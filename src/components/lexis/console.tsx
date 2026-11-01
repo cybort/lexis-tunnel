@@ -1,14 +1,17 @@
+import { Link } from "@tanstack/react-router";
 import { useEffect, useState } from "react";
 import { ensureSeed, useMesh } from "@/lib/lexis/store";
+import { useProfile } from "@/lib/lexis/profile-store";
 import { SPEC } from "@/lib/lexis/spec";
 import { currentWindow, windowRemain, type LiveSession } from "@/lib/lexis/handshake";
 import { Bench } from "./bench";
+import { ConfigPanel } from "./config-panel";
 import { LexiconPanel } from "./lexicon-panel";
 import { MapsPanel } from "./maps-panel";
 import { NodesPanel } from "./nodes-panel";
 import { Overview } from "./overview";
 
-type Tab = "overview" | "nodes" | "maps" | "tunnel" | "lexicon";
+type Tab = "overview" | "nodes" | "maps" | "tunnel" | "lexicon" | "config";
 
 const TABS: { id: Tab; label: string }[] = [
   { id: "overview", label: "总览" },
@@ -16,7 +19,14 @@ const TABS: { id: Tab; label: string }[] = [
   { id: "maps", label: "映射" },
   { id: "tunnel", label: "隧道" },
   { id: "lexicon", label: "词表" },
+  { id: "config", label: "配置" },
 ];
+
+function tabFromLocation(): Tab {
+  if (typeof window === "undefined") return "overview";
+  const value = new URLSearchParams(window.location.search).get("tab");
+  return TABS.some((item) => item.id === value) ? (value as Tab) : "overview";
+}
 
 export function Console() {
   const [tab, setTab] = useState<Tab>("overview");
@@ -30,8 +40,12 @@ export function Console() {
     (async () => {
       try {
         await useMesh.persist.rehydrate();
+        await useProfile.persist.rehydrate();
         await ensureSeed();
-        if (live) setBooted(true);
+        if (live) {
+          setTab(tabFromLocation());
+          setBooted(true);
+        }
       } catch (err) {
         if (live) setBootError(err instanceof Error ? err.message : "节点没有读出来");
       }
@@ -68,11 +82,16 @@ export function Console() {
               <p className="text-sm text-mist">低熵远程组网</p>
             </div>
           </div>
-          <p className="font-mono text-xs text-mist">
-            {windowId === null
-              ? `窗长 ${SPEC.windowSec}s`
-              : `时间窗 ${windowId} · 剩余 ${windowRemain(now)}s`}
-          </p>
+          <div className="flex items-center gap-4">
+            <p className="font-mono text-xs text-mist">
+              {windowId === null
+                ? `窗长 ${SPEC.windowSec}s`
+                : `时间窗 ${windowId} · 剩余 ${windowRemain(now)}s`}
+            </p>
+            <Link to="/download" className="inline-flex min-h-11 items-center text-sm text-sage">
+              下载
+            </Link>
+          </div>
         </div>
         <nav className="mx-auto flex max-w-6xl gap-1 overflow-x-auto px-4" aria-label="分区">
           {TABS.map((item) => (
@@ -101,6 +120,7 @@ export function Console() {
         {booted && tab === "maps" ? <MapsPanel /> : null}
         {booted && tab === "tunnel" ? <Bench session={session} onSession={setSession} /> : null}
         {booted && tab === "lexicon" ? <LexiconPanel session={session} /> : null}
+        {booted && tab === "config" ? <ConfigPanel /> : null}
       </main>
     </div>
   );

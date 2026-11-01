@@ -1,0 +1,451 @@
+export const PROFILE_VERSION = 1 as const;
+
+export type RunMode = "fixed-port" | "system-forward";
+export type ClientRole = "edge" | "gate";
+export type RuleAction = "proxy" | "direct" | "bypass" | "reject";
+export type InboundProtocol = "socks" | "tcp" | "tunnel";
+
+export type RuleType =
+  | "DOMAIN"
+  | "DOMAIN-SUFFIX"
+  | "DOMAIN-KEYWORD"
+  | "IP-CIDR"
+  | "GEOIP"
+  | "GEOSITE"
+  | "PROCESS-NAME"
+  | "PORT"
+  | "NETWORK"
+  | "MATCH";
+
+export type RouteRule = {
+  id: string;
+  type: RuleType;
+  value: string;
+  action: RuleAction;
+};
+
+export type Inbound = {
+  id: string;
+  tag: string;
+  protocol: InboundProtocol;
+  listen: string;
+  port: number;
+  targetHost: string;
+  targetPort: number;
+};
+
+export type ProcessRule = {
+  id: string;
+  name: string;
+  action: RuleAction;
+};
+
+export type LexisProfile = {
+  version: typeof PROFILE_VERSION;
+  name: string;
+  role: ClientRole;
+  mode: RunMode;
+  logLevel: "info" | "debug";
+  peerEndpoint: string;
+  inbounds: Inbound[];
+  processDefault: RuleAction;
+  processes: ProcessRule[];
+  rules: RouteRule[];
+  extras: string;
+  geositeUrl: string;
+  geoipUrl: string;
+  statusHost: string;
+  statusPort: number;
+  heartbeatSec: number;
+  linux: { method: "tproxy" | "redirect"; mark: number; table: number; dnsRedirect: boolean };
+  windows: { method: "windivert" | "portproxy"; gateway: string };
+  android: { method: "vpn"; mtu: number; address: string; dns: string };
+};
+
+export const RULE_TYPES: RuleType[] = [
+  "DOMAIN",
+  "DOMAIN-SUFFIX",
+  "DOMAIN-KEYWORD",
+  "IP-CIDR",
+  "GEOIP",
+  "GEOSITE",
+  "PROCESS-NAME",
+  "PORT",
+  "NETWORK",
+  "MATCH",
+];
+
+export const ACTIONS: RuleAction[] = ["proxy", "direct", "bypass", "reject"];
+
+export const GEOSITE: Record<string, string[]> = {
+  private: ["localhost", "local", "localdomain", "invalid"],
+  cn: ["cn", "baidu.com", "qq.com", "taobao.com", "aliyun.com", "bilibili.com", "jd.com"],
+  google: ["google.com", "gstatic.com", "googleapis.com", "youtube.com", "gmail.com"],
+  telegram: ["telegram.org", "t.me", "telegra.ph"],
+};
+
+export const GEOIP: Record<string, string[]> = {
+  private: ["10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "127.0.0.0/8", "169.254.0.0/16"],
+  cn: ["114.114.114.114/32", "223.5.5.5/32", "119.29.29.29/32", "180.76.76.76/32"],
+};
+
+const ACTION_ALIAS: Record<string, RuleAction> = {
+  proxy: "proxy",
+  接入: "proxy",
+  PROXY: "proxy",
+  词隙: "proxy",
+  direct: "direct",
+  DIRECT: "direct",
+  直连: "direct",
+  bypass: "bypass",
+  BYPASS: "bypass",
+  绕行: "bypass",
+  reject: "reject",
+  REJECT: "reject",
+  拒绝: "reject",
+};
+
+export function defaultProfile(): LexisProfile {
+  return {
+    version: PROFILE_VERSION,
+    name: "词隙",
+    role: "edge",
+    mode: "fixed-port",
+    logLevel: "info",
+    peerEndpoint: "",
+    inbounds: [
+      {
+        id: "in-socks",
+        tag: "本地 SOCKS",
+        protocol: "socks",
+        listen: "127.0.0.1",
+        port: 1080,
+        targetHost: "",
+        targetPort: 0,
+      },
+    ],
+    processDefault: "proxy",
+    processes: [
+      { id: "proc-browser", name: "chrome", action: "proxy" },
+      { id: "proc-ssh", name: "ssh", action: "bypass" },
+    ],
+    rules: [
+      { id: "r-private-site", type: "GEOSITE", value: "private", action: "direct" },
+      { id: "r-private-ip", type: "GEOIP", value: "private", action: "direct" },
+      { id: "r-cn-site", type: "GEOSITE", value: "cn", action: "direct" },
+      { id: "r-cn-ip", type: "GEOIP", value: "cn", action: "direct" },
+      { id: "r-ssh", type: "PROCESS-NAME", value: "ssh", action: "bypass" },
+      { id: "r-match", type: "MATCH", value: "", action: "proxy" },
+    ],
+    extras: "",
+    geositeUrl: "",
+    geoipUrl: "",
+    statusHost: "127.0.0.1",
+    statusPort: 17890,
+    heartbeatSec: 15,
+    linux: { method: "redirect", mark: 255, table: 100, dnsRedirect: true },
+    windows: { method: "portproxy", gateway: "10.7.0.1" },
+    android: { method: "vpn", mtu: 1500, address: "10.7.0.2/32", dns: "1.1.1.1" },
+  };
+}
+
+export function actionLabel(action: RuleAction): string {
+  switch (action) {
+    case "proxy":
+      return "接入";
+    case "direct":
+      return "直连";
+    case "bypass":
+      return "绕行";
+    case "reject":
+      return "拒绝";
+  }
+}
+
+function newId(prefix: string): string {
+  return `${prefix}-${Math.random().toString(36).slice(2, 8)}`;
+}
+
+export function normalizeProfile(input: unknown): LexisProfile {
+  const base = defaultProfile();
+  if (!input || typeof input !== "object") return base;
+  const raw = input as Partial<LexisProfile>;
+  return {
+    ...base,
+    ...raw,
+    version: PROFILE_VERSION,
+    role: raw.role === "gate" ? "gate" : "edge",
+    mode: raw.mode === "system-forward" ? "system-forward" : "fixed-port",
+    logLevel: raw.logLevel === "debug" ? "debug" : "info",
+    processDefault: isAction(raw.processDefault) ? raw.processDefault : base.processDefault,
+    inbounds: Array.isArray(raw.inbounds) ? raw.inbounds.map(normalizeInbound) : base.inbounds,
+    processes: Array.isArray(raw.processes) ? raw.processes.map(normalizeProcess) : base.processes,
+    rules: Array.isArray(raw.rules) ? raw.rules.map(normalizeRule) : base.rules,
+    linux: { ...base.linux, ...(raw.linux ?? {}) },
+    windows: { ...base.windows, ...(raw.windows ?? {}) },
+    android: { ...base.android, ...(raw.android ?? {}) },
+    heartbeatSec: clampNum(raw.heartbeatSec, 5, 120, base.heartbeatSec),
+    statusPort: clampNum(raw.statusPort, 1, 65535, base.statusPort),
+  };
+}
+
+function isAction(value: unknown): value is RuleAction {
+  return value === "proxy" || value === "direct" || value === "bypass" || value === "reject";
+}
+
+function clampNum(value: unknown, min: number, max: number, fallback: number): number {
+  const n = typeof value === "number" ? value : Number(value);
+  if (!Number.isInteger(n) || n < min || n > max) return fallback;
+  return n;
+}
+
+function normalizeInbound(raw: Partial<Inbound>): Inbound {
+  const protocol: InboundProtocol =
+    raw.protocol === "tcp" || raw.protocol === "tunnel" ? raw.protocol : "socks";
+  return {
+    id: raw.id || newId("in"),
+    tag: raw.tag || "入站",
+    protocol,
+    listen: raw.listen || "127.0.0.1",
+    port: clampNum(raw.port, 1, 65535, 1080),
+    targetHost: raw.targetHost || "",
+    targetPort: clampNum(raw.targetPort, 0, 65535, 0),
+  };
+}
+
+function normalizeProcess(raw: Partial<ProcessRule>): ProcessRule {
+  return {
+    id: raw.id || newId("proc"),
+    name: (raw.name || "").trim(),
+    action: isAction(raw.action) ? raw.action : "proxy",
+  };
+}
+
+function normalizeRule(raw: Partial<RouteRule>): RouteRule {
+  const type = RULE_TYPES.includes(raw.type as RuleType) ? (raw.type as RuleType) : "DOMAIN-SUFFIX";
+  return {
+    id: raw.id || newId("rule"),
+    type,
+    value: (raw.value || "").trim(),
+    action: isAction(raw.action) ? raw.action : "proxy",
+  };
+}
+
+export type RouteQuery = {
+  host?: string;
+  ip?: string;
+  process?: string;
+  port?: string;
+  network?: string;
+};
+
+export type RouteHit = { rule: RouteRule | null; action: RuleAction; reason: string };
+
+type Lists = { geosite: Record<string, string[]>; geoip: Record<string, string[]> };
+
+export function resourceLists(profile: LexisProfile): Lists {
+  const geosite: Record<string, string[]> = {};
+  const geoip: Record<string, string[]> = {};
+  for (const [tag, list] of Object.entries(GEOSITE)) geosite[tag] = [...list];
+  for (const [tag, list] of Object.entries(GEOIP)) geoip[tag] = [...list];
+  for (const line of profile.extras.split(/\r?\n/)) {
+    const trimmed = line.trim();
+    if (!trimmed || trimmed.startsWith("#")) continue;
+    const [head, ...rest] = trimmed.split(/\s+/);
+    const value = rest.join(" ");
+    if (!head || !value) continue;
+    if (head.startsWith("geoip:")) {
+      const tag = head.slice(6).toLowerCase();
+      geoip[tag] = [...(geoip[tag] ?? []), value];
+    } else {
+      const tag = head.toLowerCase();
+      geosite[tag] = [...(geosite[tag] ?? []), value.toLowerCase()];
+    }
+  }
+  return { geosite, geoip };
+}
+
+export function matchRoute(profile: LexisProfile, query: RouteQuery): RouteHit {
+  const lists = resourceLists(profile);
+  const host = (query.host || "").toLowerCase().replace(/\.$/, "");
+  const ip = query.ip || (isIp(host) ? host : "");
+  const processName = (query.process || "").toLowerCase();
+  if (processName) {
+    const named = profile.processes.find((item) => processHits(processName, item.name));
+    if (named) {
+      return { rule: null, action: named.action, reason: `程序 ${named.name} → ${actionLabel(named.action)}` };
+    }
+  }
+  for (const rule of profile.rules) {
+    if (ruleMatches(rule, { host, ip, processName, port: query.port || "", network: (query.network || "tcp").toLowerCase() }, lists)) {
+      return { rule, action: rule.action, reason: `${rule.type} ${rule.value} → ${actionLabel(rule.action)}` };
+    }
+  }
+  return { rule: null, action: profile.processDefault, reason: `没有命中规则，程序默认 ${actionLabel(profile.processDefault)}` };
+}
+
+function processHits(actual: string, ruleName: string): boolean {
+  const want = ruleName.trim().toLowerCase();
+  if (!want) return false;
+  const bare = actual.replace(/\.exe$/, "");
+  const wantBare = want.replace(/\.exe$/, "");
+  return bare === wantBare || bare.includes(wantBare);
+}
+
+function ruleMatches(
+  rule: RouteRule,
+  query: { host: string; ip: string; processName: string; port: string; network: string },
+  lists: Lists,
+): boolean {
+  const value = rule.value.trim().toLowerCase();
+  switch (rule.type) {
+    case "MATCH":
+      return true;
+    case "DOMAIN":
+      return query.host === value;
+    case "DOMAIN-SUFFIX":
+      return query.host === value || query.host.endsWith(`.${value}`);
+    case "DOMAIN-KEYWORD":
+      return value.length > 0 && query.host.includes(value);
+    case "IP-CIDR":
+      return query.ip !== "" && cidrContains(rule.value.trim(), query.ip);
+    case "GEOIP":
+      return query.ip !== "" && (lists.geoip[value] ?? []).some((cidr) => cidrContains(cidr, query.ip));
+    case "GEOSITE":
+      return query.host !== "" && (lists.geosite[value] ?? []).some((domain) => query.host === domain || query.host.endsWith(`.${domain}`));
+    case "PROCESS-NAME":
+      return query.processName !== "" && processHits(query.processName, rule.value);
+    case "PORT":
+      return query.port === rule.value.trim();
+    case "NETWORK":
+      return query.network === value;
+    default:
+      return false;
+  }
+}
+
+function isIp(value: string): boolean {
+  return /^\d{1,3}(\.\d{1,3}){3}$/.test(value);
+}
+
+export function cidrContains(cidr: string, ip: string): boolean {
+  const [base, bitsRaw] = cidr.split("/");
+  if (!isIp(base) || !isIp(ip)) return false;
+  const bits = bitsRaw === undefined ? 32 : Number(bitsRaw);
+  if (!Number.isInteger(bits) || bits < 0 || bits > 32) return false;
+  const mask = bits === 0 ? 0 : (~0 << (32 - bits)) >>> 0;
+  return (ip4(base) & mask) === (ip4(ip) & mask);
+}
+
+function ip4(ip: string): number {
+  return ip.split(".").reduce((acc, part) => ((acc << 8) | Number(part)) >>> 0, 0);
+}
+
+export function importClashRules(text: string): RouteRule[] {
+  const rules: RouteRule[] = [];
+  for (const line of text.split(/\r?\n/)) {
+    const trimmed = line.trim().replace(/^-\s+/, "");
+    if (!trimmed || trimmed.startsWith("#")) continue;
+    const parts = trimmed.split(",").map((part) => part.trim());
+    if (parts.length < 2) continue;
+    const type = parts[0].toUpperCase();
+    if (type === "MATCH" && parts.length >= 2 && isRuleType("MATCH")) {
+      rules.push({ id: newId("rule"), type: "MATCH", value: "", action: mapAction(parts[1]) });
+      continue;
+    }
+    if (parts.length < 3 || !isRuleType(type)) continue;
+    rules.push({ id: newId("rule"), type, value: parts[1], action: mapAction(parts[2]) });
+  }
+  if (rules.length === 0) throw new Error("没有读到 Clash 规则。每行像这样：DOMAIN-SUFFIX,example.com,PROXY");
+  return rules;
+}
+
+export function importSingBox(text: string): RouteRule[] {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(text);
+  } catch {
+    throw new Error("sing-box 配置不是合法的 JSON");
+  }
+  const route = (parsed as { route?: { rules?: unknown[] }; rules?: unknown[] }).route;
+  const list = route?.rules ?? (parsed as { rules?: unknown[] }).rules;
+  if (!Array.isArray(list)) throw new Error("没有找到 route.rules");
+  const rules: RouteRule[] = [];
+  for (const item of list) {
+    if (!item || typeof item !== "object") continue;
+    const row = item as Record<string, unknown>;
+    const action = mapAction(String(row.outbound ?? row.action ?? "proxy"));
+    pushSing(rules, "domain", row.domain, "DOMAIN", action);
+    pushSing(rules, "domain_suffix", row.domain_suffix, "DOMAIN-SUFFIX", action);
+    pushSing(rules, "domain_keyword", row.domain_keyword, "DOMAIN-KEYWORD", action);
+    pushSing(rules, "ip_cidr", row.ip_cidr, "IP-CIDR", action);
+    pushSing(rules, "process_name", row.process_name, "PROCESS-NAME", action);
+    if (typeof row.geosite === "string") rules.push({ id: newId("rule"), type: "GEOSITE", value: row.geosite, action });
+    if (typeof row.geoip === "string") rules.push({ id: newId("rule"), type: "GEOIP", value: row.geoip, action });
+    if (typeof row.port === "number") rules.push({ id: newId("rule"), type: "PORT", value: String(row.port), action });
+    if (typeof row.network === "string") rules.push({ id: newId("rule"), type: "NETWORK", value: row.network, action });
+  }
+  if (rules.length === 0) throw new Error("sing-box 规则是空的");
+  return rules;
+}
+
+function pushSing(rules: RouteRule[], key: string, value: unknown, type: RuleType, action: RuleAction) {
+  const list = Array.isArray(value) ? value : typeof value === "string" ? [value] : [];
+  for (const item of list) {
+    if (typeof item === "string" && item) rules.push({ id: newId("rule"), type, value: item, action });
+  }
+  void key;
+}
+
+function isRuleType(value: string): value is RuleType {
+  return RULE_TYPES.includes(value as RuleType);
+}
+
+function mapAction(value: string): RuleAction {
+  return ACTION_ALIAS[value] ?? ACTION_ALIAS[value.toUpperCase()] ?? "proxy";
+}
+
+export function profileIssues(profile: LexisProfile): string[] {
+  const issues: string[] = [];
+  const seen = new Set<string>();
+  for (const inbound of profile.inbounds) {
+    const key = `${inbound.listen}:${inbound.port}`;
+    if (seen.has(key)) issues.push(`入站端口重复：${key}`);
+    seen.add(key);
+    if (inbound.protocol === "tcp" && (!inbound.targetHost || inbound.targetPort < 1)) {
+      issues.push(`${inbound.tag} 是固定转发，但目标主机或端口是空的`);
+    }
+  }
+  if (profile.mode === "fixed-port" && profile.inbounds.length === 0) issues.push("固定端口模式至少要有一个入站");
+  for (const proc of profile.processes) {
+    if (!proc.name.trim()) issues.push("有一条程序规则没有名字");
+  }
+  if (profile.peerEndpoint && !/^.+:\d+$/.test(profile.peerEndpoint)) {
+    issues.push("对端地址要写成 主机:端口");
+  }
+  return issues;
+}
+
+export function gatePreset(): Pick<LexisProfile, "role" | "inbounds"> {
+  return {
+    role: "gate",
+    inbounds: [
+      {
+        id: "in-tunnel",
+        tag: "词隙入口",
+        protocol: "tunnel",
+        listen: "0.0.0.0",
+        port: 18443,
+        targetHost: "",
+        targetPort: 0,
+      },
+    ],
+  };
+}
+
+export function edgePreset(): Pick<LexisProfile, "role" | "inbounds"> {
+  return {
+    role: "edge",
+    inbounds: defaultProfile().inbounds,
+  };
+}

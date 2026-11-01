@@ -1,0 +1,13 @@
+[Unit]
+Description=LEXIS resident agent
+After=network-online.target
+
+[Service]
+Type=simple
+ExecStart=@NODE@ @HOME@/.config/lexis/lexis-agent.mjs
+WorkingDirectory=@HOME@/.config/lexis
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=default.target

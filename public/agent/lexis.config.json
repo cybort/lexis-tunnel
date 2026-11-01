@@ -1,0 +1,92 @@
+{
+  "version": 1,
+  "name": "词隙",
+  "role": "edge",
+  "mode": "fixed-port",
+  "logLevel": "info",
+  "peerEndpoint": "",
+  "inbounds": [
+    {
+      "id": "in-socks",
+      "tag": "本地 SOCKS",
+      "protocol": "socks",
+      "listen": "127.0.0.1",
+      "port": 1080,
+      "targetHost": "",
+      "targetPort": 0
+    }
+  ],
+  "processDefault": "proxy",
+  "processes": [
+    {
+      "id": "proc-browser",
+      "name": "chrome",
+      "action": "proxy"
+    },
+    {
+      "id": "proc-ssh",
+      "name": "ssh",
+      "action": "bypass"
+    }
+  ],
+  "rules": [
+    {
+      "id": "r-private-site",
+      "type": "GEOSITE",
+      "value": "private",
+      "action": "direct"
+    },
+    {
+      "id": "r-private-ip",
+      "type": "GEOIP",
+      "value": "private",
+      "action": "direct"
+    },
+    {
+      "id": "r-cn-site",
+      "type": "GEOSITE",
+      "value": "cn",
+      "action": "direct"
+    },
+    {
+      "id": "r-cn-ip",
+      "type": "GEOIP",
+      "value": "cn",
+      "action": "direct"
+    },
+    {
+      "id": "r-ssh",
+      "type": "PROCESS-NAME",
+      "value": "ssh",
+      "action": "bypass"
+    },
+    {
+      "id": "r-match",
+      "type": "MATCH",
+      "value": "",
+      "action": "proxy"
+    }
+  ],
+  "extras": "",
+  "geositeUrl": "",
+  "geoipUrl": "",
+  "statusHost": "127.0.0.1",
+  "statusPort": 17890,
+  "heartbeatSec": 15,
+  "linux": {
+    "method": "redirect",
+    "mark": 255,
+    "table": 100,
+    "dnsRedirect": true
+  },
+  "windows": {
+    "method": "portproxy",
+    "gateway": "10.7.0.1"
+  },
+  "android": {
+    "method": "vpn",
+    "mtu": 1500,
+    "address": "10.7.0.2/32",
+    "dns": "1.1.1.1"
+  }
+}

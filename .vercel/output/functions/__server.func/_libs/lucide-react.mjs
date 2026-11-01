@@ -1,5 +1,5 @@
 import { i as __toESM } from "../_runtime.mjs";
-import { K as require_react } from "./@tanstack/react-router+[...].mjs";
+import { q as require_react } from "./@tanstack/react-router+[...].mjs";
 //#region node_modules/lucide-react/dist/esm/shared/src/utils.js
 var import_react = /* @__PURE__ */ __toESM(require_react());
 /**
@@ -118,6 +118,36 @@ var Download = createLucideIcon("download", [
 * This source code is licensed under the ISC license.
 * See the LICENSE file in the root directory of this source tree.
 */
+var Monitor = createLucideIcon("monitor", [
+	["rect", {
+		width: "20",
+		height: "14",
+		x: "2",
+		y: "3",
+		rx: "2",
+		key: "48i651"
+	}],
+	["line", {
+		x1: "8",
+		x2: "16",
+		y1: "21",
+		y2: "21",
+		key: "1svkeh"
+	}],
+	["line", {
+		x1: "12",
+		x2: "12",
+		y1: "17",
+		y2: "21",
+		key: "vw1qmm"
+	}]
+]);
+/**
+* @license lucide-react v0.510.0 - ISC
+*
+* This source code is licensed under the ISC license.
+* See the LICENSE file in the root directory of this source tree.
+*/
 var Radio = createLucideIcon("radio", [
 	["path", {
 		d: "M4.9 19.1C1 15.2 1 8.8 4.9 4.9",
@@ -142,6 +172,40 @@ var Radio = createLucideIcon("radio", [
 		key: "10b0cb"
 	}]
 ]);
+/**
+* @license lucide-react v0.510.0 - ISC
+*
+* This source code is licensed under the ISC license.
+* See the LICENSE file in the root directory of this source tree.
+*/
+var Smartphone = createLucideIcon("smartphone", [["rect", {
+	width: "14",
+	height: "20",
+	x: "5",
+	y: "2",
+	rx: "2",
+	ry: "2",
+	key: "1yt0o3"
+}], ["path", {
+	d: "M12 18h.01",
+	key: "mhygvu"
+}]]);
+/**
+* @license lucide-react v0.510.0 - ISC
+*
+* This source code is licensed under the ISC license.
+* See the LICENSE file in the root directory of this source tree.
+*/
+var Terminal = createLucideIcon("terminal", [["polyline", {
+	points: "4 17 10 11 4 5",
+	key: "akl6gq"
+}], ["line", {
+	x1: "12",
+	x2: "20",
+	y1: "19",
+	y2: "19",
+	key: "q2wloq"
+}]]);
 /**
 * @license lucide-react v0.510.0 - ISC
 *
@@ -197,4 +261,4 @@ var TriangleAlert = createLucideIcon("triangle-alert", [
 	}]
 ]);
 //#endregion
-export { ArrowRight as a, Download as i, Trash2 as n, Radio as r, TriangleAlert as t };
+export { Radio as a, ArrowRight as c, Smartphone as i, Trash2 as n, Monitor as o, Terminal as r, Download as s, TriangleAlert as t };

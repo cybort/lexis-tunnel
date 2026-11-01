@@ -1,0 +1,17 @@
+词隙客户端 1.0.0
+
+这是同一份通信进程。Windows、Linux、Android（Termux）都读 lexis.config.json。
+
+固定端口：进程监听配置里的端口。SOCKS 入站给本机程序当代理；TCP 入站按目标转发；tunnel 入站收 LEXIS1 头再拨目标。
+系统接管：进程仍常驻，并写出平台脚本。Linux 在有 root 时用 iptables redirect 或 tproxy；Windows 用 netsh portproxy，或只记录 WinDivert 过滤；Android 写出 vpn-session.json 给 VpnService，Termux 本身打不开系统 VPN。
+
+程序名：接入、绕行或拒绝。Linux 从 /proc 认进程，Windows 用当前连接的进程名，Android 上认不到进程时规则仍留在配置里。
+路由：DOMAIN、DOMAIN-SUFFIX、IP-CIDR、GEOSITE、GEOIP、PROCESS-NAME、MATCH。内置 geosite/geoip 是一份小样。完整库把文本 URL 填进配置，客户端启动时拉取。文本一行一条：`类别 域名`、`geoip:类别 地址段`，或单独一行域名 / 地址段（归到 remote）。
+
+安装：
+- Windows：在解压目录里运行 install.ps1。登录后任务 LexisAgent 会把进程拉起。
+- Linux：sh install.sh。有 systemd 就装用户服务，没有就 nohup。
+- Android：在 Termux 里 sh install.sh。
+
+状态页默认是 http://127.0.0.1:17890/
+改配置后重启进程。控制台导出的 JSON 覆盖 lexis.config.json 即可。

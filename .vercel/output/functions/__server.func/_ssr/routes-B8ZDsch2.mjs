@@ -1,9 +1,9 @@
 import { i as __toESM } from "../_runtime.mjs";
-import { K as require_react, b as require_jsx_runtime } from "../_libs/@tanstack/react-router+[...].mjs";
-import { a as ArrowRight, i as Download, n as Trash2, r as Radio } from "../_libs/lucide-react.mjs";
+import { q as require_react, x as require_jsx_runtime, y as Link } from "../_libs/@tanstack/react-router+[...].mjs";
+import { a as Radio, c as ArrowRight, n as Trash2, s as Download } from "../_libs/lucide-react.mjs";
 import { n as persist, r as create, t as createJSONStorage } from "../_libs/zustand.mjs";
 import { a as Cell, i as Bar, n as YAxis, o as ResponsiveContainer, r as XAxis, s as Tooltip, t as BarChart } from "../_libs/recharts+[...].mjs";
-//#region node_modules/.nitro/vite/services/ssr/assets/routes-CtiAsog8.js
+//#region node_modules/.nitro/vite/services/ssr/assets/routes-B8ZDsch2.js
 var import_react = /* @__PURE__ */ __toESM(require_react());
 var import_jsx_runtime = require_jsx_runtime();
 function concat(...parts) {
@@ -353,6 +353,485 @@ function downloadJson(filename, data) {
 	a.click();
 	URL.revokeObjectURL(url);
 }
+var RULE_TYPES = [
+	"DOMAIN",
+	"DOMAIN-SUFFIX",
+	"DOMAIN-KEYWORD",
+	"IP-CIDR",
+	"GEOIP",
+	"GEOSITE",
+	"PROCESS-NAME",
+	"PORT",
+	"NETWORK",
+	"MATCH"
+];
+var ACTIONS = [
+	"proxy",
+	"direct",
+	"bypass",
+	"reject"
+];
+var GEOSITE = {
+	private: [
+		"localhost",
+		"local",
+		"localdomain",
+		"invalid"
+	],
+	cn: [
+		"cn",
+		"baidu.com",
+		"qq.com",
+		"taobao.com",
+		"aliyun.com",
+		"bilibili.com",
+		"jd.com"
+	],
+	google: [
+		"google.com",
+		"gstatic.com",
+		"googleapis.com",
+		"youtube.com",
+		"gmail.com"
+	],
+	telegram: [
+		"telegram.org",
+		"t.me",
+		"telegra.ph"
+	]
+};
+var GEOIP = {
+	private: [
+		"10.0.0.0/8",
+		"172.16.0.0/12",
+		"192.168.0.0/16",
+		"127.0.0.0/8",
+		"169.254.0.0/16"
+	],
+	cn: [
+		"114.114.114.114/32",
+		"223.5.5.5/32",
+		"119.29.29.29/32",
+		"180.76.76.76/32"
+	]
+};
+var ACTION_ALIAS = {
+	proxy: "proxy",
+	接入: "proxy",
+	PROXY: "proxy",
+	词隙: "proxy",
+	direct: "direct",
+	DIRECT: "direct",
+	直连: "direct",
+	bypass: "bypass",
+	BYPASS: "bypass",
+	绕行: "bypass",
+	reject: "reject",
+	REJECT: "reject",
+	拒绝: "reject"
+};
+function defaultProfile() {
+	return {
+		version: 1,
+		name: "词隙",
+		role: "edge",
+		mode: "fixed-port",
+		logLevel: "info",
+		peerEndpoint: "",
+		inbounds: [{
+			id: "in-socks",
+			tag: "本地 SOCKS",
+			protocol: "socks",
+			listen: "127.0.0.1",
+			port: 1080,
+			targetHost: "",
+			targetPort: 0
+		}],
+		processDefault: "proxy",
+		processes: [{
+			id: "proc-browser",
+			name: "chrome",
+			action: "proxy"
+		}, {
+			id: "proc-ssh",
+			name: "ssh",
+			action: "bypass"
+		}],
+		rules: [
+			{
+				id: "r-private-site",
+				type: "GEOSITE",
+				value: "private",
+				action: "direct"
+			},
+			{
+				id: "r-private-ip",
+				type: "GEOIP",
+				value: "private",
+				action: "direct"
+			},
+			{
+				id: "r-cn-site",
+				type: "GEOSITE",
+				value: "cn",
+				action: "direct"
+			},
+			{
+				id: "r-cn-ip",
+				type: "GEOIP",
+				value: "cn",
+				action: "direct"
+			},
+			{
+				id: "r-ssh",
+				type: "PROCESS-NAME",
+				value: "ssh",
+				action: "bypass"
+			},
+			{
+				id: "r-match",
+				type: "MATCH",
+				value: "",
+				action: "proxy"
+			}
+		],
+		extras: "",
+		geositeUrl: "",
+		geoipUrl: "",
+		statusHost: "127.0.0.1",
+		statusPort: 17890,
+		heartbeatSec: 15,
+		linux: {
+			method: "redirect",
+			mark: 255,
+			table: 100,
+			dnsRedirect: true
+		},
+		windows: {
+			method: "portproxy",
+			gateway: "10.7.0.1"
+		},
+		android: {
+			method: "vpn",
+			mtu: 1500,
+			address: "10.7.0.2/32",
+			dns: "1.1.1.1"
+		}
+	};
+}
+function actionLabel(action) {
+	switch (action) {
+		case "proxy": return "接入";
+		case "direct": return "直连";
+		case "bypass": return "绕行";
+		case "reject": return "拒绝";
+	}
+}
+function newId(prefix) {
+	return `${prefix}-${Math.random().toString(36).slice(2, 8)}`;
+}
+function normalizeProfile(input) {
+	const base = defaultProfile();
+	if (!input || typeof input !== "object") return base;
+	const raw = input;
+	return {
+		...base,
+		...raw,
+		version: 1,
+		role: raw.role === "gate" ? "gate" : "edge",
+		mode: raw.mode === "system-forward" ? "system-forward" : "fixed-port",
+		logLevel: raw.logLevel === "debug" ? "debug" : "info",
+		processDefault: isAction(raw.processDefault) ? raw.processDefault : base.processDefault,
+		inbounds: Array.isArray(raw.inbounds) ? raw.inbounds.map(normalizeInbound) : base.inbounds,
+		processes: Array.isArray(raw.processes) ? raw.processes.map(normalizeProcess) : base.processes,
+		rules: Array.isArray(raw.rules) ? raw.rules.map(normalizeRule) : base.rules,
+		linux: {
+			...base.linux,
+			...raw.linux ?? {}
+		},
+		windows: {
+			...base.windows,
+			...raw.windows ?? {}
+		},
+		android: {
+			...base.android,
+			...raw.android ?? {}
+		},
+		heartbeatSec: clampNum(raw.heartbeatSec, 5, 120, base.heartbeatSec),
+		statusPort: clampNum(raw.statusPort, 1, 65535, base.statusPort)
+	};
+}
+function isAction(value) {
+	return value === "proxy" || value === "direct" || value === "bypass" || value === "reject";
+}
+function clampNum(value, min, max, fallback) {
+	const n = typeof value === "number" ? value : Number(value);
+	if (!Number.isInteger(n) || n < min || n > max) return fallback;
+	return n;
+}
+function normalizeInbound(raw) {
+	const protocol = raw.protocol === "tcp" || raw.protocol === "tunnel" ? raw.protocol : "socks";
+	return {
+		id: raw.id || newId("in"),
+		tag: raw.tag || "入站",
+		protocol,
+		listen: raw.listen || "127.0.0.1",
+		port: clampNum(raw.port, 1, 65535, 1080),
+		targetHost: raw.targetHost || "",
+		targetPort: clampNum(raw.targetPort, 0, 65535, 0)
+	};
+}
+function normalizeProcess(raw) {
+	return {
+		id: raw.id || newId("proc"),
+		name: (raw.name || "").trim(),
+		action: isAction(raw.action) ? raw.action : "proxy"
+	};
+}
+function normalizeRule(raw) {
+	const type = RULE_TYPES.includes(raw.type) ? raw.type : "DOMAIN-SUFFIX";
+	return {
+		id: raw.id || newId("rule"),
+		type,
+		value: (raw.value || "").trim(),
+		action: isAction(raw.action) ? raw.action : "proxy"
+	};
+}
+function resourceLists(profile) {
+	const geosite = {};
+	const geoip = {};
+	for (const [tag, list] of Object.entries(GEOSITE)) geosite[tag] = [...list];
+	for (const [tag, list] of Object.entries(GEOIP)) geoip[tag] = [...list];
+	for (const line of profile.extras.split(/\r?\n/)) {
+		const trimmed = line.trim();
+		if (!trimmed || trimmed.startsWith("#")) continue;
+		const [head, ...rest] = trimmed.split(/\s+/);
+		const value = rest.join(" ");
+		if (!head || !value) continue;
+		if (head.startsWith("geoip:")) {
+			const tag = head.slice(6).toLowerCase();
+			geoip[tag] = [...geoip[tag] ?? [], value];
+		} else {
+			const tag = head.toLowerCase();
+			geosite[tag] = [...geosite[tag] ?? [], value.toLowerCase()];
+		}
+	}
+	return {
+		geosite,
+		geoip
+	};
+}
+function matchRoute(profile, query) {
+	const lists = resourceLists(profile);
+	const host = (query.host || "").toLowerCase().replace(/\.$/, "");
+	const ip = query.ip || (isIp(host) ? host : "");
+	const processName = (query.process || "").toLowerCase();
+	if (processName) {
+		const named = profile.processes.find((item) => processHits(processName, item.name));
+		if (named) return {
+			rule: null,
+			action: named.action,
+			reason: `程序 ${named.name} → ${actionLabel(named.action)}`
+		};
+	}
+	for (const rule of profile.rules) if (ruleMatches(rule, {
+		host,
+		ip,
+		processName,
+		port: query.port || "",
+		network: (query.network || "tcp").toLowerCase()
+	}, lists)) return {
+		rule,
+		action: rule.action,
+		reason: `${rule.type} ${rule.value} → ${actionLabel(rule.action)}`
+	};
+	return {
+		rule: null,
+		action: profile.processDefault,
+		reason: `没有命中规则，程序默认 ${actionLabel(profile.processDefault)}`
+	};
+}
+function processHits(actual, ruleName) {
+	const want = ruleName.trim().toLowerCase();
+	if (!want) return false;
+	const bare = actual.replace(/\.exe$/, "");
+	const wantBare = want.replace(/\.exe$/, "");
+	return bare === wantBare || bare.includes(wantBare);
+}
+function ruleMatches(rule, query, lists) {
+	const value = rule.value.trim().toLowerCase();
+	switch (rule.type) {
+		case "MATCH": return true;
+		case "DOMAIN": return query.host === value;
+		case "DOMAIN-SUFFIX": return query.host === value || query.host.endsWith(`.${value}`);
+		case "DOMAIN-KEYWORD": return value.length > 0 && query.host.includes(value);
+		case "IP-CIDR": return query.ip !== "" && cidrContains(rule.value.trim(), query.ip);
+		case "GEOIP": return query.ip !== "" && (lists.geoip[value] ?? []).some((cidr) => cidrContains(cidr, query.ip));
+		case "GEOSITE": return query.host !== "" && (lists.geosite[value] ?? []).some((domain) => query.host === domain || query.host.endsWith(`.${domain}`));
+		case "PROCESS-NAME": return query.processName !== "" && processHits(query.processName, rule.value);
+		case "PORT": return query.port === rule.value.trim();
+		case "NETWORK": return query.network === value;
+		default: return false;
+	}
+}
+function isIp(value) {
+	return /^\d{1,3}(\.\d{1,3}){3}$/.test(value);
+}
+function cidrContains(cidr, ip) {
+	const [base, bitsRaw] = cidr.split("/");
+	if (!isIp(base) || !isIp(ip)) return false;
+	const bits = bitsRaw === void 0 ? 32 : Number(bitsRaw);
+	if (!Number.isInteger(bits) || bits < 0 || bits > 32) return false;
+	const mask = bits === 0 ? 0 : -1 << 32 - bits >>> 0;
+	return (ip4(base) & mask) === (ip4(ip) & mask);
+}
+function ip4(ip) {
+	return ip.split(".").reduce((acc, part) => (acc << 8 | Number(part)) >>> 0, 0);
+}
+function importClashRules(text) {
+	const rules = [];
+	for (const line of text.split(/\r?\n/)) {
+		const trimmed = line.trim().replace(/^-\s+/, "");
+		if (!trimmed || trimmed.startsWith("#")) continue;
+		const parts = trimmed.split(",").map((part) => part.trim());
+		if (parts.length < 2) continue;
+		const type = parts[0].toUpperCase();
+		if (type === "MATCH" && parts.length >= 2 && isRuleType("MATCH")) {
+			rules.push({
+				id: newId("rule"),
+				type: "MATCH",
+				value: "",
+				action: mapAction(parts[1])
+			});
+			continue;
+		}
+		if (parts.length < 3 || !isRuleType(type)) continue;
+		rules.push({
+			id: newId("rule"),
+			type,
+			value: parts[1],
+			action: mapAction(parts[2])
+		});
+	}
+	if (rules.length === 0) throw new Error("没有读到 Clash 规则。每行像这样：DOMAIN-SUFFIX,example.com,PROXY");
+	return rules;
+}
+function importSingBox(text) {
+	let parsed;
+	try {
+		parsed = JSON.parse(text);
+	} catch {
+		throw new Error("sing-box 配置不是合法的 JSON");
+	}
+	const list = parsed.route?.rules ?? parsed.rules;
+	if (!Array.isArray(list)) throw new Error("没有找到 route.rules");
+	const rules = [];
+	for (const item of list) {
+		if (!item || typeof item !== "object") continue;
+		const row = item;
+		const action = mapAction(String(row.outbound ?? row.action ?? "proxy"));
+		pushSing(rules, "domain", row.domain, "DOMAIN", action);
+		pushSing(rules, "domain_suffix", row.domain_suffix, "DOMAIN-SUFFIX", action);
+		pushSing(rules, "domain_keyword", row.domain_keyword, "DOMAIN-KEYWORD", action);
+		pushSing(rules, "ip_cidr", row.ip_cidr, "IP-CIDR", action);
+		pushSing(rules, "process_name", row.process_name, "PROCESS-NAME", action);
+		if (typeof row.geosite === "string") rules.push({
+			id: newId("rule"),
+			type: "GEOSITE",
+			value: row.geosite,
+			action
+		});
+		if (typeof row.geoip === "string") rules.push({
+			id: newId("rule"),
+			type: "GEOIP",
+			value: row.geoip,
+			action
+		});
+		if (typeof row.port === "number") rules.push({
+			id: newId("rule"),
+			type: "PORT",
+			value: String(row.port),
+			action
+		});
+		if (typeof row.network === "string") rules.push({
+			id: newId("rule"),
+			type: "NETWORK",
+			value: row.network,
+			action
+		});
+	}
+	if (rules.length === 0) throw new Error("sing-box 规则是空的");
+	return rules;
+}
+function pushSing(rules, key, value, type, action) {
+	const list = Array.isArray(value) ? value : typeof value === "string" ? [value] : [];
+	for (const item of list) if (typeof item === "string" && item) rules.push({
+		id: newId("rule"),
+		type,
+		value: item,
+		action
+	});
+}
+function isRuleType(value) {
+	return RULE_TYPES.includes(value);
+}
+function mapAction(value) {
+	return ACTION_ALIAS[value] ?? ACTION_ALIAS[value.toUpperCase()] ?? "proxy";
+}
+function profileIssues(profile) {
+	const issues = [];
+	const seen = /* @__PURE__ */ new Set();
+	for (const inbound of profile.inbounds) {
+		const key = `${inbound.listen}:${inbound.port}`;
+		if (seen.has(key)) issues.push(`入站端口重复：${key}`);
+		seen.add(key);
+		if (inbound.protocol === "tcp" && (!inbound.targetHost || inbound.targetPort < 1)) issues.push(`${inbound.tag} 是固定转发，但目标主机或端口是空的`);
+	}
+	if (profile.mode === "fixed-port" && profile.inbounds.length === 0) issues.push("固定端口模式至少要有一个入站");
+	for (const proc of profile.processes) if (!proc.name.trim()) issues.push("有一条程序规则没有名字");
+	if (profile.peerEndpoint && !/^.+:\d+$/.test(profile.peerEndpoint)) issues.push("对端地址要写成 主机:端口");
+	return issues;
+}
+function gatePreset() {
+	return {
+		role: "gate",
+		inbounds: [{
+			id: "in-tunnel",
+			tag: "词隙入口",
+			protocol: "tunnel",
+			listen: "0.0.0.0",
+			port: 18443,
+			targetHost: "",
+			targetPort: 0
+		}]
+	};
+}
+function edgePreset() {
+	return {
+		role: "edge",
+		inbounds: defaultProfile().inbounds
+	};
+}
+var useProfile = create()(persist((set) => ({
+	profile: defaultProfile(),
+	setProfile: (profile) => set({ profile: normalizeProfile(profile) }),
+	patch: (partial) => set((state) => ({ profile: normalizeProfile({
+		...state.profile,
+		...partial
+	}) }))
+}), {
+	name: "lexis-profile-v1",
+	storage: createJSONStorage(() => localStorage),
+	skipHydration: true,
+	version: 1,
+	merge: (persisted, current) => {
+		const saved = persisted;
+		return {
+			...current,
+			profile: normalizeProfile(saved?.profile ?? current.profile)
+		};
+	}
+}));
 /**
 * Pronounceable triples. Empty onset/coda are omitted so every word is at least 3 letters
 * and the letter distribution stays inside a small alphabet (low byte entropy on the wire).
@@ -1415,6 +1894,599 @@ function Bench({ session, onSession }) {
 		})]
 	});
 }
+function rid(prefix) {
+	return `${prefix}-${crypto.randomUUID().slice(0, 8)}`;
+}
+function ConfigPanel() {
+	const profile = useProfile((s) => s.profile);
+	const patch = useProfile((s) => s.patch);
+	const [importKind, setImportKind] = (0, import_react.useState)("clash");
+	const [importText, setImportText] = (0, import_react.useState)("DOMAIN-SUFFIX,example.com,PROXY\nGEOSITE,cn,DIRECT\nMATCH,PROXY");
+	const [importError, setImportError] = (0, import_react.useState)(null);
+	const [host, setHost] = (0, import_react.useState)("www.baidu.com");
+	const [ip, setIp] = (0, import_react.useState)("");
+	const [proc, setProc] = (0, import_react.useState)("");
+	const hit = matchRoute(profile, {
+		host,
+		ip,
+		process: proc
+	});
+	const issues = profileIssues(profile);
+	function setInbounds(inbounds) {
+		patch({ inbounds });
+	}
+	function setProcesses(processes) {
+		patch({ processes });
+	}
+	function setRules(rules) {
+		patch({ rules });
+	}
+	return /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", {
+		className: "flex flex-col gap-4",
+		children: [
+			/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("section", {
+				className: "rounded-md border border-line bg-panel p-4",
+				children: [
+					/* @__PURE__ */ (0, import_jsx_runtime.jsx)("h2", {
+						className: "text-base font-medium",
+						children: "通用配置"
+					}),
+					/* @__PURE__ */ (0, import_jsx_runtime.jsx)("p", {
+						className: "mt-2 text-sm text-mist",
+						children: "同一份档案给 Windows、Linux、Android 客户端。固定端口只监听；系统接管还会写出平台转发脚本。程序规则优先于域名和地址规则。"
+					}),
+					/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", {
+						className: "mt-4 flex flex-wrap gap-2",
+						children: [
+							/* @__PURE__ */ (0, import_jsx_runtime.jsx)(Btn, {
+								kind: profile.mode === "fixed-port" ? "solid" : "ghost",
+								onClick: () => patch({ mode: "fixed-port" }),
+								children: "固定端口"
+							}),
+							/* @__PURE__ */ (0, import_jsx_runtime.jsx)(Btn, {
+								kind: profile.mode === "system-forward" ? "solid" : "ghost",
+								onClick: () => patch({ mode: "system-forward" }),
+								children: "系统接管"
+							}),
+							/* @__PURE__ */ (0, import_jsx_runtime.jsx)(Btn, {
+								kind: "ghost",
+								onClick: () => patch(edgePreset()),
+								children: "边缘预设"
+							}),
+							/* @__PURE__ */ (0, import_jsx_runtime.jsx)(Btn, {
+								kind: "ghost",
+								onClick: () => patch(gatePreset()),
+								children: "闸门预设"
+							})
+						]
+					}),
+					/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", {
+						className: "mt-4 grid gap-3 sm:grid-cols-2",
+						children: [
+							/* @__PURE__ */ (0, import_jsx_runtime.jsx)(Field, {
+								label: "名称",
+								children: /* @__PURE__ */ (0, import_jsx_runtime.jsx)("input", {
+									className: control,
+									value: profile.name,
+									onChange: (e) => patch({ name: e.target.value })
+								})
+							}),
+							/* @__PURE__ */ (0, import_jsx_runtime.jsx)(Field, {
+								label: "角色",
+								children: /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("select", {
+									className: control,
+									value: profile.role,
+									onChange: (e) => patch({ role: e.target.value }),
+									children: [/* @__PURE__ */ (0, import_jsx_runtime.jsx)("option", {
+										value: "edge",
+										children: "边缘客户端"
+									}), /* @__PURE__ */ (0, import_jsx_runtime.jsx)("option", {
+										value: "gate",
+										children: "公网闸门"
+									})]
+								})
+							}),
+							/* @__PURE__ */ (0, import_jsx_runtime.jsx)(Field, {
+								label: "对端 主机:端口",
+								children: /* @__PURE__ */ (0, import_jsx_runtime.jsx)("input", {
+									className: control,
+									value: profile.peerEndpoint,
+									placeholder: "203.0.113.8:18443",
+									onChange: (e) => patch({ peerEndpoint: e.target.value })
+								})
+							}),
+							/* @__PURE__ */ (0, import_jsx_runtime.jsx)(Field, {
+								label: "程序未命中时",
+								children: /* @__PURE__ */ (0, import_jsx_runtime.jsx)("select", {
+									className: control,
+									value: profile.processDefault,
+									onChange: (e) => patch({ processDefault: e.target.value }),
+									children: ACTIONS.map((action) => /* @__PURE__ */ (0, import_jsx_runtime.jsx)("option", {
+										value: action,
+										children: actionLabel(action)
+									}, action))
+								})
+							})
+						]
+					})
+				]
+			}),
+			/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("section", {
+				className: "rounded-md border border-line bg-panel p-4",
+				children: [/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", {
+					className: "flex items-center justify-between gap-3",
+					children: [/* @__PURE__ */ (0, import_jsx_runtime.jsx)("h2", {
+						className: "text-base font-medium",
+						children: "入站"
+					}), /* @__PURE__ */ (0, import_jsx_runtime.jsx)(Btn, {
+						kind: "ghost",
+						onClick: () => setInbounds([...profile.inbounds, {
+							id: rid("in"),
+							tag: "新入站",
+							protocol: "socks",
+							listen: "127.0.0.1",
+							port: 1080,
+							targetHost: "",
+							targetPort: 0
+						}]),
+						children: "添加入站"
+					})]
+				}), /* @__PURE__ */ (0, import_jsx_runtime.jsx)("div", {
+					className: "mt-4 flex flex-col gap-3",
+					children: profile.inbounds.map((inbound) => /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", {
+						className: "grid gap-2 rounded-sm bg-panel-2 p-3 sm:grid-cols-2",
+						children: [
+							/* @__PURE__ */ (0, import_jsx_runtime.jsx)("input", {
+								className: control,
+								"aria-label": "入站名称",
+								value: inbound.tag,
+								onChange: (e) => setInbounds(profile.inbounds.map((item) => item.id === inbound.id ? {
+									...item,
+									tag: e.target.value
+								} : item))
+							}),
+							/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("select", {
+								className: control,
+								"aria-label": "入站协议",
+								value: inbound.protocol,
+								onChange: (e) => setInbounds(profile.inbounds.map((item) => item.id === inbound.id ? {
+									...item,
+									protocol: e.target.value
+								} : item)),
+								children: [
+									/* @__PURE__ */ (0, import_jsx_runtime.jsx)("option", {
+										value: "socks",
+										children: "SOCKS"
+									}),
+									/* @__PURE__ */ (0, import_jsx_runtime.jsx)("option", {
+										value: "tcp",
+										children: "固定转发"
+									}),
+									/* @__PURE__ */ (0, import_jsx_runtime.jsx)("option", {
+										value: "tunnel",
+										children: "隧道入口"
+									})
+								]
+							}),
+							/* @__PURE__ */ (0, import_jsx_runtime.jsx)("input", {
+								className: control,
+								"aria-label": "监听地址",
+								value: inbound.listen,
+								onChange: (e) => setInbounds(profile.inbounds.map((item) => item.id === inbound.id ? {
+									...item,
+									listen: e.target.value
+								} : item))
+							}),
+							/* @__PURE__ */ (0, import_jsx_runtime.jsx)("input", {
+								className: control,
+								"aria-label": "监听端口",
+								inputMode: "numeric",
+								value: inbound.port,
+								onChange: (e) => setInbounds(profile.inbounds.map((item) => item.id === inbound.id ? {
+									...item,
+									port: Number(e.target.value)
+								} : item))
+							}),
+							inbound.protocol === "tcp" ? /* @__PURE__ */ (0, import_jsx_runtime.jsxs)(import_jsx_runtime.Fragment, { children: [/* @__PURE__ */ (0, import_jsx_runtime.jsx)("input", {
+								className: control,
+								"aria-label": "目标主机",
+								value: inbound.targetHost,
+								placeholder: "目标主机",
+								onChange: (e) => setInbounds(profile.inbounds.map((item) => item.id === inbound.id ? {
+									...item,
+									targetHost: e.target.value
+								} : item))
+							}), /* @__PURE__ */ (0, import_jsx_runtime.jsx)("input", {
+								className: control,
+								"aria-label": "目标端口",
+								inputMode: "numeric",
+								value: inbound.targetPort,
+								onChange: (e) => setInbounds(profile.inbounds.map((item) => item.id === inbound.id ? {
+									...item,
+									targetPort: Number(e.target.value)
+								} : item))
+							})] }) : null,
+							/* @__PURE__ */ (0, import_jsx_runtime.jsx)(Btn, {
+								kind: "ember",
+								onClick: () => setInbounds(profile.inbounds.filter((item) => item.id !== inbound.id)),
+								children: "删除"
+							})
+						]
+					}, inbound.id))
+				})]
+			}),
+			/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("section", {
+				className: "rounded-md border border-line bg-panel p-4",
+				children: [
+					/* @__PURE__ */ (0, import_jsx_runtime.jsx)("h2", {
+						className: "text-base font-medium",
+						children: "系统接管"
+					}),
+					/* @__PURE__ */ (0, import_jsx_runtime.jsx)("p", {
+						className: "mt-2 text-sm text-mist",
+						children: profile.mode === "system-forward" ? "客户端启动时会按当前系统写出并尝试执行。" : "现在走固定端口。这些参数会跟着配置走，切到系统接管才生效。"
+					}),
+					/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", {
+						className: "mt-4 grid gap-3 lg:grid-cols-3",
+						children: [
+							/* @__PURE__ */ (0, import_jsx_runtime.jsxs)(Platform, {
+								title: "Linux",
+								body: "iptables redirect 或 tproxy。需要 root 才会改规则。",
+								children: [/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("select", {
+									className: control,
+									value: profile.linux.method,
+									onChange: (e) => patch({ linux: {
+										...profile.linux,
+										method: e.target.value
+									} }),
+									children: [/* @__PURE__ */ (0, import_jsx_runtime.jsx)("option", {
+										value: "redirect",
+										children: "redirect"
+									}), /* @__PURE__ */ (0, import_jsx_runtime.jsx)("option", {
+										value: "tproxy",
+										children: "tproxy"
+									})]
+								}), /* @__PURE__ */ (0, import_jsx_runtime.jsx)("input", {
+									className: control,
+									"aria-label": "fwmark",
+									inputMode: "numeric",
+									value: profile.linux.mark,
+									onChange: (e) => patch({ linux: {
+										...profile.linux,
+										mark: Number(e.target.value)
+									} })
+								})]
+							}),
+							/* @__PURE__ */ (0, import_jsx_runtime.jsxs)(Platform, {
+								title: "Windows",
+								body: "portproxy 转发到本地端口，或只记录 WinDivert 过滤。",
+								children: [/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("select", {
+									className: control,
+									value: profile.windows.method,
+									onChange: (e) => patch({ windows: {
+										...profile.windows,
+										method: e.target.value
+									} }),
+									children: [/* @__PURE__ */ (0, import_jsx_runtime.jsx)("option", {
+										value: "portproxy",
+										children: "portproxy"
+									}), /* @__PURE__ */ (0, import_jsx_runtime.jsx)("option", {
+										value: "windivert",
+										children: "WinDivert"
+									})]
+								}), /* @__PURE__ */ (0, import_jsx_runtime.jsx)("input", {
+									className: control,
+									"aria-label": "网关",
+									value: profile.windows.gateway,
+									onChange: (e) => patch({ windows: {
+										...profile.windows,
+										gateway: e.target.value
+									} })
+								})]
+							}),
+							/* @__PURE__ */ (0, import_jsx_runtime.jsxs)(Platform, {
+								title: "Android",
+								body: "写出 VpnService 会话。地址、MTU、DNS 和绕行网段。",
+								children: [/* @__PURE__ */ (0, import_jsx_runtime.jsx)("input", {
+									className: control,
+									"aria-label": "VPN 地址",
+									value: profile.android.address,
+									onChange: (e) => patch({ android: {
+										...profile.android,
+										address: e.target.value
+									} })
+								}), /* @__PURE__ */ (0, import_jsx_runtime.jsx)("input", {
+									className: control,
+									"aria-label": "DNS",
+									value: profile.android.dns,
+									onChange: (e) => patch({ android: {
+										...profile.android,
+										dns: e.target.value
+									} })
+								})]
+							})
+						]
+					})
+				]
+			}),
+			/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("section", {
+				className: "rounded-md border border-line bg-panel p-4",
+				children: [/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", {
+					className: "flex items-center justify-between gap-3",
+					children: [/* @__PURE__ */ (0, import_jsx_runtime.jsx)("h2", {
+						className: "text-base font-medium",
+						children: "按程序接入或绕行"
+					}), /* @__PURE__ */ (0, import_jsx_runtime.jsx)(Btn, {
+						kind: "ghost",
+						onClick: () => setProcesses([...profile.processes, {
+							id: rid("proc"),
+							name: "",
+							action: "proxy"
+						}]),
+						children: "添加程序"
+					})]
+				}), /* @__PURE__ */ (0, import_jsx_runtime.jsx)("div", {
+					className: "mt-4 flex flex-col gap-2",
+					children: profile.processes.map((item) => /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", {
+						className: "grid gap-2 sm:grid-cols-[1fr_8rem_auto]",
+						children: [
+							/* @__PURE__ */ (0, import_jsx_runtime.jsx)("input", {
+								className: control,
+								"aria-label": "程序名",
+								placeholder: "chrome 或 ssh.exe",
+								value: item.name,
+								onChange: (e) => setProcesses(profile.processes.map((row) => row.id === item.id ? {
+									...row,
+									name: e.target.value
+								} : row))
+							}),
+							/* @__PURE__ */ (0, import_jsx_runtime.jsx)("select", {
+								className: control,
+								"aria-label": "程序动作",
+								value: item.action,
+								onChange: (e) => setProcesses(profile.processes.map((row) => row.id === item.id ? {
+									...row,
+									action: e.target.value
+								} : row)),
+								children: ACTIONS.map((action) => /* @__PURE__ */ (0, import_jsx_runtime.jsx)("option", {
+									value: action,
+									children: actionLabel(action)
+								}, action))
+							}),
+							/* @__PURE__ */ (0, import_jsx_runtime.jsx)(Btn, {
+								kind: "ghost",
+								onClick: () => setProcesses(profile.processes.filter((row) => row.id !== item.id)),
+								children: "删除"
+							})
+						]
+					}, item.id))
+				})]
+			}),
+			/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("section", {
+				className: "rounded-md border border-line bg-panel p-4",
+				children: [
+					/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", {
+						className: "flex items-center justify-between gap-3",
+						children: [/* @__PURE__ */ (0, import_jsx_runtime.jsx)("h2", {
+							className: "text-base font-medium",
+							children: "路由"
+						}), /* @__PURE__ */ (0, import_jsx_runtime.jsx)(Btn, {
+							kind: "ghost",
+							onClick: () => setRules([...profile.rules, {
+								id: rid("rule"),
+								type: "DOMAIN-SUFFIX",
+								value: "",
+								action: "proxy"
+							}]),
+							children: "添加规则"
+						})]
+					}),
+					/* @__PURE__ */ (0, import_jsx_runtime.jsx)("div", {
+						className: "mt-4 flex flex-col gap-2",
+						children: profile.rules.map((rule) => /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", {
+							className: "grid gap-2 sm:grid-cols-[10rem_1fr_8rem_auto]",
+							children: [
+								/* @__PURE__ */ (0, import_jsx_runtime.jsx)("select", {
+									className: control,
+									"aria-label": "规则类型",
+									value: rule.type,
+									onChange: (e) => setRules(profile.rules.map((row) => row.id === rule.id ? {
+										...row,
+										type: e.target.value
+									} : row)),
+									children: RULE_TYPES.map((type) => /* @__PURE__ */ (0, import_jsx_runtime.jsx)("option", {
+										value: type,
+										children: type
+									}, type))
+								}),
+								/* @__PURE__ */ (0, import_jsx_runtime.jsx)("input", {
+									className: control,
+									"aria-label": "规则值",
+									value: rule.value,
+									placeholder: rule.type === "MATCH" ? "留空" : "值",
+									onChange: (e) => setRules(profile.rules.map((row) => row.id === rule.id ? {
+										...row,
+										value: e.target.value
+									} : row))
+								}),
+								/* @__PURE__ */ (0, import_jsx_runtime.jsx)("select", {
+									className: control,
+									"aria-label": "规则动作",
+									value: rule.action,
+									onChange: (e) => setRules(profile.rules.map((row) => row.id === rule.id ? {
+										...row,
+										action: e.target.value
+									} : row)),
+									children: ACTIONS.map((action) => /* @__PURE__ */ (0, import_jsx_runtime.jsx)("option", {
+										value: action,
+										children: actionLabel(action)
+									}, action))
+								}),
+								/* @__PURE__ */ (0, import_jsx_runtime.jsx)(Btn, {
+									kind: "ghost",
+									onClick: () => setRules(profile.rules.filter((row) => row.id !== rule.id)),
+									children: "删除"
+								})
+							]
+						}, rule.id))
+					}),
+					/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", {
+						className: "mt-4 grid gap-3",
+						children: [
+							/* @__PURE__ */ (0, import_jsx_runtime.jsx)(Field, {
+								label: "导入格式",
+								children: /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("select", {
+									className: control,
+									value: importKind,
+									onChange: (e) => setImportKind(e.target.value),
+									children: [/* @__PURE__ */ (0, import_jsx_runtime.jsx)("option", {
+										value: "clash",
+										children: "Clash 规则"
+									}), /* @__PURE__ */ (0, import_jsx_runtime.jsx)("option", {
+										value: "sing-box",
+										children: "sing-box route.rules"
+									})]
+								})
+							}),
+							/* @__PURE__ */ (0, import_jsx_runtime.jsx)("textarea", {
+								className: "min-h-32 w-full rounded-sm border border-line bg-ink px-3 py-3 font-mono text-sm text-fg",
+								value: importText,
+								onChange: (e) => setImportText(e.target.value)
+							}),
+							/* @__PURE__ */ (0, import_jsx_runtime.jsx)(Btn, {
+								kind: "ghost",
+								onClick: () => {
+									try {
+										setRules(importKind === "clash" ? importClashRules(importText) : importSingBox(importText));
+										setImportError(null);
+									} catch (err) {
+										setImportError(err instanceof Error ? err.message : "导入失败");
+									}
+								},
+								children: "用这段替换路由"
+							}),
+							importError ? /* @__PURE__ */ (0, import_jsx_runtime.jsx)("p", {
+								className: "text-sm text-ember",
+								children: importError
+							}) : null
+						]
+					})
+				]
+			}),
+			/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("section", {
+				className: "rounded-md border border-line bg-panel p-4",
+				children: [
+					/* @__PURE__ */ (0, import_jsx_runtime.jsx)("h2", {
+						className: "text-base font-medium",
+						children: "geosite / geoip"
+					}),
+					/* @__PURE__ */ (0, import_jsx_runtime.jsx)("p", {
+						className: "mt-2 text-sm text-mist",
+						children: "内置 private、cn、google、telegram，以及 private/cn 的一小段地址。cn 地址只放了常见公共 DNS。完整库填文本 URL，客户端启动时拉。带类别写 `类别 域名` 或 `geoip:cn 1.2.3.0/24`；单独一行域名或地址段归到 remote。额外行写在下面，立刻参与本页试匹配。"
+					}),
+					/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", {
+						className: "mt-4 grid gap-3",
+						children: [
+							/* @__PURE__ */ (0, import_jsx_runtime.jsx)(Field, {
+								label: "geosite 文本 URL",
+								children: /* @__PURE__ */ (0, import_jsx_runtime.jsx)("input", {
+									className: control,
+									value: profile.geositeUrl,
+									onChange: (e) => patch({ geositeUrl: e.target.value })
+								})
+							}),
+							/* @__PURE__ */ (0, import_jsx_runtime.jsx)(Field, {
+								label: "geoip 文本 URL",
+								children: /* @__PURE__ */ (0, import_jsx_runtime.jsx)("input", {
+									className: control,
+									value: profile.geoipUrl,
+									onChange: (e) => patch({ geoipUrl: e.target.value })
+								})
+							}),
+							/* @__PURE__ */ (0, import_jsx_runtime.jsx)(Field, {
+								label: "额外条目",
+								children: /* @__PURE__ */ (0, import_jsx_runtime.jsx)("textarea", {
+									className: "min-h-24 w-full rounded-sm border border-line bg-ink px-3 py-3 font-mono text-sm text-fg",
+									value: profile.extras,
+									onChange: (e) => patch({ extras: e.target.value })
+								})
+							})
+						]
+					})
+				]
+			}),
+			/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("section", {
+				className: "rounded-md border border-line bg-panel p-4",
+				children: [
+					/* @__PURE__ */ (0, import_jsx_runtime.jsx)("h2", {
+						className: "text-base font-medium",
+						children: "试一条"
+					}),
+					/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", {
+						className: "mt-4 grid gap-3 sm:grid-cols-3",
+						children: [
+							/* @__PURE__ */ (0, import_jsx_runtime.jsx)(Field, {
+								label: "域名",
+								children: /* @__PURE__ */ (0, import_jsx_runtime.jsx)("input", {
+									className: control,
+									value: host,
+									onChange: (e) => setHost(e.target.value)
+								})
+							}),
+							/* @__PURE__ */ (0, import_jsx_runtime.jsx)(Field, {
+								label: "地址",
+								children: /* @__PURE__ */ (0, import_jsx_runtime.jsx)("input", {
+									className: control,
+									value: ip,
+									onChange: (e) => setIp(e.target.value)
+								})
+							}),
+							/* @__PURE__ */ (0, import_jsx_runtime.jsx)(Field, {
+								label: "程序",
+								children: /* @__PURE__ */ (0, import_jsx_runtime.jsx)("input", {
+									className: control,
+									value: proc,
+									onChange: (e) => setProc(e.target.value)
+								})
+							})
+						]
+					}),
+					/* @__PURE__ */ (0, import_jsx_runtime.jsx)("p", {
+						className: "mt-3 text-sm",
+						children: hit.reason
+					})
+				]
+			}),
+			issues.length > 0 ? /* @__PURE__ */ (0, import_jsx_runtime.jsx)("ul", {
+				className: "text-sm text-ember",
+				children: issues.map((issue) => /* @__PURE__ */ (0, import_jsx_runtime.jsx)("li", { children: issue }, issue))
+			}) : null,
+			/* @__PURE__ */ (0, import_jsx_runtime.jsx)("div", {
+				className: "flex flex-wrap gap-2",
+				children: /* @__PURE__ */ (0, import_jsx_runtime.jsx)(Btn, {
+					onClick: () => downloadJson("lexis.config.json", profile),
+					children: "导出配置"
+				})
+			})
+		]
+	});
+}
+function Platform({ title, body, children }) {
+	return /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", {
+		className: "flex flex-col gap-2 rounded-sm bg-panel-2 p-3",
+		children: [
+			/* @__PURE__ */ (0, import_jsx_runtime.jsx)("h3", {
+				className: "text-sm font-medium",
+				children: title
+			}),
+			/* @__PURE__ */ (0, import_jsx_runtime.jsx)("p", {
+				className: "text-sm text-mist",
+				children: body
+			}),
+			children
+		]
+	});
+}
 function LexiconPanel({ session }) {
 	const [query, setQuery] = (0, import_react.useState)("");
 	const [source, setSource] = (0, import_react.useState)("session");
@@ -2069,8 +3141,17 @@ var TABS = [
 	{
 		id: "lexicon",
 		label: "词表"
+	},
+	{
+		id: "config",
+		label: "配置"
 	}
 ];
+function tabFromLocation() {
+	if (typeof window === "undefined") return "overview";
+	const value = new URLSearchParams(window.location.search).get("tab");
+	return TABS.some((item) => item.id === value) ? value : "overview";
+}
 function Console() {
 	const [tab, setTab] = (0, import_react.useState)("overview");
 	const [booted, setBooted] = (0, import_react.useState)(false);
@@ -2082,8 +3163,12 @@ function Console() {
 		(async () => {
 			try {
 				await useMesh.persist.rehydrate();
+				await useProfile.persist.rehydrate();
 				await ensureSeed();
-				if (live) setBooted(true);
+				if (live) {
+					setTab(tabFromLocation());
+					setBooted(true);
+				}
 			} catch (err) {
 				if (live) setBootError(err instanceof Error ? err.message : "节点没有读出来");
 			}
@@ -2128,9 +3213,16 @@ function Console() {
 						className: "text-sm text-mist",
 						children: "低熵远程组网"
 					})] })]
-				}), /* @__PURE__ */ (0, import_jsx_runtime.jsx)("p", {
-					className: "font-mono text-xs text-mist",
-					children: windowId === null ? `窗长 ${SPEC.windowSec}s` : `时间窗 ${windowId} · 剩余 ${windowRemain(now)}s`
+				}), /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", {
+					className: "flex items-center gap-4",
+					children: [/* @__PURE__ */ (0, import_jsx_runtime.jsx)("p", {
+						className: "font-mono text-xs text-mist",
+						children: windowId === null ? `窗长 ${SPEC.windowSec}s` : `时间窗 ${windowId} · 剩余 ${windowRemain(now)}s`
+					}), /* @__PURE__ */ (0, import_jsx_runtime.jsx)(Link, {
+						to: "/download",
+						className: "inline-flex min-h-11 items-center text-sm text-sage",
+						children: "下载"
+					})]
 				})]
 			}), /* @__PURE__ */ (0, import_jsx_runtime.jsx)("nav", {
 				className: "mx-auto flex max-w-6xl gap-1 overflow-x-auto px-4",
@@ -2161,7 +3253,8 @@ function Console() {
 					session,
 					onSession: setSession
 				}) : null,
-				booted && tab === "lexicon" ? /* @__PURE__ */ (0, import_jsx_runtime.jsx)(LexiconPanel, { session }) : null
+				booted && tab === "lexicon" ? /* @__PURE__ */ (0, import_jsx_runtime.jsx)(LexiconPanel, { session }) : null,
+				booted && tab === "config" ? /* @__PURE__ */ (0, import_jsx_runtime.jsx)(ConfigPanel, {}) : null
 			]
 		})]
 	});

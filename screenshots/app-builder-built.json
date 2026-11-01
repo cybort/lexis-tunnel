@@ -7,9 +7,9 @@
       "status": 200,
       "title": "词隙 LEXIS",
       "hasCanvas": false,
-      "bodyTextLen": 648,
-      "bodyTextHash": "ef7aa759e88b863d4cfccbf889c70017cc5f24642a987f5c55387133d06fce84",
-      "bodyTextPrefix": "词隙 LEXIS 低熵远程组网 时间窗 5978405 · 剩余 60s 总览 节点 映射 隧道 词表 节点 1 闸门 · 1 ",
+      "bodyTextLen": 62,
+      "bodyTextHash": "459dd8796c5733a77a695327436d005ac7890cdf65f713805422c6ccf91adb99",
+      "bodyTextPrefix": "词隙 LEXIS 低熵远程组网 窗长 300s 下载 总览 节点 映射 隧道 词表 配置 正在这台浏览器里准备闸门和内网端。",
       "horizontalOverflow": false,
       "consoleErrors": [],
       "pageErrors": [],
@@ -21,9 +21,9 @@
       "status": 200,
       "title": "词隙 LEXIS",
       "hasCanvas": false,
-      "bodyTextLen": 648,
-      "bodyTextHash": "aee01d1ff718c48e179184120cc1cdc346cc75146ec5fdd3eed86cb84f74d18f",
-      "bodyTextPrefix": "词隙 LEXIS 低熵远程组网 时间窗 5978405 · 剩余 59s 总览 节点 映射 隧道 词表 节点 1 闸门 · 1 ",
+      "bodyTextLen": 655,
+      "bodyTextHash": "cee1ba5529e1e5c5c2b036c2e1fd967bd0814a88dc1250d17a7490e8722e4fbb",
+      "bodyTextPrefix": "词隙 LEXIS 低熵远程组网 时间窗 5978413 · 剩余 265s 下载 总览 节点 映射 隧道 词表 配置 节点 1 ",
       "horizontalOverflow": false,
       "consoleErrors": [],
       "pageErrors": [],
@@ -35,7 +35,6 @@
   "verdictFile": "/workspace/screenshots/app-builder-built.json",
   "divergesFromBaseline": true,
   "baselineReasons": [
-    "desktop: body text changed (56 -> 648 chars, hash mismatch)",
-    "mobile: body text changed (56 -> 648 chars, hash mismatch)"
+    "mobile: body text changed (62 -> 655 chars, hash mismatch)"
   ]
 }
