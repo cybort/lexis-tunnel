@@ -6,12 +6,21 @@ import {
   ecdh,
   fingerprintOf,
   hmac,
-  hkdf,
   importPrivateJwk,
   importRawPublic,
   LexisError,
   type KeyMaterial,
 } from "./crypto";
+import {
+  clampOffer,
+  decodeKdf,
+  deriveSessionKey,
+  encodeKdf,
+  featureByte,
+  honeyFromFeatures,
+  type ArgonParams,
+  type SessionOffer,
+} from "./kdf";
 import { invertLexicon, sessionLexicon } from "./lexicon";
 import { SPEC } from "./spec";
 import type { MeshNode } from "./types";
@@ -33,6 +42,9 @@ export type LiveSession = {
   gateName: string;
   edgeFp: string;
   gateFp: string;
+  kdf: ArgonParams;
+  honey: boolean;
+  kdfMs: number;
 };
 
 export type EdgePending = {
@@ -73,9 +85,11 @@ function transcript(parts: {
   window: number;
   nonceC: Uint8Array;
   nonceS: Uint8Array;
+  kdf: Uint8Array;
+  features: number;
 }): Uint8Array {
   return concat(
-    utf8("LEXIS1"),
+    utf8("LEXIS2"),
     parts.ephC,
     parts.ephS,
     parts.ltC,
@@ -83,19 +97,13 @@ function transcript(parts: {
     u32be(parts.window),
     parts.nonceC,
     parts.nonceS,
+    parts.kdf,
+    new Uint8Array([parts.features & 0xff]),
   );
 }
 
-async function deriveSk(ssE: Uint8Array, ssS: Uint8Array, nonceC: Uint8Array, nonceS: Uint8Array, window: number) {
-  return hkdf(
-    concat(ssE, ssS),
-    concat(nonceC, nonceS, u32be(window)),
-    utf8("LEXIS-SK-v1"),
-    32,
-  );
-}
-
-export async function edgeStart(edge: MeshNode, now = Date.now()): Promise<EdgePending> {
+export async function edgeStart(edge: MeshNode, now = Date.now(), offer?: Partial<SessionOffer>): Promise<EdgePending> {
+  const wanted = clampOffer(offer);
   const eph = await createIdentity();
   const ltRaw = unb64(edge.publicRawB64);
   assertPoint(ltRaw, "内网端");
@@ -108,33 +116,39 @@ export async function edgeStart(edge: MeshNode, now = Date.now()): Promise<EdgeP
     ltRaw,
     u32be(window),
     nonceC,
+    encodeKdf(wanted),
+    new Uint8Array([featureByte(wanted.honey)]),
   );
   const helloWire = await encodeStatic(blob);
   return { eph, nonceC, window, helloWire, ltRaw };
 }
 
 function parseHello(buf: Uint8Array) {
-  if (buf.length !== 2 + 65 + 65 + 4 + 16) throw new LexisError("客户端问候长度不对");
+  if (buf.length !== 2 + 65 + 65 + 4 + 16 + 4 + 1) throw new LexisError("客户端问候长度不对");
   if (buf[0] !== 1 || buf[1] !== 1) throw new LexisError("客户端问候版本不对");
   const ephRaw = buf.slice(2, 67);
   const ltRaw = buf.slice(67, 132);
   const window = (buf[132] << 24) | (buf[133] << 16) | (buf[134] << 8) | buf[135];
   const nonce = buf.slice(136, 152);
+  const kdf = decodeKdf(buf, 152);
+  const features = buf[156];
   assertPoint(ephRaw, "对端临时");
   assertPoint(ltRaw, "对端长期");
-  return { ephRaw, ltRaw, window: window >>> 0, nonce };
+  return { ephRaw, ltRaw, window: window >>> 0, nonce, kdf, features };
 }
 
 function parseServer(buf: Uint8Array) {
-  if (buf.length !== 2 + 65 + 65 + 16 + 16) throw new LexisError("服务端问候长度不对");
+  if (buf.length !== 2 + 65 + 65 + 16 + 16 + 4 + 1) throw new LexisError("服务端问候长度不对");
   if (buf[0] !== 1 || buf[1] !== 2) throw new LexisError("服务端问候版本不对");
   const ephRaw = buf.slice(2, 67);
   const ltRaw = buf.slice(67, 132);
   const nonce = buf.slice(132, 148);
   const confirm = buf.slice(148, 164);
+  const kdf = decodeKdf(buf, 164);
+  const features = buf[168];
   assertPoint(ephRaw, "闸门临时");
   assertPoint(ltRaw, "闸门长期");
-  return { ephRaw, ltRaw, nonce, confirm };
+  return { ephRaw, ltRaw, nonce, confirm, kdf, features };
 }
 
 export async function gateRespond(
@@ -152,7 +166,10 @@ export async function gateRespond(
   const nonceS = crypto.getRandomValues(new Uint8Array(16));
   const ssE = await ecdh(await importPrivateJwk(ephS.privateJwk), await importRawPublic(hello.ephRaw));
   const ssS = await ecdh(await importPrivateJwk(gate.privateJwk), await importRawPublic(hello.ltRaw));
-  const sk = await deriveSk(ssE, ssS, hello.nonce, nonceS, hello.window);
+  const kdfBytes = encodeKdf(hello.kdf);
+  const features = hello.features & 0xff;
+  const derived = deriveSessionKey(ssE, ssS, hello.nonce, nonceS, hello.window, features, hello.kdf);
+  const sk = derived.key;
   const tr = transcript({
     ephC: hello.ephRaw,
     ephS: ephS.publicRaw,
@@ -161,10 +178,12 @@ export async function gateRespond(
     window: hello.window,
     nonceC: hello.nonce,
     nonceS,
+    kdf: kdfBytes,
+    features,
   });
   const confirmS = (await hmac(sk, concat(utf8("lexis-srv-v1"), tr))).subarray(0, 16);
   const expectFinish = (await hmac(sk, concat(utf8("lexis-cli-v1"), tr))).subarray(0, 16);
-  const blob = concat(new Uint8Array([1, 2]), ephS.publicRaw, ltS, nonceS, confirmS);
+  const blob = concat(new Uint8Array([1, 2]), ephS.publicRaw, ltS, nonceS, confirmS, kdfBytes, new Uint8Array([features]));
   const serverWire = await encodeStatic(blob);
   return {
     sk,
@@ -185,7 +204,7 @@ export async function edgeFinish(
   pending: EdgePending,
   gateRawB64: string,
   serverWire: string,
-): Promise<{ sk: Uint8Array; finishWire: string; window: number }> {
+): Promise<{ sk: Uint8Array; finishWire: string; window: number; kdf: ArgonParams; honey: boolean; kdfMs: number }> {
   const server = parseServer(await decodeStatic(serverWire));
   const pinned = unb64(gateRawB64);
   if (!timingSafeEqual(server.ltRaw, pinned)) {
@@ -199,7 +218,9 @@ export async function edgeFinish(
     await importPrivateJwk(edge.privateJwk),
     await importRawPublic(server.ltRaw),
   );
-  const sk = await deriveSk(ssE, ssS, pending.nonceC, server.nonce, pending.window);
+  const features = server.features & 0xff;
+  const derived = deriveSessionKey(ssE, ssS, pending.nonceC, server.nonce, pending.window, features, server.kdf);
+  const sk = derived.key;
   const tr = transcript({
     ephC: pending.eph.publicRaw,
     ephS: server.ephRaw,
@@ -208,6 +229,8 @@ export async function edgeFinish(
     window: pending.window,
     nonceC: pending.nonceC,
     nonceS: server.nonce,
+    kdf: encodeKdf(server.kdf),
+    features,
   });
   const expectS = (await hmac(sk, concat(utf8("lexis-srv-v1"), tr))).subarray(0, 16);
   if (!timingSafeEqual(expectS, server.confirm)) {
@@ -215,7 +238,14 @@ export async function edgeFinish(
   }
   const confirmC = (await hmac(sk, concat(utf8("lexis-cli-v1"), tr))).subarray(0, 16);
   const finishWire = await encodeStatic(concat(new Uint8Array([1, 3]), confirmC));
-  return { sk, finishWire, window: pending.window };
+  return {
+    sk,
+    finishWire,
+    window: pending.window,
+    kdf: server.kdf,
+    honey: honeyFromFeatures(features),
+    kdfMs: derived.ms,
+  };
 }
 
 export async function gateAccept(pending: GatePending, finishWire: string): Promise<void> {
@@ -235,6 +265,9 @@ export async function openSession(opts: {
   helloWire: string;
   serverWire: string;
   finishWire: string;
+  kdf: ArgonParams;
+  honey: boolean;
+  kdfMs: number;
 }): Promise<LiveSession> {
   const lexicon = await sessionLexicon(opts.sk, opts.window);
   const inverse = invertLexicon(lexicon);
@@ -254,18 +287,26 @@ export async function openSession(opts: {
     gateName: opts.gate.name,
     edgeFp: opts.edge.fingerprint,
     gateFp: opts.gate.fingerprint,
+    kdf: opts.kdf,
+    honey: opts.honey,
+    kdfMs: opts.kdfMs,
   };
 }
 
 /** Both roles, in order. The browser lab runs this; a real split process would run each step on its host. */
-export async function establish(edge: MeshNode, gate: MeshNode, now = Date.now()): Promise<LiveSession> {
+export async function establish(
+  edge: MeshNode,
+  gate: MeshNode,
+  now = Date.now(),
+  offer?: Partial<SessionOffer>,
+): Promise<LiveSession> {
   if (edge.role !== "edge" || gate.role !== "gate") {
     throw new LexisError("需要一个内网端和一个公网闸门");
   }
   if (edge.pinnedPeerId !== gate.id || gate.pinnedPeerId !== edge.id) {
     throw new LexisError("两端还没有互相绑定");
   }
-  const started = await edgeStart(edge, now);
+  const started = await edgeStart(edge, now, offer);
   const responded = await gateRespond(gate, edge.publicRawB64, started.helloWire);
   const finished = await edgeFinish(edge, started, gate.publicRawB64, responded.serverWire);
   await gateAccept(responded, finished.finishWire);
@@ -280,5 +321,8 @@ export async function establish(edge: MeshNode, gate: MeshNode, now = Date.now()
     helloWire: started.helloWire,
     serverWire: responded.serverWire,
     finishWire: finished.finishWire,
+    kdf: finished.kdf,
+    honey: finished.honey,
+    kdfMs: finished.kdfMs,
   });
 }

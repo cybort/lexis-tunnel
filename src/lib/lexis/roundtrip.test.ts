@@ -24,6 +24,7 @@ async function makeNode(name: string, role: MeshNode["role"]): Promise<MeshNode>
     fingerprint: key.fingerprint,
     pinnedPeerId: null,
     createdAt: Date.now(),
+    kdf: null,
   };
 }
 

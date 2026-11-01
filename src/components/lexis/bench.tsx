@@ -4,6 +4,8 @@ import { entropyPair } from "@/lib/lexis/entropy";
 import { establish, type LiveSession } from "@/lib/lexis/handshake";
 import { LexisError } from "@/lib/lexis/crypto";
 import { invertLexicon, sessionLexicon } from "@/lib/lexis/lexicon";
+import { packPayload, unpackPayload } from "@/lib/lexis/pack";
+import { useProfile } from "@/lib/lexis/profile-store";
 import { decodeRecord, encodeRecord, heartbeatPayload, RECORD, recordLabel } from "@/lib/lexis/records";
 import { open, seal, type Direction } from "@/lib/lexis/seal";
 import { useMesh } from "@/lib/lexis/store";
@@ -62,6 +64,7 @@ export function Bench({
 }) {
   const nodes = useMesh((s) => s.nodes);
   const mappings = useMesh((s) => s.mappings);
+  const profile = useProfile((s) => s.profile);
   const edges = nodes.filter((n) => n.role === "edge");
   const gates = nodes.filter((n) => n.role === "gate");
   const [edgeId, setEdgeId] = useState(edges[0]?.id ?? "");
@@ -91,8 +94,12 @@ export function Bench({
     setLastFrame(null);
     onSession(null);
     try {
-      const next = await establish(edge, gate);
+      const next = await establish(edge, gate, Date.now(), { ...profile.kdf, honey: profile.honey });
       onSession(next);
+      push({
+        title: "会话密钥已按握手回声派生",
+        meta: `Argon2id ${next.kdf.memoryKiB} KiB · t${next.kdf.iterations} · p${next.kdf.parallelism} · ${next.kdfMs} ms · ${next.honey ? "蜜文" : "坏帧会被拒绝"}`,
+      });
       for (const item of [
         { title: "内网端 → 闸门 · 问候", prose: next.helloWire },
         { title: "闸门 → 内网端 · 临时公钥和确认", prose: next.serverWire },
@@ -114,42 +121,54 @@ export function Bench({
     }
   }
 
-  async function transmit(dir: Direction, plaintext: Uint8Array, title: string) {
-    if (!session) throw new LexisError("还没有会话");
-    const counter = session.counters[dir] + 1;
+  async function frame(current: LiveSession, dir: Direction, plaintext: Uint8Array) {
+    const packed = await packPayload(plaintext, profile.zstd);
+    const counter = current.counters[dir] + 1;
     const prose = await seal({
-      key: session.sk,
-      lexicon: session.lexicon,
+      key: current.sk,
+      lexicon: current.lexicon,
       counter,
-      window: session.window,
+      window: current.window,
       direction: dir,
-      plaintext,
+      plaintext: packed.bytes,
     });
     const opened = await open({
-      key: session.sk,
-      inverse: session.inverse,
-      window: session.window,
+      key: current.sk,
+      inverse: current.inverse,
+      window: current.window,
       direction: dir,
       prose,
-      lastSeen: session.seen[dir],
+      lastSeen: current.seen[dir],
+      honey: current.honey,
     });
+    if (opened.honey) throw new LexisError("正确密钥不该落到蜜文");
+    const unpacked = await unpackPayload(opened.plaintext, false);
     const next: LiveSession = {
-      ...session,
-      counters: { ...session.counters, [dir]: opened.counter },
-      seen: { ...session.seen, [dir]: opened.counter },
+      ...current,
+      counters: { ...current.counters, [dir]: opened.counter },
+      seen: { ...current.seen, [dir]: opened.counter },
     };
-    onSession(next);
-    setLastFrame({ prose, direction: dir });
-    const ent = entropyPair(prose);
-    const rec = decodeRecord(opened.plaintext);
+    const sense = unpacked.compressed
+      ? `对端看见类型 1，按帧头解开 zstd ${packed.level}`
+      : "对端看见类型 0，按原文使用";
+    return { prose, unpacked, next, counter: opened.counter, sense };
+  }
+
+  async function transmit(dir: Direction, plaintext: Uint8Array, title: string) {
+    if (!session) throw new LexisError("还没有会话");
+    const framed = await frame(session, dir, plaintext);
+    onSession(framed.next);
+    setLastFrame({ prose: framed.prose, direction: dir });
+    const ent = entropyPair(framed.prose);
+    const rec = decodeRecord(framed.unpacked.data);
     push({
       title,
-      prose,
-      meta: `${dir === "g2e" ? "闸门 → 内网" : "内网 → 闸门"} · 计数器 ${opened.counter} · ${recordLabel(rec.type)} · conn ${rec.conn} · seq ${rec.seq} · ${ent.nbytes} 字节 · 熵 ${ent.wire.toFixed(2)}`,
+      prose: framed.prose,
+      meta: `${dir === "g2e" ? "闸门 → 内网" : "内网 → 闸门"} · 计数器 ${framed.counter} · ${recordLabel(rec.type)} · conn ${rec.conn} · seq ${rec.seq} · ${ent.nbytes} 字节 · 熵 ${ent.wire.toFixed(2)} · ${framed.sense}`,
       wire: ent.wire,
       random: ent.random,
     });
-    return { prose, payload: rec.payload, session: next };
+    return { prose: framed.prose, payload: rec.payload, session: framed.next };
   }
 
   async function sendDraft() {
@@ -213,35 +232,15 @@ export function Bench({
     let current = session;
     try {
       const run = async (dir: Direction, type: number, conn: number, seq: number, body: string, title: string) => {
-        const counter = current.counters[dir] + 1;
-        const prose = await seal({
-          key: current.sk,
-          lexicon: current.lexicon,
-          counter,
-          window: current.window,
-          direction: dir,
-          plaintext: encodeRecord(type, conn, seq, utf8(body)),
-        });
-        const opened = await open({
-          key: current.sk,
-          inverse: current.inverse,
-          window: current.window,
-          direction: dir,
-          prose,
-          lastSeen: current.seen[dir],
-        });
-        current = {
-          ...current,
-          counters: { ...current.counters, [dir]: opened.counter },
-          seen: { ...current.seen, [dir]: opened.counter },
-        };
-        setLastFrame({ prose, direction: dir });
-        const ent = entropyPair(prose);
-        const rec = decodeRecord(opened.plaintext);
+        const framed = await frame(current, dir, encodeRecord(type, conn, seq, utf8(body)));
+        current = framed.next;
+        setLastFrame({ prose: framed.prose, direction: dir });
+        const ent = entropyPair(framed.prose);
+        const rec = decodeRecord(framed.unpacked.data);
         push({
           title,
-          prose,
-          meta: `${recordLabel(rec.type)} · ${ent.nbytes} B · 熵 ${ent.wire.toFixed(2)} / 随机 ${ent.random.toFixed(2)} · 拆出 ${showPayload(rec.payload).replace(/\s+/g, " ").slice(0, 80)}`,
+          prose: framed.prose,
+          meta: `${recordLabel(rec.type)} · ${ent.nbytes} B · 熵 ${ent.wire.toFixed(2)} / 随机 ${ent.random.toFixed(2)} · ${framed.sense} · 拆出 ${showPayload(rec.payload).replace(/\s+/g, " ").slice(0, 80)}`,
           wire: ent.wire,
           random: ent.random,
         });
@@ -268,6 +267,40 @@ export function Bench({
     } catch (err) {
       onSession(current);
       setError(err instanceof Error ? err.message : "演练中断");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function wrongKey() {
+    if (!session || !lastFrame) {
+      setError("先发出一帧，再用一把错误密钥去拆");
+      return;
+    }
+    setBusy(true);
+    setError(null);
+    try {
+      const opened = await open({
+        key: randomBytes(32),
+        inverse: session.inverse,
+        window: session.window,
+        direction: lastFrame.direction,
+        prose: lastFrame.prose,
+        lastSeen: 0,
+        honey: session.honey,
+      });
+      const text = isPrintableText(opened.plaintext) ? fromUtf8(opened.plaintext) : hex(opened.plaintext);
+      push({
+        title: opened.honey ? "错误密钥落到一句蜜文" : "错误密钥居然拆开了原文",
+        meta: text,
+        bad: !opened.honey,
+      });
+    } catch (err) {
+      push({
+        title: "错误密钥被校验挡住",
+        meta: err instanceof Error ? err.message : "拆不开",
+        bad: true,
+      });
     } finally {
       setBusy(false);
     }
@@ -345,8 +378,15 @@ export function Bench({
           {session ? (
             <dl className="mt-4 space-y-2 text-sm">
               <div>
-                <dt className="text-mist">会话密钥</dt>
+                <dt className="text-mist">会话密钥 · Argon2id</dt>
                 <dd className="break-all font-mono text-xs">{session.skFp}</dd>
+              </div>
+              <div>
+                <dt className="text-mist">派生</dt>
+                <dd className="font-mono text-xs">
+                  {session.kdf.memoryKiB} KiB · t{session.kdf.iterations} · p{session.kdf.parallelism} · {session.kdfMs} ms ·{" "}
+                  {session.honey ? "蜜文" : "校验失败即拒绝"}
+                </dd>
               </div>
               <div>
                 <dt className="text-mist">时间窗</dt>
@@ -371,6 +411,9 @@ export function Bench({
             </Btn>
             <Btn kind="ghost" disabled={!session || busy} onClick={() => void sendRandom()}>
               随机字节
+            </Btn>
+            <Btn kind="ghost" disabled={!session || busy || !lastFrame} onClick={() => void wrongKey()}>
+              用错误密钥拆上一帧
             </Btn>
             <Btn kind="ghost" disabled={!session || busy} onClick={() => void wrongWindow()}>
               用下一窗拆上一帧

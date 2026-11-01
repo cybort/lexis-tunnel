@@ -14,6 +14,7 @@ import {
   type ProcessRule,
   type RouteRule,
 } from "@/lib/lexis/profile";
+import { clampKdf } from "@/lib/lexis/kdf";
 import { useProfile } from "@/lib/lexis/profile-store";
 import { downloadJson } from "@/lib/lexis/store";
 import { Btn, control, Field } from "./ui";
@@ -83,6 +84,89 @@ export function ConfigPanel() {
               {ACTIONS.map((action) => (
                 <option key={action} value={action}>
                   {actionLabel(action)}
+                </option>
+              ))}
+            </select>
+          </Field>
+        </div>
+      </section>
+
+      <section className="rounded-md border border-line bg-panel p-4">
+        <h2 className="text-base font-medium">密钥与压缩</h2>
+        <p className="mt-2 text-sm text-mist">
+          长期私钥可以用口令做 Argon2id 派生，在节点页操作。会话密钥也是 Argon2id，材料是两次 ECDH 的共享秘密。内存、迭代、并行和蜜文开关放进握手，闸门把超出上限的参数压回来再回声，两端按回声计算。
+        </p>
+        <p className="mt-2 text-sm text-mist">
+          压缩不靠这份配置在对端对齐。明文第一个字节是类型：0 是原文，1 是 zstd 帧。等级决定窗口，窗口写在帧头里，对端解开以后自己读。比原文更大时这一帧会改回类型 0。
+        </p>
+        <p className="mt-2 text-sm text-mist">
+          蜜文在握手时谈定。打开以后，校验对不上不报错，而按公开词表落成另一句话。线上没有「这是蜜文」的位。没有先验明文的人分不出猜对还是猜错。这个模式不再提示报文被改过。
+        </p>
+        <div className="mt-4 grid gap-3 sm:grid-cols-3">
+          <Field label="Argon2 内存 KiB">
+            <select
+              className={control}
+              value={profile.kdf.memoryKiB}
+              onChange={(e) => patch({ kdf: clampKdf({ ...profile.kdf, memoryKiB: Number(e.target.value) }) })}
+            >
+              {[1024, 4096, 8192, 19456, 65536].map((n) => (
+                <option key={n} value={n}>
+                  {n}
+                </option>
+              ))}
+            </select>
+          </Field>
+          <Field label="迭代">
+            <select
+              className={control}
+              value={profile.kdf.iterations}
+              onChange={(e) => patch({ kdf: clampKdf({ ...profile.kdf, iterations: Number(e.target.value) }) })}
+            >
+              {[1, 2, 3, 4].map((n) => (
+                <option key={n} value={n}>
+                  {n}
+                </option>
+              ))}
+            </select>
+          </Field>
+          <Field label="并行">
+            <select
+              className={control}
+              value={profile.kdf.parallelism}
+              onChange={(e) => patch({ kdf: clampKdf({ ...profile.kdf, parallelism: Number(e.target.value) }) })}
+            >
+              {[1, 2].map((n) => (
+                <option key={n} value={n}>
+                  {n}
+                </option>
+              ))}
+            </select>
+          </Field>
+        </div>
+        <div className="mt-4 flex flex-wrap gap-2">
+          <Btn kind={profile.honey ? "solid" : "ghost"} onClick={() => patch({ honey: true })}>
+            蜜文打开
+          </Btn>
+          <Btn kind={!profile.honey ? "solid" : "ghost"} onClick={() => patch({ honey: false })}>
+            蜜文关闭
+          </Btn>
+          <Btn kind={profile.zstd.enabled ? "solid" : "ghost"} onClick={() => patch({ zstd: { ...profile.zstd, enabled: true } })}>
+            发送时尝试 zstd
+          </Btn>
+          <Btn kind={!profile.zstd.enabled ? "solid" : "ghost"} onClick={() => patch({ zstd: { ...profile.zstd, enabled: false } })}>
+            不压缩
+          </Btn>
+        </div>
+        <div className="mt-4 max-w-xs">
+          <Field label="zstd 等级">
+            <select
+              className={control}
+              value={profile.zstd.level}
+              onChange={(e) => patch({ zstd: { ...profile.zstd, level: Number(e.target.value) } })}
+            >
+              {[1, 3, 6, 9, 19].map((n) => (
+                <option key={n} value={n}>
+                  {n}
                 </option>
               ))}
             </select>

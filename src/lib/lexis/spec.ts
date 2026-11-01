@@ -3,7 +3,8 @@
 export const SPEC = {
   name: "lexis-codebook-ctr-v1",
   curve: "P-256",
-  kdf: "HKDF-SHA-256",
+  kdf: "Argon2id",
+  expand: "HKDF-SHA-256",
   mac: "HMAC-SHA-256",
   macBytes: 16,
   lexiconSize: 4096,

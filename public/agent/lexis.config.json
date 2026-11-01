@@ -88,5 +88,15 @@
     "mtu": 1500,
     "address": "10.7.0.2/32",
     "dns": "1.1.1.1"
+  },
+  "kdf": {
+    "memoryKiB": 4096,
+    "iterations": 2,
+    "parallelism": 1
+  },
+  "honey": false,
+  "zstd": {
+    "enabled": false,
+    "level": 3
   }
 }

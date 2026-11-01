@@ -1,14 +1,23 @@
 import { useRef, useState } from "react";
 import { Download, Trash2 } from "lucide-react";
-import { b64 } from "@/lib/lexis/bytes";
+import { b64, randomBytes } from "@/lib/lexis/bytes";
 import { identityFromJwks, LexisError } from "@/lib/lexis/crypto";
+import { clampKdf, deriveIdentity } from "@/lib/lexis/kdf";
+import { useProfile } from "@/lib/lexis/profile-store";
 import { SPEC } from "@/lib/lexis/spec";
 import { downloadJson, makeNode, sidecarOf, useMesh } from "@/lib/lexis/store";
-import type { MeshNode, NodeRole } from "@/lib/lexis/types";
+import type { MeshNode, NodeKdf, NodeRole } from "@/lib/lexis/types";
 import { Btn, control, Field } from "./ui";
 
 function roleLabel(role: NodeRole) {
   return role === "gate" ? "公网闸门" : "内网端";
+}
+
+function readKdf(value: unknown): NodeKdf | null {
+  if (!value || typeof value !== "object") return null;
+  const raw = value as Partial<NodeKdf>;
+  if (typeof raw.saltB64 !== "string" || !raw.saltB64) return null;
+  return { saltB64: raw.saltB64, ...clampKdf(raw) };
 }
 
 export function NodesPanel() {
@@ -18,6 +27,7 @@ export function NodesPanel() {
   const removeNode = useMesh((s) => s.removeNode);
   const bindPair = useMesh((s) => s.bindPair);
   const reset = useMesh((s) => s.reset);
+  const setIdentity = useMesh((s) => s.setIdentity);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const fileRef = useRef<HTMLInputElement>(null);
@@ -54,6 +64,7 @@ export function NodesPanel() {
         fingerprint: ident.fingerprint,
         pinnedPeerId: null,
         createdAt: Date.now(),
+        kdf: readKdf(data.kdf),
       };
       addNode(node);
       const peerFp = data.pinnedPeerFingerprint;
@@ -63,6 +74,33 @@ export function NodesPanel() {
       }
     } catch (err) {
       setError(err instanceof Error ? err.message : "侧车读不了");
+    }
+  }
+
+  async function deriveNode(id: string, passphrase: string) {
+    const trimmed = passphrase.trim();
+    if (!trimmed) {
+      setError("先写口令");
+      return;
+    }
+    setBusy(true);
+    setError(null);
+    try {
+      const params = clampKdf(useProfile.getState().profile.kdf);
+      const salt = randomBytes(16);
+      const ident = await deriveIdentity(trimmed, salt, params);
+      const kdf: NodeKdf = { saltB64: b64(salt), ...params };
+      setIdentity(id, {
+        publicJwk: ident.publicJwk,
+        privateJwk: ident.privateJwk,
+        publicRawB64: b64(ident.publicRaw),
+        fingerprint: ident.fingerprint,
+        kdf,
+      });
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "派生失败");
+    } finally {
+      setBusy(false);
     }
   }
 
@@ -99,7 +137,9 @@ export function NodesPanel() {
         />
       </div>
       {error ? <p className="text-sm text-ember">{error}</p> : null}
-      <p className="text-sm text-mist">私钥只留在这台浏览器。导出的侧车等于节点身份，不要公开传输。</p>
+      <p className="text-sm text-mist">
+        私钥只留在这台浏览器。口令派生不保存口令，也不存校验位：换一个口令只会得到另一把合法私钥，不会提示口令错误。
+      </p>
       <div className="grid gap-3 lg:grid-cols-2">
         {nodes.map((node) => (
           <NodeCard
@@ -110,6 +150,7 @@ export function NodesPanel() {
             onName={(name) => updateNode(node.id, { name })}
             onBind={(peerId) => bindPair(node.id, peerId)}
             onRemove={() => removeNode(node.id)}
+            onDerive={(passphrase) => deriveNode(node.id, passphrase)}
           />
         ))}
       </div>
@@ -124,6 +165,7 @@ function NodeCard({
   onName,
   onBind,
   onRemove,
+  onDerive,
 }: {
   node: MeshNode;
   peers: MeshNode[];
@@ -131,8 +173,11 @@ function NodeCard({
   onName: (name: string) => void;
   onBind: (peerId: string) => void;
   onRemove: () => void;
+  onDerive: (passphrase: string) => Promise<void>;
 }) {
   const [peerId, setPeerId] = useState(node.pinnedPeerId ?? "");
+  const [passphrase, setPassphrase] = useState("");
+  const [deriving, setDeriving] = useState(false);
   return (
     <article className="rounded-md border border-line bg-panel p-4">
       <div className="flex items-start justify-between gap-3">
@@ -155,6 +200,13 @@ function NodeCard({
         </button>
       </div>
       <p className="mt-3 break-all font-mono text-xs text-mist">{node.fingerprint}</p>
+      {node.kdf ? (
+        <p className="mt-2 text-sm text-mist">
+          Argon2id · 内存 {node.kdf.memoryKiB} KiB · 迭代 {node.kdf.iterations} · 并行 {node.kdf.parallelism}
+        </p>
+      ) : (
+        <p className="mt-2 text-sm text-mist">这把私钥是随机生成的，还没有用口令派生。</p>
+      )}
       <div className="mt-3 flex flex-col gap-2 sm:flex-row">
         <Field label="绑定到">
           <select
@@ -182,6 +234,32 @@ function NodeCard({
           <Download className="size-4" aria-hidden="true" />
           导出侧车
         </Btn>
+      </div>
+      <div className="mt-3 grid gap-2">
+        <Field label="口令">
+          <input
+            className={control}
+            type="password"
+            autoComplete="off"
+            value={passphrase}
+            aria-label={`${node.name}的口令`}
+            onChange={(e) => setPassphrase(e.target.value)}
+          />
+        </Field>
+        <Btn
+          kind="ghost"
+          disabled={deriving || !passphrase.trim()}
+          onClick={() => {
+            setDeriving(true);
+            void onDerive(passphrase).finally(() => {
+              setPassphrase("");
+              setDeriving(false);
+            });
+          }}
+        >
+          {deriving ? "派生中" : "用 Argon2id 派生私钥"}
+        </Btn>
+        <p className="text-sm text-mist">参数用配置页里的内存和迭代。派生会换掉指纹，绑定仍按节点编号。</p>
       </div>
       {node.pinnedPeerId ? (
         <p className="mt-3 text-sm text-mist">已指向 {peer?.name ?? "一个已经删掉的节点"}</p>

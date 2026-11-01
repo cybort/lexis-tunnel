@@ -16,6 +16,10 @@ type MeshState = {
   updateMapping: (id: string, patch: Partial<PortMap>) => void;
   removeMapping: (id: string) => void;
   seed: (nodes: MeshNode[], mappings: PortMap[]) => void;
+  setIdentity: (
+    id: string,
+    next: Pick<MeshNode, "publicJwk" | "privateJwk" | "publicRawB64" | "fingerprint" | "kdf">,
+  ) => void;
   reset: () => void;
 };
 
@@ -51,6 +55,10 @@ export const useMesh = create<MeshState>()(
         })),
       removeMapping: (id) => set((s) => ({ mappings: s.mappings.filter((m) => m.id !== id) })),
       seed: (nodes, mappings) => set({ nodes, mappings }),
+      setIdentity: (id, next) =>
+        set((s) => ({
+          nodes: s.nodes.map((n) => (n.id === id ? { ...n, ...next } : n)),
+        })),
       reset: () => set({ nodes: [], mappings: [] }),
     }),
     {
@@ -74,6 +82,7 @@ export async function makeNode(name: string, role: MeshNode["role"]): Promise<Me
     fingerprint: key.fingerprint,
     pinnedPeerId: null,
     createdAt: Date.now(),
+    kdf: null,
   };
 }
 
@@ -133,7 +142,8 @@ export function sidecarOf(node: MeshNode, peer: MeshNode | undefined) {
     pinnedPeerPublicJwk: peer?.publicJwk ?? null,
     windowSeconds: SPEC.windowSec,
     lexiconSize: SPEC.lexiconSize,
-    handshake: "p256-ecdh-ephemeral-plus-static",
+    handshake: "p256-ecdh-argon2id",
+    kdf: node.kdf,
     wire: "secret-lexicon-prose",
   };
 }

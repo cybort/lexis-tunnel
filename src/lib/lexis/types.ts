@@ -1,5 +1,12 @@
 export type NodeRole = "gate" | "edge";
 
+export type NodeKdf = {
+  saltB64: string;
+  memoryKiB: number;
+  iterations: number;
+  parallelism: number;
+};
+
 export type MeshNode = {
   id: string;
   name: string;
@@ -10,6 +17,8 @@ export type MeshNode = {
   fingerprint: string;
   pinnedPeerId: string | null;
   createdAt: number;
+  /** Set when the long-term key was derived from a passphrase. The passphrase is not stored. */
+  kdf: NodeKdf | null;
 };
 
 export type PortMap = {

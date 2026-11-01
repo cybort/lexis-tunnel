@@ -1,3 +1,5 @@
+import { clampKdf, DEFAULT_KDF, type ArgonParams } from "./kdf";
+
 export const PROFILE_VERSION = 1 as const;
 
 export type RunMode = "fixed-port" | "system-forward";
@@ -60,6 +62,9 @@ export type LexisProfile = {
   linux: { method: "tproxy" | "redirect"; mark: number; table: number; dnsRedirect: boolean };
   windows: { method: "windivert" | "portproxy"; gateway: string };
   android: { method: "vpn"; mtu: number; address: string; dns: string };
+  kdf: ArgonParams;
+  honey: boolean;
+  zstd: { enabled: boolean; level: number };
 };
 
 export const RULE_TYPES: RuleType[] = [
@@ -146,6 +151,9 @@ export function defaultProfile(): LexisProfile {
     linux: { method: "redirect", mark: 255, table: 100, dnsRedirect: true },
     windows: { method: "portproxy", gateway: "10.7.0.1" },
     android: { method: "vpn", mtu: 1500, address: "10.7.0.2/32", dns: "1.1.1.1" },
+    kdf: { ...DEFAULT_KDF },
+    honey: false,
+    zstd: { enabled: false, level: 3 },
   };
 }
 
@@ -186,6 +194,12 @@ export function normalizeProfile(input: unknown): LexisProfile {
     android: { ...base.android, ...(raw.android ?? {}) },
     heartbeatSec: clampNum(raw.heartbeatSec, 5, 120, base.heartbeatSec),
     statusPort: clampNum(raw.statusPort, 1, 65535, base.statusPort),
+    kdf: clampKdf(raw.kdf),
+    honey: raw.honey === true,
+    zstd: {
+      enabled: Boolean(raw.zstd && raw.zstd.enabled),
+      level: clampNum(raw.zstd?.level, 1, 19, base.zstd.level),
+    },
   };
 }
 

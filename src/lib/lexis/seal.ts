@@ -10,6 +10,7 @@ import {
 } from "./bytes";
 import { dress, undress } from "./codec";
 import { hmac, hkdfStream, LexisError } from "./crypto";
+import { honeySentence } from "./pack";
 import { SPEC } from "./spec";
 
 export type Direction = "e2g" | "g2e";
@@ -30,11 +31,14 @@ export type OpenInput = {
   direction: Direction;
   prose: string;
   lastSeen: number;
+  /** When set, a bad MAC becomes a honey sentence instead of an error. Negotiated in the handshake. */
+  honey?: boolean;
 };
 
 export type Opened = {
   counter: number;
   plaintext: Uint8Array;
+  honey: boolean;
 };
 
 function mask24(mac: Uint8Array): number {
@@ -99,8 +103,6 @@ export async function open(input: OpenInput): Promise<Opened> {
   );
   const masked = ((take(words[0]) & 0xfff) << 12) | (take(words[1]) & 0xfff);
   const counter = (masked ^ mask) & 0xffffff;
-  if (counter < 1) throw new LexisError("计数器无效");
-  if (counter <= lastSeen) throw new LexisError("计数器没有前进，按回放丢弃");
 
   const bodyWords = words.slice(2);
   const ks = await hkdfStream(
@@ -114,16 +116,31 @@ export async function open(input: OpenInput): Promise<Opened> {
     return (take(w) - ks12 + SPEC.lexiconSize) % SPEC.lexiconSize;
   });
   const raw = chunksToBytes(chunks);
-  if (raw.length < 2 + SPEC.macBytes) throw new LexisError("正文长度不够");
+  const honey = input.honey === true;
+  const asHoney = async (): Promise<Opened> => ({
+    counter: lastSeen,
+    plaintext: utf8(await honeySentence(raw.length ? raw : utf8(prose))),
+    honey: true,
+  });
+  if (raw.length < 2 + SPEC.macBytes) {
+    if (honey) return asHoney();
+    throw new LexisError("正文长度不够");
+  }
   const len = readU16(raw, 0);
-  if (2 + len + SPEC.macBytes > raw.length) throw new LexisError("正文字段被截断");
+  if (2 + len + SPEC.macBytes > raw.length) {
+    if (honey) return asHoney();
+    throw new LexisError("正文字段被截断");
+  }
   const plaintext = raw.slice(2, 2 + len);
   const tag = raw.slice(2 + len, 2 + len + SPEC.macBytes);
   const expect = (
     await hmac(key, concat(utf8(`lexis-mac-v1|${direction}|`), u32be(counter), plaintext))
   ).subarray(0, SPEC.macBytes);
   if (!timingSafeEqual(tag, expect)) {
+    if (honey) return asHoney();
     throw new LexisError("校验失败。密钥、计数器或词表对不上。");
   }
-  return { counter, plaintext };
+  if (counter < 1) throw new LexisError("计数器无效");
+  if (counter <= lastSeen) throw new LexisError("计数器没有前进，按回放丢弃");
+  return { counter, plaintext, honey: false };
 }
