@@ -11,7 +11,7 @@ const CARDS = [
     title: "Windows",
     icon: Monitor,
     resident: "登录任务常驻，失败会重试",
-    listen: "固定端口，或 netsh portproxy / WinDivert 记录",
+    listen: "固定端口。portproxy 只绑回环，WinDivert 只记录",
     process: "按进程名接入或绕行",
   },
   {
@@ -19,7 +19,7 @@ const CARDS = [
     title: "Linux",
     icon: Terminal,
     resident: "systemd 用户服务，断了自己拉起",
-    listen: "固定端口，或 iptables redirect / tproxy",
+    listen: "固定端口。转发脚本可写，tproxy 还取不到原始目的地址",
     process: "从 /proc 认出程序名",
   },
   {
@@ -27,7 +27,7 @@ const CARDS = [
     title: "Android",
     icon: Smartphone,
     resident: "Termux 后台，Termux:Boot 开机拉起",
-    listen: "固定端口，系统接管写成 VpnService 会话",
+    listen: "固定端口。系统接管只写出 VpnService 会话",
     process: "程序规则写在配置里，认不到进程时不乱改动作",
   },
 ] as const;
@@ -81,7 +81,7 @@ export function DownloadPage() {
           <p className="font-mono text-xs text-sage">LEXIS {manifest?.version ?? "1.0.0"}</p>
           <h2 className="mt-2 text-2xl font-bold">三个系统，同一份配置</h2>
           <p className="mt-2 max-w-2xl text-sm text-mist">
-            通信进程安装后留在后台。控制台里的「配置」导出 JSON，覆盖客户端目录里的 lexis.config.json 再重启。需要 Node.js 22。状态页在本机 17890 端口。
+            通信进程安装后留在后台。转发正文和控制台是同一套词表。TLS 和 WebSocket 只做外层，用来过 CDN。SOCKS 可以另加用户名。加入名单的节点都能中继。导出的配置带本机私钥，两端要互相放上对方公钥。需要 Node.js 22。状态页在本机 17890 端口。
           </p>
         </section>
         <div className="grid gap-3 lg:grid-cols-3">

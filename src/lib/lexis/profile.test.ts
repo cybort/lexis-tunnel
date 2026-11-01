@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { cidrContains, defaultProfile, importClashRules, importSingBox, matchRoute } from "./profile.ts";
+import { cidrContains, defaultProfile, importClashRules, importSingBox, matchRoute, normalizeProfile, profileIssues } from "./profile.ts";
 
 const profile = defaultProfile();
 
@@ -40,5 +40,14 @@ const custom = {
 };
 assert.equal(matchRoute(custom, { host: "a.intranet.example" }).action, "direct");
 assert.equal(matchRoute(custom, { ip: "203.0.113.9" }).action, "direct");
+
+const upgraded = normalizeProfile({ version: 1, role: "gate" });
+assert.equal(upgraded.link.idleMs, 120000);
+assert.equal(upgraded.link.maxConns, 128);
+assert.equal(upgraded.egress.blockPrivate, true);
+assert.equal(upgraded.outer.transport, "tcp");
+assert.equal(upgraded.outer.wsPath, "/lexis");
+assert.equal(upgraded.identity, null);
+assert.equal(profileIssues(upgraded).some((item) => item.includes("身份")), true);
 
 console.log("profile ok");

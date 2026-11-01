@@ -98,5 +98,16 @@
   "zstd": {
     "enabled": false,
     "level": 3
+  },
+  "link": {
+    "token": "",
+    "idleMs": 120000,
+    "maxConns": 128,
+    "headerBytes": 8192,
+    "allowLan": false
+  },
+  "egress": {
+    "blockPrivate": true,
+    "allow": []
   }
 }

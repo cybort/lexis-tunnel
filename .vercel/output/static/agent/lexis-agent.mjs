@@ -1,16 +1,20 @@
 #!/usr/bin/env node
 /**
- * LEXIS resident agent. Same lexis.config.json on Windows, Linux, and Android (Termux).
- * Fixed-port mode listens for SOCKS, plain TCP maps, and tunnel prefaces.
- * System-forward mode writes the platform takeover file and tries to apply it.
+ * LEXIS resident agent.
+ * The forwarding payload is the same lexicon seal as the console.
+ * TCP, TLS and WebSocket only carry the prose. SOCKS may ask for a username.
  */
 import { execFile } from "node:child_process";
+import { timingSafeEqual } from "node:crypto";
+import { createSocket as createUdp } from "node:dgram";
+import { lookup } from "node:dns";
 import { createServer as createTcp, connect as connectTcp } from "node:net";
 import { createServer as createHttp } from "node:http";
 import { mkdirSync, readFileSync, writeFileSync, existsSync, readdirSync, readlinkSync } from "node:fs";
 import { homedir, platform } from "node:os";
-import { dirname, join } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import { acceptSession, connectSession, dialOuter, hopCount, listenOuter, nodeFromIdentity, parseOpen, pipeMux } from "./lexis-frame.mjs";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const configPath = process.argv.includes("--config")
@@ -41,6 +45,7 @@ const state = {
 };
 let remoteGeosite = "";
 let remoteGeoip = "";
+let liveConns = 0;
 
 function log(line) {
   const text = `${new Date().toISOString()} ${line}`;
@@ -179,7 +184,199 @@ function note(decision, host) {
   log(`${decision.action} ${host} (${decision.reason})`);
 }
 
+function linkOf(config) {
+  const link = config.link || {};
+  const idle = Number(link.idleMs);
+  const max = Number(link.maxConns);
+  const header = Number(link.headerBytes);
+  return {
+    token: String(link.token || "").trim(),
+    idleMs: Number.isInteger(idle) && idle >= 1000 ? idle : 120000,
+    maxConns: Number.isInteger(max) && max >= 1 ? max : 128,
+    headerBytes: Number.isInteger(header) && header >= 256 ? header : 8192,
+    allowLan: link.allowLan === true,
+  };
+}
+
+function arm(socket, config) {
+  socket.setTimeout(linkOf(config).idleMs);
+  socket.on("timeout", () => {
+    log("空闲超时");
+    socket.destroy();
+  });
+}
+
+function admit(socket, config) {
+  if (liveConns >= linkOf(config).maxConns) {
+    log("连接数已满");
+    socket.destroy();
+    return false;
+  }
+  liveConns += 1;
+  let closed = false;
+  socket.once("close", () => {
+    if (closed) return;
+    closed = true;
+    liveConns -= 1;
+  });
+  return true;
+}
+
+function ipv4Parts(ip) {
+  const parts = String(ip).split(".");
+  if (parts.length !== 4) return null;
+  const nums = parts.map((part) => Number(part));
+  if (nums.some((n) => !Number.isInteger(n) || n < 0 || n > 255)) return null;
+  return nums;
+}
+
+function expandV6(ip) {
+  let text = ip.toLowerCase();
+  const dotted = text.match(/^(.*:)(\d+\.\d+\.\d+\.\d+)$/);
+  if (dotted) {
+    const nums = ipv4Parts(dotted[2]);
+    if (!nums) return null;
+    const tail = ((nums[0] << 8) | nums[1]).toString(16) + ":" + ((nums[2] << 8) | nums[3]).toString(16);
+    text = dotted[1] + tail;
+  }
+  const halves = text.split("::");
+  if (halves.length > 2) return null;
+  const head = halves[0] ? halves[0].split(":") : [];
+  const tail = halves.length === 2 && halves[1] ? halves[1].split(":") : [];
+  if (halves.length === 1 && head.length !== 8) return null;
+  const missing = 8 - head.length - tail.length;
+  if (missing < 0) return null;
+  const full = [...head, ...Array(missing).fill("0"), ...tail];
+  if (full.length !== 8 || full.some((part) => !/^[0-9a-f]{1,4}$/.test(part))) return null;
+  return full.map((part) => part.padStart(4, "0")).join(":");
+}
+
+function isBlockedV4(ip) {
+  if (!ipv4Parts(ip)) return true;
+  const nets = [
+    ["0.0.0.0", 8],
+    ["10.0.0.0", 8],
+    ["100.64.0.0", 10],
+    ["127.0.0.0", 8],
+    ["169.254.0.0", 16],
+    ["172.16.0.0", 12],
+    ["192.0.0.0", 24],
+    ["192.0.2.0", 24],
+    ["192.168.0.0", 16],
+    ["198.18.0.0", 15],
+    ["198.51.100.0", 24],
+    ["203.0.113.0", 24],
+    ["224.0.0.0", 4],
+    ["240.0.0.0", 4],
+  ];
+  return nets.some(([base, bits]) => cidrContains(`${base}/${bits}`, ip));
+}
+
+function isBlockedAddress(ip) {
+  let raw = String(ip || "").trim().toLowerCase();
+  if (raw.startsWith("[") && raw.endsWith("]")) raw = raw.slice(1, -1);
+  if (raw.startsWith("::ffff:") && ipv4Parts(raw.slice(7))) return isBlockedV4(raw.slice(7));
+  if (ipv4Parts(raw)) return isBlockedV4(raw);
+  if (!raw.includes(":")) return true;
+  const expanded = expandV6(raw);
+  if (!expanded) return true;
+  if (expanded === "0000:0000:0000:0000:0000:0000:0000:0000") return true;
+  if (expanded === "0000:0000:0000:0000:0000:0000:0000:0001") return true;
+  const first = Number.parseInt(expanded.slice(0, 4), 16);
+  if ((first & 0xfe00) === 0xfc00) return true;
+  if ((first & 0xffc0) === 0xfe80) return true;
+  if ((first & 0xff00) === 0xff00) return true;
+  if (expanded.startsWith("2001:0db8")) return true;
+  if (expanded.startsWith("0000:0000:0000:0000:0000:ffff:")) {
+    const hex = expanded.split(":").slice(6).join("");
+    const v4 = [0, 1, 2, 3].map((i) => Number.parseInt(hex.slice(i * 2, i * 2 + 2), 16)).join(".");
+    return isBlockedV4(v4);
+  }
+  return false;
+}
+
+function allowHit(config, host, port) {
+  const name = String(host || "").trim().toLowerCase().replace(/^\[|\]$/g, "");
+  const list = Array.isArray(config.egress?.allow) ? config.egress.allow : [];
+  for (const raw of list) {
+    const item = String(raw || "").trim().toLowerCase();
+    if (!item) continue;
+    if (item.includes("/")) {
+      const base = item.split("/")[0];
+      if (ipv4Parts(base) && ipv4Parts(name) && cidrContains(item, name)) return true;
+      continue;
+    }
+    const bracket = item.match(/^\[(.+)\]:(\d+)$/);
+    if (bracket) {
+      if (bracket[1] === name && Number(bracket[2]) === Number(port)) return true;
+      continue;
+    }
+    const colon = item.lastIndexOf(":");
+    if (colon > 0 && item.indexOf(":") === colon && /^\d+$/.test(item.slice(colon + 1))) {
+      if (item.slice(0, colon) === name && Number(item.slice(colon + 1)) === Number(port)) return true;
+      continue;
+    }
+    if (item === name) return true;
+  }
+  return false;
+}
+
+function lookupAll(host) {
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error("dns")), 3000);
+    lookup(host, { all: true, verbatim: true }, (err, rows) => {
+      clearTimeout(timer);
+      if (err) reject(err);
+      else resolve(rows || []);
+    });
+  });
+}
+
+async function assessTarget(config, host, port) {
+  const name = String(host || "").trim();
+  const nport = Number(port);
+  if (!name || !Number.isInteger(nport) || nport < 1 || nport > 65535) return { ok: false, reason: "目标无效" };
+  if (config.egress?.blockPrivate === false) return { ok: true, host: name, port: nport };
+  if (allowHit(config, name, nport)) return { ok: true, host: name, port: nport };
+  if (ipv4Parts(name) || name.includes(":")) {
+    if (isBlockedAddress(name)) return { ok: false, reason: "目标地址被拦截" };
+    return { ok: true, host: name, port: nport };
+  }
+  let addrs = [];
+  try {
+    addrs = await lookupAll(name);
+  } catch {
+    return { ok: false, reason: "域名无法解析" };
+  }
+  if (!addrs.length) return { ok: false, reason: "域名无法解析" };
+  for (const addr of addrs) {
+    if (isBlockedAddress(addr.address)) return { ok: false, reason: "解析到内网地址" };
+  }
+  return { ok: true, host: addrs[0].address, port: nport };
+}
+
+const SOCKS_OK = Buffer.from([0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0]);
+const SOCKS_FAIL = Buffer.from([0x05, 0x05, 0x00, 0x01, 0, 0, 0, 0, 0, 0]);
+
+function okSocks(socket) {
+  if (!socket._lexisSocks || socket._lexisReplied) return;
+  socket._lexisReplied = true;
+  socket.write(SOCKS_OK);
+}
+
+function failSocks(socket) {
+  if (socket.destroyed) return;
+  if (socket._lexisSocks && !socket._lexisReplied) {
+    socket._lexisReplied = true;
+    socket.end(SOCKS_FAIL);
+    return;
+  }
+  socket.destroy();
+}
+
 function pipe(a, b) {
+  a.resume();
+  b.resume();
   a.pipe(b);
   b.pipe(a);
   const close = () => {
@@ -192,63 +389,271 @@ function pipe(a, b) {
   b.on("close", () => a.destroy());
 }
 
-function dial(host, port) {
-  return connectTcp({ host, port });
+function dial(host, port, config) {
+  const socket = connectTcp({ host, port });
+  socket.on("error", () => socket.destroy());
+  arm(socket, config);
+  return socket;
 }
 
-function relayProxy(socket, config, host, port) {
-  const endpoint = String(config.peerEndpoint || "");
-  const match = endpoint.match(/^(.+):(\d+)$/);
-  if (!match) {
-    log(`接入 ${host}:${port} 失败：没有对端主机:端口`);
-    socket.destroy();
-    return;
+const lexSessions = new Map();
+
+function outerOf(config) {
+  const outer = config.outer || {};
+  const transport = ["tcp", "tls", "ws", "wss"].includes(outer.transport) ? outer.transport : "tcp";
+  return {
+    transport,
+    wsPath: typeof outer.wsPath === "string" && outer.wsPath.startsWith("/") ? outer.wsPath : "/lexis",
+    tlsVerify: outer.tlsVerify !== false,
+  };
+}
+
+function zstdOf(config) {
+  return { enabled: Boolean(config.zstd?.enabled), level: Number(config.zstd?.level) || 3 };
+}
+
+function offerOf(config) {
+  const kdf = config.kdf || {};
+  return {
+    memoryKiB: Number(kdf.memoryKiB) || 4096,
+    iterations: Number(kdf.iterations) || 2,
+    parallelism: Number(kdf.parallelism) || 1,
+    honey: config.honey === true,
+  };
+}
+
+function peerList(config) {
+  return (Array.isArray(config.peers) ? config.peers : []).filter((peer) => peer && peer.publicRawB64 && peer.endpoint);
+}
+
+function splitEndpoint(endpoint) {
+  const match = String(endpoint || "").match(/^(.*):(\d+)$/);
+  if (!match) throw new Error("对端地址要写成 主机:端口");
+  return [match[1], Number(match[2])];
+}
+
+function choosePeer(config) {
+  const peers = peerList(config);
+  if (!peers.length) return null;
+  const want = String(config.peerEndpoint || "");
+  return peers.find((peer) => peer.endpoint === want) || peers[0];
+}
+
+async function sessionFor(config, peer) {
+  const key = peer.id || peer.publicRawB64;
+  if (lexSessions.has(key)) return lexSessions.get(key);
+  const job = (async () => {
+    const [host, port] = splitEndpoint(peer.endpoint);
+    const outer = outerOf(config);
+    const pipe = await dialOuter({
+      transport: peer.transport || outer.transport,
+      host,
+      port,
+      path: peer.wsPath || outer.wsPath,
+      wsHost: peer.wsHost || host,
+      tlsVerify: outer.tlsVerify,
+    });
+    const self = await nodeFromIdentity(config.identity, "edge");
+    const via = { peerId: peer.id || "" };
+    const session = await connectSession({
+      pipe,
+      self,
+      peerRawB64: peer.publicRawB64,
+      offer: offerOf(config),
+      zstd: zstdOf(config),
+      maxStreams: linkOf(config).maxConns,
+      heartbeatMs: Math.max(5, config.heartbeatSec || 15) * 1000,
+      onStream: (stream) => void handleRemoteStream(stream, config, via),
+    });
+    session.peerId = via.peerId;
+    void session.whenClosed().then(() => lexSessions.delete(key));
+    return session;
+  })();
+  lexSessions.set(key, job);
+  try {
+    return await job;
+  } catch (err) {
+    lexSessions.delete(key);
+    throw err;
   }
-  const peer = dial(match[1], Number(match[2]));
-  peer.on("connect", () => {
-    peer.write(`LEXIS1\n${host}\n${port}\n`);
-    pipe(socket, peer);
-  });
-  peer.on("error", () => socket.destroy());
 }
 
-function relayDirect(socket, host, port) {
-  const remote = dial(host, port);
-  remote.on("connect", () => pipe(socket, remote));
-  remote.on("error", () => socket.destroy());
+function bridgeSocket(stream, socket) {
+  socket.on("data", (chunk) => {
+    void stream.write(chunk).catch(() => socket.destroy());
+  });
+  socket.on("error", () => void stream.close());
+  socket.on("close", () => void stream.close());
+  const pull = async () => {
+    try {
+      for (;;) {
+        const chunk = await stream.read();
+        if (!chunk) {
+          socket.end();
+          return;
+        }
+        if (!socket.write(chunk)) await new Promise((resolve) => socket.once("drain", resolve));
+      }
+    } catch {
+      socket.destroy();
+    }
+  };
+  void pull();
+}
+
+async function exitUdp(stream, host, port) {
+  const udp = createUdp("udp4");
+  await new Promise((resolve, reject) => {
+    udp.once("error", reject);
+    udp.bind(0, () => resolve());
+  });
+  await stream.accept();
+  udp.on("message", (msg) => {
+    void stream.write(msg).catch(() => udp.close());
+  });
+  try {
+    for (;;) {
+      const chunk = await stream.read();
+      if (!chunk) break;
+      await new Promise((resolve, reject) => udp.send(chunk, port, host, (err) => (err ? reject(err) : resolve())));
+    }
+  } finally {
+    udp.close();
+    await stream.close().catch(() => undefined);
+  }
+}
+
+async function handleRemoteStream(stream, config, via) {
+  try {
+    const command = stream.command || "";
+    if (hopCount(command) > 4) {
+      await stream.reject("中继跳数过多");
+      return;
+    }
+    const parsed = parseOpen(command);
+    if (parsed.relay) {
+      const next = peerList(config).find((peer) => peer.id === parsed.relay || peer.name === parsed.relay);
+      if (!next) {
+        await stream.reject("没有这个节点");
+        return;
+      }
+      if (via && via.peerId && via.peerId === next.id) {
+        await stream.reject("拒绝把流送回上一跳");
+        return;
+      }
+      const down = await sessionFor(config, next);
+      const remote = await down.open(parsed.rest);
+      await stream.accept();
+      note({ action: "proxy", reason: `中继 ${next.name}` }, parsed.rest);
+      await pipeMux(stream, remote);
+      return;
+    }
+    if (!parsed.host || !parsed.port) {
+      await stream.reject("目标无效");
+      return;
+    }
+    const decision = decide(config, {
+      host: parsed.host,
+      ip: isIp(parsed.host) ? parsed.host : "",
+      port: String(parsed.port),
+      network: parsed.udp ? "udp" : "tcp",
+    });
+    if (decision.action === "reject" || decision.action === "bypass") {
+      note(decision, `${parsed.host}:${parsed.port}`);
+      await stream.reject(decision.reason);
+      return;
+    }
+    const verdict = await assessTarget(config, parsed.host, parsed.port);
+    if (!verdict.ok) {
+      note({ action: "reject", reason: verdict.reason }, `${parsed.host}:${parsed.port}`);
+      await stream.reject(verdict.reason);
+      return;
+    }
+    if (parsed.udp) {
+      await exitUdp(stream, verdict.host, verdict.port);
+      return;
+    }
+    const remote = dial(verdict.host, verdict.port, config);
+    let up = false;
+    remote.once("error", () => {
+      if (!up) void stream.reject("拨号失败");
+      remote.destroy();
+    });
+    remote.once("connect", () => {
+      up = true;
+      note({ action: "direct", reason: decision.reason }, `${parsed.host}:${parsed.port}`);
+      void stream.accept().then(() => bridgeSocket(stream, remote)).catch(() => remote.destroy());
+    });
+  } catch (err) {
+    log(`流转发失败 ${err.message || err}`);
+    try {
+      await stream.reject("转发失败");
+    } catch {
+      /* already closed */
+    }
+  }
+}
+
+function relayProxy(socket, config, host, port, network = "tcp") {
+  void (async () => {
+    try {
+      if (!config.identity?.privateJwk) throw new Error("没有本机身份");
+      const peer = choosePeer(config);
+      if (!peer) throw new Error("没有加入的节点");
+      const session = await sessionFor(config, peer);
+      const stream = await session.open(`${network} ${host} ${port}`);
+      if (socket._lexisSocks) okSocks(socket);
+      bridgeSocket(stream, socket);
+    } catch (err) {
+      log(`接入 ${host}:${port} 失败：${err.message || err}`);
+      failSocks(socket);
+    }
+  })();
+}
+
+function relayDirect(socket, host, port, config) {
+  const remote = dial(host, port, config);
+  remote.on("connect", () => {
+    okSocks(socket);
+    pipe(socket, remote);
+  });
+  remote.on("error", () => {
+    remote.destroy();
+    failSocks(socket);
+  });
 }
 
 function applyAction(socket, config, decision, host, port) {
   note(decision, `${host}:${port}`);
   if (decision.action === "reject") {
-    socket.destroy();
+    failSocks(socket);
     return;
   }
   if (decision.action === "proxy") relayProxy(socket, config, host, port);
-  else relayDirect(socket, host, port);
+  else relayDirect(socket, host, port, config);
 }
 
-function readPreface(socket) {
-  return new Promise((resolve, reject) => {
-    let buf = "";
-    const timer = setTimeout(() => reject(new Error("隧道头超时")), 10000);
-    const onData = (chunk) => {
-      buf += chunk.toString("utf8");
-      const parts = buf.split("\n");
-      if (parts.length >= 4 && parts[0] === "LEXIS1") {
-        clearTimeout(timer);
-        socket.off("data", onData);
-        const rest = Buffer.from(parts.slice(3).join("\n"));
-        if (rest.length) socket.unshift(rest);
-        resolve({ host: parts[1], port: Number(parts[2]) });
-      }
-    };
-    socket.on("data", onData);
-    socket.on("error", (err) => {
-      clearTimeout(timer);
-      reject(err);
+async function acceptTunnel(socket, pipeReady, config) {
+  try {
+    if (!config.identity?.privateJwk) throw new Error("没有本机身份");
+    const pipe = await pipeReady;
+    const self = await nodeFromIdentity(config.identity, "gate");
+    const via = { peerId: "" };
+    const session = await acceptSession({
+      pipe,
+      self,
+      peers: peerList(config),
+      zstd: zstdOf(config),
+      maxStreams: linkOf(config).maxConns,
+      heartbeatMs: Math.max(5, config.heartbeatSec || 15) * 1000,
+      onStream: (stream) => void handleRemoteStream(stream, config, via),
     });
-  });
+    session.peerId = "";
+    await session.whenClosed();
+  } catch (err) {
+    log(`隧道拒绝 ${err.message || err}`);
+    socket.destroy();
+  }
 }
 
 async function findProcess(port) {
@@ -316,103 +721,310 @@ async function findProcess(port) {
 }
 
 function handleSocks(socket, config) {
+  socket._lexisSocks = true;
   let stage = 0;
   let pending = Buffer.alloc(0);
+  const cap = linkOf(config).headerBytes;
   socket.on("data", (chunk) => {
     pending = Buffer.concat([pending, chunk]);
-    if (stage === 0) {
-      if (pending.length < 2) return;
-      const n = pending[1];
-      if (pending.length < 2 + n) return;
-      pending = pending.subarray(2 + n);
-      socket.write(Buffer.from([0x05, 0x00]));
-      stage = 1;
-    }
-    if (stage === 1) {
-      if (pending.length < 4) return;
-      const atyp = pending[3];
-      let host = "";
-      let port = 0;
-      let offset = 4;
-      if (atyp === 1) {
-        if (pending.length < 10) return;
-        host = [...pending.subarray(4, 8)].join(".");
-        port = pending.readUInt16BE(8);
-        offset = 10;
-      } else if (atyp === 3) {
-        const len = pending[4];
-        if (pending.length < 5 + len + 2) return;
-        host = pending.subarray(5, 5 + len).toString("utf8");
-        port = pending.readUInt16BE(5 + len);
-        offset = 7 + len;
-      } else if (atyp === 4) {
-        if (pending.length < 22) return;
-        const words = [];
-        for (let i = 0; i < 16; i += 2) words.push(pending.readUInt16BE(4 + i).toString(16));
-        host = words.join(":");
-        port = pending.readUInt16BE(20);
-        offset = 22;
-      } else {
-        socket.end(Buffer.from([0x05, 0x08, 0x00, 0x01, 0, 0, 0, 0, 0, 0]));
-        return;
-      }
-      const rest = pending.subarray(offset);
-      pending = Buffer.alloc(0);
-      stage = 2;
-      socket.removeAllListeners("data");
-      if (rest.length) socket.unshift(rest);
-      void (async () => {
-        const processName = await findProcess(socket.remotePort);
-        const decision = decide(config, { host, ip: isIp(host) ? host : "", process: processName, port: String(port), network: "tcp" });
-        if (decision.action === "reject") {
-          note(decision, `${host}:${port}`);
-          socket.end(Buffer.from([0x05, 0x02, 0x00, 0x01, 0, 0, 0, 0, 0, 0]));
-          return;
-        }
-        socket.write(Buffer.from([0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0]));
-        applyAction(socket, config, decision, host, port);
-      })();
-    }
-  });
-  socket.on("error", () => socket.destroy());
-}
-
-function serveInbound(config, inbound) {
-  const server = createTcp((socket) => {
-    if (inbound.protocol === "socks") {
-      handleSocks(socket, config);
+    if (pending.length > cap) {
+      socket.destroy();
       return;
     }
-    if (inbound.protocol === "tunnel") {
-      void readPreface(socket)
-        .then(({ host, port }) => {
-          const decision = decide(config, { host, ip: isIp(host) ? host : "", port: String(port), network: "tcp" });
-          if (decision.action === "reject" || decision.action === "bypass") {
-            note(decision, `${host}:${port}`);
-            socket.destroy();
-            return;
-          }
-          note({ action: "direct", reason: decision.reason }, `${host}:${port}`);
-          relayDirect(socket, host, port);
-        })
-        .catch(() => socket.destroy());
+    if (stage === 0) {
+      if (pending.length < 2) return;
+      const methods = pending[1];
+      if (pending.length < 2 + methods) return;
+      const offered = [...pending.subarray(2, 2 + methods)];
+      pending = pending.subarray(2 + methods);
+      const user = String(config.socksAuth?.user || "");
+      const pass = String(config.socksAuth?.pass || "");
+      if (user || pass) {
+        if (!user || !pass || !offered.includes(0x02)) {
+          socket.end(Buffer.from([0x05, 0xff]));
+          return;
+        }
+        socket.write(Buffer.from([0x05, 0x02]));
+        stage = 0.5;
+      } else {
+        socket.write(Buffer.from([0x05, 0x00]));
+        stage = 1;
+      }
+    }
+    if (stage === 0.5) {
+      if (pending.length < 2) return;
+      const ulen = pending[1];
+      if (pending.length < 2 + ulen + 1) return;
+      const plen = pending[2 + ulen];
+      if (pending.length < 3 + ulen + plen) return;
+      const user = pending.subarray(2, 2 + ulen).toString("utf8");
+      const pass = pending.subarray(3 + ulen, 3 + ulen + plen).toString("utf8");
+      pending = pending.subarray(3 + ulen + plen);
+      const okUser = sameSecret(user, config.socksAuth?.user || "");
+      const okPass = sameSecret(pass, config.socksAuth?.pass || "");
+      if (!okUser || !okPass) {
+        socket.end(Buffer.from([0x01, 0x01]));
+        return;
+      }
+      socket.write(Buffer.from([0x01, 0x00]));
+      stage = 1;
+    }
+    if (stage !== 1) return;
+    if (pending.length < 4) return;
+    const cmd = pending[1];
+    if (cmd !== 0x01 && cmd !== 0x03) {
+      socket._lexisReplied = true;
+      socket.removeAllListeners("data");
+      socket.end(Buffer.from([0x05, 0x07, 0x00, 0x01, 0, 0, 0, 0, 0, 0]));
+      return;
+    }
+    const atyp = pending[3];
+    let host = "";
+    let port = 0;
+    let offset = 4;
+    if (atyp === 1) {
+      if (pending.length < 10) return;
+      host = [...pending.subarray(4, 8)].join(".");
+      port = pending.readUInt16BE(8);
+      offset = 10;
+    } else if (atyp === 3) {
+      const len = pending[4];
+      if (pending.length < 5 + len + 2) return;
+      host = pending.subarray(5, 5 + len).toString("utf8");
+      port = pending.readUInt16BE(5 + len);
+      offset = 7 + len;
+    } else if (atyp === 4) {
+      if (pending.length < 22) return;
+      const words = [];
+      for (let i = 0; i < 16; i += 2) words.push(pending.readUInt16BE(4 + i).toString(16));
+      host = words.join(":");
+      port = pending.readUInt16BE(20);
+      offset = 22;
+    } else {
+      socket._lexisReplied = true;
+      socket.removeAllListeners("data");
+      socket.end(Buffer.from([0x05, 0x08, 0x00, 0x01, 0, 0, 0, 0, 0, 0]));
+      return;
+    }
+    const rest = pending.subarray(offset);
+    pending = Buffer.alloc(0);
+    stage = 2;
+    socket.pause();
+    socket.removeAllListeners("data");
+    if (rest.length) socket.unshift(rest);
+    if (cmd === 0x03) {
+      socket.resume();
+      startUdpAssociate(socket, config);
       return;
     }
     void (async () => {
       const processName = await findProcess(socket.remotePort);
-      const host = inbound.targetHost;
-      const port = inbound.targetPort;
       const decision = decide(config, { host, ip: isIp(host) ? host : "", process: processName, port: String(port), network: "tcp" });
+      if (decision.action === "reject") {
+        note(decision, `${host}:${port}`);
+        socket._lexisReplied = true;
+        socket.resume();
+        socket.end(Buffer.from([0x05, 0x02, 0x00, 0x01, 0, 0, 0, 0, 0, 0]));
+        return;
+      }
       applyAction(socket, config, decision, host, port);
+    })();
+  });
+  socket.on("error", () => socket.destroy());
+}
+
+function sameSecret(left, right) {
+  const a = Buffer.from(String(left));
+  const b = Buffer.from(String(right));
+  if (a.length !== b.length || a.length === 0) return false;
+  return timingSafeEqual(a, b);
+}
+
+function parseSocksUdp(msg) {
+  if (msg.length < 10 || msg[2] !== 0) return null;
+  const atyp = msg[3];
+  if (atyp === 1) {
+    const host = [...msg.subarray(4, 8)].join(".");
+    return { host, port: msg.readUInt16BE(8), data: msg.subarray(10) };
+  }
+  if (atyp === 3) {
+    const len = msg[4];
+    if (msg.length < 7 + len) return null;
+    return {
+      host: msg.subarray(5, 5 + len).toString("utf8"),
+      port: msg.readUInt16BE(5 + len),
+      data: msg.subarray(7 + len),
+    };
+  }
+  return null;
+}
+
+function socksUdpPacket(host, port, data) {
+  if (isIp(host)) {
+    const out = Buffer.alloc(10 + data.length);
+    out[3] = 1;
+    host.split(".").forEach((part, i) => {
+      out[4 + i] = Number(part);
+    });
+    out.writeUInt16BE(port, 8);
+    Buffer.from(data).copy(out, 10);
+    return out;
+  }
+  const name = Buffer.from(host);
+  const out = Buffer.alloc(7 + name.length + data.length);
+  out[3] = 3;
+  out[4] = name.length;
+  name.copy(out, 5);
+  out.writeUInt16BE(port, 5 + name.length);
+  Buffer.from(data).copy(out, 7 + name.length);
+  return out;
+}
+
+function startUdpAssociate(socket, config) {
+  const udp = createUdp("udp4");
+  const streams = new Map();
+  const directs = new Map();
+  let client = null;
+  const closeAll = () => {
+    try {
+      udp.close();
+    } catch {
+      /* already closed */
+    }
+    for (const stream of streams.values()) void stream.close();
+    for (const direct of directs.values()) {
+      try {
+        direct.close();
+      } catch {
+        /* already closed */
+      }
+    }
+    directs.clear();
+  };
+  udp.on("error", () => socket.destroy());
+  udp.bind(0, "127.0.0.1", () => {
+    const reply = Buffer.from([0x05, 0x00, 0x00, 0x01, 127, 0, 0, 1, 0, 0]);
+    reply.writeUInt16BE(udp.address().port, 8);
+    socket._lexisReplied = true;
+    socket.write(reply);
+  });
+  socket.on("close", closeAll);
+  udp.on("message", (msg, rinfo) => {
+    if (!client) client = { address: rinfo.address, port: rinfo.port };
+    else if (client.address !== rinfo.address || client.port !== rinfo.port) return;
+    const parsed = parseSocksUdp(msg);
+    if (!parsed || !parsed.port) return;
+    void (async () => {
+      try {
+        const decision = decide(config, {
+          host: parsed.host,
+          ip: isIp(parsed.host) ? parsed.host : "",
+          port: String(parsed.port),
+          network: "udp",
+        });
+        note(decision, `udp ${parsed.host}:${parsed.port}`);
+        if (decision.action === "reject") return;
+        const sendBack = (chunk) => {
+          if (!client) return;
+          udp.send(socksUdpPacket(parsed.host, parsed.port, chunk), client.port, client.address);
+        };
+        if (decision.action !== "proxy") {
+          const key = `d:${parsed.host}:${parsed.port}`;
+          let direct = directs.get(key);
+          if (!direct) {
+            direct = createUdp("udp4");
+            direct.on("message", sendBack);
+            direct.on("error", () => {
+              directs.delete(key);
+              try {
+                direct.close();
+              } catch {
+                /* already closed */
+              }
+            });
+            directs.set(key, direct);
+          }
+          direct.send(parsed.data, parsed.port, parsed.host);
+          return;
+        }
+        const key = `${parsed.host}:${parsed.port}`;
+        let stream = streams.get(key);
+        if (!stream) {
+          const peer = choosePeer(config);
+          if (!peer || !config.identity?.privateJwk) return;
+          const session = await sessionFor(config, peer);
+          stream = await session.open(`udp ${parsed.host} ${parsed.port}`);
+          streams.set(key, stream);
+          const pump = async () => {
+            for (;;) {
+              const chunk = await stream.read();
+              if (!chunk) return;
+              sendBack(chunk);
+            }
+          };
+          void pump();
+        }
+        await stream.write(parsed.data);
+      } catch (err) {
+        log(`udp ${parsed.host}:${parsed.port} 失败：${err.message || err}`);
+      }
+    })();
+  });
+}
+
+function listenHost(config, inbound) {
+  const listen = inbound.listen || "127.0.0.1";
+  if (inbound.protocol === "tunnel") return listen;
+  if (linkOf(config).allowLan) return listen;
+  if (listen !== "127.0.0.1" && listen !== "::1") log(`${inbound.tag || inbound.protocol} 改绑 127.0.0.1`);
+  return "127.0.0.1";
+}
+
+function serveInbound(config, inbound) {
+  const host = listenHost(config, inbound);
+  if (inbound.protocol === "tunnel") {
+    const outer = outerOf(config);
+    const tunnel = listenOuter({
+      transport: outer.transport,
+      host,
+      port: inbound.port,
+      path: outer.wsPath,
+      onSocket(socket, pipeReady) {
+        if (!admit(socket, config)) return;
+        arm(socket, config);
+        void acceptTunnel(socket, pipeReady, config);
+      },
+    });
+    void tunnel.listening().then(() => {
+      const suffix = outer.transport === "ws" || outer.transport === "wss" ? outer.wsPath : "";
+      state.listeners.push(`tunnel ${outer.transport} ${host}:${inbound.port}${suffix}`);
+      log(`监听词表 ${outer.transport} ${host}:${inbound.port}${suffix}`);
+    });
+    return tunnel;
+  }
+  const server = createTcp((socket) => {
+    socket.on("error", () => socket.destroy());
+    if (!admit(socket, config)) return;
+    arm(socket, config);
+    if (inbound.protocol === "socks") {
+      handleSocks(socket, config);
+      return;
+    }
+    void (async () => {
+      const processName = await findProcess(socket.remotePort);
+      const targetHost = inbound.targetHost;
+      const targetPort = inbound.targetPort;
+      const decision = decide(config, { host: targetHost, ip: isIp(targetHost) ? targetHost : "", process: processName, port: String(targetPort), network: "tcp" });
+      applyAction(socket, config, decision, targetHost, targetPort);
     })();
   });
   server.on("error", (err) => {
     state.errors.push(`${inbound.tag} ${inbound.port}: ${err.message}`);
     log(`入站失败 ${inbound.tag}: ${err.message}`);
   });
-  server.listen(inbound.port, inbound.listen, () => {
-    state.listeners.push(`${inbound.protocol} ${inbound.listen}:${inbound.port}`);
-    log(`监听 ${inbound.protocol} ${inbound.listen}:${inbound.port}`);
+  server.listen(inbound.port, host, () => {
+    state.listeners.push(`${inbound.protocol} ${host}:${inbound.port}`);
+    log(`监听 ${inbound.protocol} ${host}:${inbound.port}`);
   });
   return server;
 }
@@ -427,8 +1039,8 @@ function forwardScript(config) {
       body: `$port = ${port}
 $gateway = "${gateway}"
 if ("${winMethod}" -eq "portproxy") {
-  netsh interface portproxy add v4tov4 listenaddress=0.0.0.0 listenport=$port connectaddress=127.0.0.1 connectport=$port
-  Write-Output "portproxy -> 127.0.0.1:$port"
+  netsh interface portproxy add v4tov4 listenaddress=127.0.0.1 listenport=$port connectaddress=127.0.0.1 connectport=$port
+  Write-Output "portproxy 只绑 127.0.0.1:$port，不向局域网公布"
 } else {
   Write-Output "WinDivert 过滤已记录，网关 $gateway。驱动需要单独安装后由本进程的监听端口承接。"
 }
@@ -559,6 +1171,14 @@ function selfCheck() {
     console.error("self-check failed", a, b, c, d);
     process.exit(1);
   }
+  if (hopCount("relay a relay b tcp h 1") !== 2 || !parseOpen("udp h 9").udp) {
+    console.error("open grammar failed");
+    process.exit(1);
+  }
+  if (!isBlockedAddress("127.0.0.1") || !isBlockedAddress("10.0.0.8") || !isBlockedAddress("169.254.169.254") || !isBlockedAddress("::1") || isBlockedAddress("8.8.8.8")) {
+    console.error("address check failed");
+    process.exit(1);
+  }
   console.log("lexis-agent check ok");
 }
 
@@ -592,7 +1212,21 @@ async function main() {
   log(`词隙客户端常驻中，状态页 http://${config.statusHost || "127.0.0.1"}:${config.statusPort || 17890}/  家目录 ${homedir()}`);
 }
 
-main().catch((err) => {
-  console.error(err);
-  process.exit(1);
-});
+function isDirectRun() {
+  const entry = process.argv[1];
+  if (!entry) return false;
+  try {
+    return fileURLToPath(import.meta.url) === resolve(entry);
+  } catch {
+    return false;
+  }
+}
+
+if (isDirectRun()) {
+  main().catch((err) => {
+    console.error(err);
+    process.exit(1);
+  });
+}
+
+export { isBlockedAddress, assessTarget, serveInbound };

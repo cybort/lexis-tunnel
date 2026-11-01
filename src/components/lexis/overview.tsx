@@ -69,7 +69,7 @@ export function Overview({ onOpen }: { onOpen: () => void }) {
           ))}
         </ol>
         <p className="mt-4 text-sm text-mist">
-          浏览器里不能守一个真正的 TCP 端口。这条控制台把握手、词表和封装真实跑完，端口映射按同一帧格式演练。侧车文件留给以后要常驻的进程。
+          浏览器里不能守一个真正的 TCP 端口。这条控制台把握手、词表和封装真实跑完。下载的常驻进程走同一套词表。TLS 和 WebSocket 只包在外面，方便过 CDN。虚拟网卡、WinDivert 驱动、Linux tproxy 的原始目的地址、Android 的 VpnService 仍然不在这个进程里。
         </p>
       </Panel>
 

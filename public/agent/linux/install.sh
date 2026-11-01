@@ -3,7 +3,7 @@ set -eu
 HERE=$(CDPATH= cd -- "$(dirname "$0")" && pwd)
 DEST="${HOME}/.config/lexis"
 mkdir -p "$DEST"
-cp "$HERE/lexis-agent.mjs" "$HERE/lexis.config.json" "$DEST/"
+cp "$HERE/lexis-agent.mjs" "$HERE/lexis-frame.mjs" "$HERE/zstd.wasm" "$HERE/lexis-tls.crt" "$HERE/lexis-tls.key" "$HERE/lexis.config.json" "$DEST/"
 chmod +x "$DEST/lexis-agent.mjs"
 if ! command -v node >/dev/null 2>&1; then
   echo "需要 Node.js 22"

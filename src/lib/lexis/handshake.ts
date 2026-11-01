@@ -66,6 +66,8 @@ export type GatePending = {
   nonceS: Uint8Array;
   serverWire: string;
   expectFinish: Uint8Array;
+  kdf: ArgonParams;
+  features: number;
 };
 
 export function currentWindow(now = Date.now()): number {
@@ -196,6 +198,8 @@ export async function gateRespond(
     nonceS,
     serverWire,
     expectFinish,
+    kdf: hello.kdf,
+    features,
   };
 }
 

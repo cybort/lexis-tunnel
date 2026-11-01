@@ -1,12 +1,28 @@
-词隙客户端 1.0.0
+词隙客户端 1.2.0
 
-这是同一份通信进程。Windows、Linux、Android（Termux）都读 lexis.config.json。
+这是同一份通信进程。Windows、Linux、Android（Termux）都读 lexis.config.json。需要 Node.js 22。目录里还要有 lexis-frame.mjs、zstd.wasm，以及实验室用的 lexis-tls.crt / lexis-tls.key。
 
-固定端口：进程监听配置里的端口。SOCKS 入站给本机程序当代理；TCP 入站按目标转发；tunnel 入站收 LEXIS1 头再拨目标。
-系统接管：进程仍常驻，并写出平台脚本。Linux 在有 root 时用 iptables redirect 或 tproxy；Windows 用 netsh portproxy，或只记录 WinDivert 过滤；Android 写出 vpn-session.json 给 VpnService，Termux 本身打不开系统 VPN。
+转发正文和控制台是同一套词表。两端用长期公钥做 ECDH，会话密钥用 Argon2id，参数在握手里回声。计数器、密钥流和秘密词表把明文写成散文。明文第一个字节决定是原文还是 zstd。蜜文打开时，校验对不上不报错，而落成公开词表里的另一句话。重放仍然会被丢掉。
+
+外层只负责把头和协议走完，方便过 CDN：
+- tcp：一行一句词表
+- tls：同一句词表走在 TLS 应用数据里。包里的证书是实验室自签，正式源站请换成自己的
+- ws / wss：一条 WebSocket 文本消息就是一句词表，路径默认 /lexis。CDN 若自己终结 TLS，源站听 ws，客户端连 wss，并填 CDN 的主机名
+
+身份写在 identity。peers 里放要加入的节点，公钥必须对上。导出的配置带本机私钥，不要外传。没有口令校验位，换一把密钥不会提示口令错误。
+
+一条会话上可以开多路。打开命令是 `tcp 主机 端口`、`udp 主机 端口`，或 `relay 节点 tcp 主机 端口`。名单里的每个节点都能中继，跳数超过 4 就拒绝。中继自己不拨号。
+
+SOCKS 接受 CONNECT 和 UDP ASSOCIATE。socksAuth 的用户名和密码都填了才认证，留空就不认证。UDP 关联绑在回环。
+
+固定端口：进程监听配置里的端口。SOCKS 给本机程序当代理；TCP 入站按目标转发；tunnel 入站做词表握手，然后接受上面的打开命令。
+系统接管：进程仍常驻，并写出平台脚本。Linux 在有 root 时写 iptables redirect，或一条 tproxy 规则；tproxy 还不会取原始目的地址，所以并没有真正接管。Windows 的 portproxy 只绑 127.0.0.1，不把本地端口公布到局域网；WinDivert 只留下说明，驱动不在包里。Android 写出 vpn-session.json 给 VpnService，Termux 本身打不开系统 VPN。没有虚拟网卡。
+
+SOCKS 和固定转发默认只绑 127.0.0.1。只有 link.allowLan 为 true 时才按配置里的地址监听。隧道入口可以听更宽的地址。
+出口拨号前会先解析域名。回环、内网、链路本地、运营商级 NAT 和文档地址默认拒绝。egress.allow 一行一个主机、主机:端口或 IPv4 网段，用来单独放行。这道拦截不作用于你本机 SOCKS 的直连和绕行。空闲超时和连接上限在 link.idleMs、link.maxConns。
 
 程序名：接入、绕行或拒绝。Linux 从 /proc 认进程，Windows 用当前连接的进程名，Android 上认不到进程时规则仍留在配置里。
-路由：DOMAIN、DOMAIN-SUFFIX、IP-CIDR、GEOSITE、GEOIP、PROCESS-NAME、MATCH。内置 geosite/geoip 是一份小样。完整库把文本 URL 填进配置，客户端启动时拉取。文本一行一条：`类别 域名`、`geoip:类别 地址段`，或单独一行域名 / 地址段（归到 remote）。
+路由：DOMAIN、DOMAIN-SUFFIX、IP-CIDR、GEOSITE、GEOIP、PROCESS-NAME、MATCH。内置 geosite/geoip 是一份小样。完整库把文本 URL 填进配置，客户端启动时拉取。文本一行一条：`类别 域名`、`geoip:类别 地址段`，或单独一行域名 / 地址段（归到 remote）。域名还不会先解析再套 IP 规则。
 
 安装：
 - Windows：在解压目录里运行 install.ps1。登录后任务 LexisAgent 会把进程拉起。
@@ -14,6 +30,4 @@
 - Android：在 Termux 里 sh install.sh。
 
 状态页默认是 http://127.0.0.1:17890/
-改配置后重启进程。控制台导出的 JSON 覆盖 lexis.config.json 即可。
-
-会话密钥在控制台里用 Argon2id 从两次 ECDH 派生，参数在握手里回声。帧可以在明文里带 zstd，对端看类型字节，不用把压缩开关配成一样。蜜文打开时，错误密钥不会得到一个明确的失败。这个下载包里的常驻进程仍按 LEXIS1 前言做转发，不在本机跑词表封装。
+改配置后重启进程。控制台导出的 JSON 覆盖 lexis.config.json 即可。两端都要把对方公钥放进 peers。

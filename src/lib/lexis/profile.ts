@@ -42,6 +42,27 @@ export type ProcessRule = {
   action: RuleAction;
 };
 
+export type OuterTransport = "tcp" | "tls" | "ws" | "wss";
+
+export type NodeIdentity = {
+  id: string;
+  name: string;
+  publicJwk: JsonWebKey;
+  privateJwk: JsonWebKey;
+  publicRawB64: string;
+  fingerprint: string;
+};
+
+export type NetPeer = {
+  id: string;
+  name: string;
+  endpoint: string;
+  transport: OuterTransport;
+  publicRawB64: string;
+  wsPath: string;
+  wsHost: string;
+};
+
 export type LexisProfile = {
   version: typeof PROFILE_VERSION;
   name: string;
@@ -65,6 +86,12 @@ export type LexisProfile = {
   kdf: ArgonParams;
   honey: boolean;
   zstd: { enabled: boolean; level: number };
+  link: { token: string; idleMs: number; maxConns: number; headerBytes: number; allowLan: boolean };
+  egress: { blockPrivate: boolean; allow: string[] };
+  outer: { transport: OuterTransport; wsPath: string; tlsVerify: boolean };
+  socksAuth: { user: string; pass: string };
+  identity: NodeIdentity | null;
+  peers: NetPeer[];
 };
 
 export const RULE_TYPES: RuleType[] = [
@@ -154,6 +181,12 @@ export function defaultProfile(): LexisProfile {
     kdf: { ...DEFAULT_KDF },
     honey: false,
     zstd: { enabled: false, level: 3 },
+    link: { token: "", idleMs: 120000, maxConns: 128, headerBytes: 8192, allowLan: false },
+    egress: { blockPrivate: true, allow: [] },
+    outer: { transport: "tcp", wsPath: "/lexis", tlsVerify: true },
+    socksAuth: { user: "", pass: "" },
+    identity: null,
+    peers: [],
   };
 }
 
@@ -200,6 +233,63 @@ export function normalizeProfile(input: unknown): LexisProfile {
       enabled: Boolean(raw.zstd && raw.zstd.enabled),
       level: clampNum(raw.zstd?.level, 1, 19, base.zstd.level),
     },
+    link: {
+      token: typeof raw.link?.token === "string" ? raw.link.token : "",
+      idleMs: clampNum(raw.link?.idleMs, 1000, 600000, base.link.idleMs),
+      maxConns: clampNum(raw.link?.maxConns, 1, 10000, base.link.maxConns),
+      headerBytes: clampNum(raw.link?.headerBytes, 256, 65536, base.link.headerBytes),
+      allowLan: raw.link?.allowLan === true,
+    },
+    egress: {
+      blockPrivate: raw.egress?.blockPrivate !== false,
+      allow: Array.isArray(raw.egress?.allow) ? raw.egress.allow.map((item) => String(item).trim()).filter(Boolean) : [],
+    },
+    outer: normalizeOuter(raw.outer),
+    socksAuth: {
+      user: typeof raw.socksAuth?.user === "string" ? raw.socksAuth.user : "",
+      pass: typeof raw.socksAuth?.pass === "string" ? raw.socksAuth.pass : "",
+    },
+    identity: normalizeIdentity(raw.identity),
+    peers: Array.isArray(raw.peers) ? raw.peers.map((item) => normalizePeer(item)).filter((item): item is NetPeer => item !== null) : [],
+  };
+}
+
+function isOuter(value: unknown): value is OuterTransport {
+  return value === "tcp" || value === "tls" || value === "ws" || value === "wss";
+}
+
+function normalizeOuter(raw: LexisProfile["outer"] | undefined): LexisProfile["outer"] {
+  const base = defaultProfile().outer;
+  return {
+    transport: isOuter(raw?.transport) ? raw.transport : base.transport,
+    wsPath: typeof raw?.wsPath === "string" && raw.wsPath.startsWith("/") ? raw.wsPath : base.wsPath,
+    tlsVerify: raw?.tlsVerify !== false,
+  };
+}
+
+function normalizeIdentity(raw: Partial<NodeIdentity> | null | undefined): NodeIdentity | null {
+  if (!raw || typeof raw !== "object") return null;
+  if (!raw.publicJwk || !raw.privateJwk || typeof raw.publicRawB64 !== "string" || !raw.publicRawB64) return null;
+  return {
+    id: raw.id || newId("id"),
+    name: raw.name || "本机",
+    publicJwk: raw.publicJwk,
+    privateJwk: raw.privateJwk,
+    publicRawB64: raw.publicRawB64,
+    fingerprint: raw.fingerprint || "",
+  };
+}
+
+function normalizePeer(raw: Partial<NetPeer> | null | undefined): NetPeer | null {
+  if (!raw || typeof raw !== "object") return null;
+  return {
+    id: raw.id || newId("peer"),
+    name: raw.name || "节点",
+    endpoint: String(raw.endpoint || "").trim(),
+    transport: isOuter(raw.transport) ? raw.transport : "tcp",
+    publicRawB64: String(raw.publicRawB64 || "").trim(),
+    wsPath: typeof raw.wsPath === "string" && raw.wsPath.startsWith("/") ? raw.wsPath : "/lexis",
+    wsHost: String(raw.wsHost || "").trim(),
   };
 }
 
@@ -436,6 +526,20 @@ export function profileIssues(profile: LexisProfile): string[] {
   }
   if (profile.peerEndpoint && !/^.+:\d+$/.test(profile.peerEndpoint)) {
     issues.push("对端地址要写成 主机:端口");
+  }
+  const joined = profile.peers.length > 0 || profile.inbounds.some((item) => item.protocol === "tunnel");
+  if ((joined || profile.role === "gate" || profile.peerEndpoint) && !profile.identity) {
+    issues.push("常驻转发要有本机身份。在节点页把一把密钥写成常驻身份");
+  }
+  if (profile.inbounds.some((item) => item.protocol === "tunnel") && profile.peers.length === 0) {
+    issues.push("隧道入口还没有对端公钥，握不上手");
+  }
+  for (const peer of profile.peers) {
+    if (!/^.+:\d+$/.test(peer.endpoint)) issues.push(`${peer.name} 的地址要写成 主机:端口`);
+    if (peer.publicRawB64.length < 16) issues.push(`${peer.name} 缺少公钥，不能加入词表握手`);
+  }
+  if ((profile.socksAuth.user && !profile.socksAuth.pass) || (!profile.socksAuth.user && profile.socksAuth.pass)) {
+    issues.push("SOCKS 用户名和密码要一起填，或都留空");
   }
   return issues;
 }

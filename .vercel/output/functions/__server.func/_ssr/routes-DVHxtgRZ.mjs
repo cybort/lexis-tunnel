@@ -6,7 +6,7 @@ import { t as p256 } from "../_libs/noble__curves+noble__hashes.mjs";
 import { t as argon2id } from "../_libs/noble__hashes.mjs";
 import { t as require_index_node } from "../_libs/bokuweb__zstd-wasm.mjs";
 import { a as Cell, i as Bar, n as YAxis, o as ResponsiveContainer, r as XAxis, s as Tooltip, t as BarChart } from "../_libs/recharts+[...].mjs";
-//#region node_modules/.nitro/vite/services/ssr/assets/routes-iRfLjJqC.js
+//#region node_modules/.nitro/vite/services/ssr/assets/routes-DVHxtgRZ.js
 var import_react = /* @__PURE__ */ __toESM(require_react());
 var import_jsx_runtime = require_jsx_runtime();
 var import_index_node = require_index_node();
@@ -654,7 +654,29 @@ function defaultProfile() {
 		zstd: {
 			enabled: false,
 			level: 3
-		}
+		},
+		link: {
+			token: "",
+			idleMs: 12e4,
+			maxConns: 128,
+			headerBytes: 8192,
+			allowLan: false
+		},
+		egress: {
+			blockPrivate: true,
+			allow: []
+		},
+		outer: {
+			transport: "tcp",
+			wsPath: "/lexis",
+			tlsVerify: true
+		},
+		socksAuth: {
+			user: "",
+			pass: ""
+		},
+		identity: null,
+		peers: []
 	};
 }
 function actionLabel(action) {
@@ -702,7 +724,60 @@ function normalizeProfile(input) {
 		zstd: {
 			enabled: Boolean(raw.zstd && raw.zstd.enabled),
 			level: clampNum(raw.zstd?.level, 1, 19, base.zstd.level)
-		}
+		},
+		link: {
+			token: typeof raw.link?.token === "string" ? raw.link.token : "",
+			idleMs: clampNum(raw.link?.idleMs, 1e3, 6e5, base.link.idleMs),
+			maxConns: clampNum(raw.link?.maxConns, 1, 1e4, base.link.maxConns),
+			headerBytes: clampNum(raw.link?.headerBytes, 256, 65536, base.link.headerBytes),
+			allowLan: raw.link?.allowLan === true
+		},
+		egress: {
+			blockPrivate: raw.egress?.blockPrivate !== false,
+			allow: Array.isArray(raw.egress?.allow) ? raw.egress.allow.map((item) => String(item).trim()).filter(Boolean) : []
+		},
+		outer: normalizeOuter(raw.outer),
+		socksAuth: {
+			user: typeof raw.socksAuth?.user === "string" ? raw.socksAuth.user : "",
+			pass: typeof raw.socksAuth?.pass === "string" ? raw.socksAuth.pass : ""
+		},
+		identity: normalizeIdentity(raw.identity),
+		peers: Array.isArray(raw.peers) ? raw.peers.map((item) => normalizePeer(item)).filter((item) => item !== null) : []
+	};
+}
+function isOuter(value) {
+	return value === "tcp" || value === "tls" || value === "ws" || value === "wss";
+}
+function normalizeOuter(raw) {
+	const base = defaultProfile().outer;
+	return {
+		transport: isOuter(raw?.transport) ? raw.transport : base.transport,
+		wsPath: typeof raw?.wsPath === "string" && raw.wsPath.startsWith("/") ? raw.wsPath : base.wsPath,
+		tlsVerify: raw?.tlsVerify !== false
+	};
+}
+function normalizeIdentity(raw) {
+	if (!raw || typeof raw !== "object") return null;
+	if (!raw.publicJwk || !raw.privateJwk || typeof raw.publicRawB64 !== "string" || !raw.publicRawB64) return null;
+	return {
+		id: raw.id || newId("id"),
+		name: raw.name || "本机",
+		publicJwk: raw.publicJwk,
+		privateJwk: raw.privateJwk,
+		publicRawB64: raw.publicRawB64,
+		fingerprint: raw.fingerprint || ""
+	};
+}
+function normalizePeer(raw) {
+	if (!raw || typeof raw !== "object") return null;
+	return {
+		id: raw.id || newId("peer"),
+		name: raw.name || "节点",
+		endpoint: String(raw.endpoint || "").trim(),
+		transport: isOuter(raw.transport) ? raw.transport : "tcp",
+		publicRawB64: String(raw.publicRawB64 || "").trim(),
+		wsPath: typeof raw.wsPath === "string" && raw.wsPath.startsWith("/") ? raw.wsPath : "/lexis",
+		wsHost: String(raw.wsHost || "").trim()
 	};
 }
 function isAction(value) {
@@ -934,6 +1009,13 @@ function profileIssues(profile) {
 	if (profile.mode === "fixed-port" && profile.inbounds.length === 0) issues.push("固定端口模式至少要有一个入站");
 	for (const proc of profile.processes) if (!proc.name.trim()) issues.push("有一条程序规则没有名字");
 	if (profile.peerEndpoint && !/^.+:\d+$/.test(profile.peerEndpoint)) issues.push("对端地址要写成 主机:端口");
+	if ((profile.peers.length > 0 || profile.inbounds.some((item) => item.protocol === "tunnel") || profile.role === "gate" || profile.peerEndpoint) && !profile.identity) issues.push("常驻转发要有本机身份。在节点页把一把密钥写成常驻身份");
+	if (profile.inbounds.some((item) => item.protocol === "tunnel") && profile.peers.length === 0) issues.push("隧道入口还没有对端公钥，握不上手");
+	for (const peer of profile.peers) {
+		if (!/^.+:\d+$/.test(peer.endpoint)) issues.push(`${peer.name} 的地址要写成 主机:端口`);
+		if (peer.publicRawB64.length < 16) issues.push(`${peer.name} 缺少公钥，不能加入词表握手`);
+	}
+	if (profile.socksAuth.user && !profile.socksAuth.pass || !profile.socksAuth.user && profile.socksAuth.pass) issues.push("SOCKS 用户名和密码要一起填，或都留空");
 	return issues;
 }
 function gatePreset() {
@@ -1266,7 +1348,9 @@ async function gateRespond(gate, peerRawB64, helloWire) {
 		nonceC: hello.nonce,
 		nonceS,
 		serverWire,
-		expectFinish
+		expectFinish,
+		kdf: hello.kdf,
+		features
 	};
 }
 async function edgeFinish(edge, pending, gateRawB64, serverWire) {
@@ -2222,6 +2306,7 @@ function ConfigPanel() {
 	const [host, setHost] = (0, import_react.useState)("www.baidu.com");
 	const [ip, setIp] = (0, import_react.useState)("");
 	const [proc, setProc] = (0, import_react.useState)("");
+	const [minting, setMinting] = (0, import_react.useState)(false);
 	const hit = matchRoute(profile, {
 		host,
 		ip,
@@ -2230,6 +2315,22 @@ function ConfigPanel() {
 	const issues = profileIssues(profile);
 	function setInbounds(inbounds) {
 		patch({ inbounds });
+	}
+	async function mintIdentity() {
+		setMinting(true);
+		try {
+			const ident = await createIdentity();
+			patch({ identity: {
+				id: crypto.randomUUID(),
+				name: profile.name || "本机",
+				publicJwk: ident.publicJwk,
+				privateJwk: ident.privateJwk,
+				publicRawB64: b64(ident.publicRaw),
+				fingerprint: ident.fingerprint
+			} });
+		} finally {
+			setMinting(false);
+		}
 	}
 	function setProcesses(processes) {
 		patch({ processes });
@@ -2466,6 +2567,256 @@ function ConfigPanel() {
 			}),
 			/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("section", {
 				className: "rounded-md border border-line bg-panel p-4",
+				children: [
+					/* @__PURE__ */ (0, import_jsx_runtime.jsx)("h2", {
+						className: "text-base font-medium",
+						children: "链路"
+					}),
+					/* @__PURE__ */ (0, import_jsx_runtime.jsx)("p", {
+						className: "mt-2 text-sm text-mist",
+						children: "常驻进程和这条控制台用同一套词表。握手仍是两次 ECDH 加 Argon2id，正文是密钥、计数器和秘密词表。TCP、TLS、WebSocket 只负责协议和头，用来过 CDN。路径默认 /lexis。CDN 若自己终结 TLS，源站可以听 WebSocket。"
+					}),
+					/* @__PURE__ */ (0, import_jsx_runtime.jsx)("p", {
+						className: "mt-2 text-sm text-mist",
+						children: "一条会话上可以开多路。打开写成 tcp 主机 端口、udp 主机 端口，或 relay 节点 再接后面的命令。名单里的节点都能中继，跳数到 4 就停。SOCKS 的用户名和密码留空就是不认证。"
+					}),
+					/* @__PURE__ */ (0, import_jsx_runtime.jsx)("div", {
+						className: "mt-4 flex flex-wrap gap-2",
+						children: [
+							"tcp",
+							"tls",
+							"ws",
+							"wss"
+						].map((name) => /* @__PURE__ */ (0, import_jsx_runtime.jsx)(Btn, {
+							kind: profile.outer.transport === name ? "solid" : "ghost",
+							onClick: () => patch({ outer: {
+								...profile.outer,
+								transport: name
+							} }),
+							children: name
+						}, name))
+					}),
+					/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", {
+						className: "mt-4 grid gap-3 sm:grid-cols-2",
+						children: [
+							/* @__PURE__ */ (0, import_jsx_runtime.jsx)(Field, {
+								label: "WebSocket 路径",
+								children: /* @__PURE__ */ (0, import_jsx_runtime.jsx)("input", {
+									className: control,
+									value: profile.outer.wsPath,
+									onChange: (e) => patch({ outer: {
+										...profile.outer,
+										wsPath: e.target.value
+									} })
+								})
+							}),
+							/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", { children: [/* @__PURE__ */ (0, import_jsx_runtime.jsx)("p", {
+								className: "text-sm text-mist",
+								children: "校验证书"
+							}), /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", {
+								className: "mt-2 flex flex-wrap gap-2",
+								children: [/* @__PURE__ */ (0, import_jsx_runtime.jsx)(Btn, {
+									kind: profile.outer.tlsVerify ? "solid" : "ghost",
+									onClick: () => patch({ outer: {
+										...profile.outer,
+										tlsVerify: true
+									} }),
+									children: "校验"
+								}), /* @__PURE__ */ (0, import_jsx_runtime.jsx)(Btn, {
+									kind: !profile.outer.tlsVerify ? "solid" : "ghost",
+									onClick: () => patch({ outer: {
+										...profile.outer,
+										tlsVerify: false
+									} }),
+									children: "实验室自签"
+								})]
+							})] }),
+							/* @__PURE__ */ (0, import_jsx_runtime.jsx)(Field, {
+								label: "SOCKS 用户名",
+								children: /* @__PURE__ */ (0, import_jsx_runtime.jsx)("input", {
+									className: control,
+									autoComplete: "off",
+									value: profile.socksAuth.user,
+									onChange: (e) => patch({ socksAuth: {
+										...profile.socksAuth,
+										user: e.target.value
+									} })
+								})
+							}),
+							/* @__PURE__ */ (0, import_jsx_runtime.jsx)(Field, {
+								label: "SOCKS 密码",
+								children: /* @__PURE__ */ (0, import_jsx_runtime.jsx)("input", {
+									className: control,
+									type: "password",
+									autoComplete: "off",
+									value: profile.socksAuth.pass,
+									onChange: (e) => patch({ socksAuth: {
+										...profile.socksAuth,
+										pass: e.target.value
+									} })
+								})
+							})
+						]
+					}),
+					/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", {
+						className: "mt-4 rounded-sm bg-panel-2 p-3",
+						children: [
+							/* @__PURE__ */ (0, import_jsx_runtime.jsx)("p", {
+								className: "text-sm text-mist",
+								children: "本机身份"
+							}),
+							/* @__PURE__ */ (0, import_jsx_runtime.jsx)("p", {
+								className: "mt-2 break-all font-mono text-xs text-fg",
+								children: profile.identity?.fingerprint || "还没有"
+							}),
+							/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", {
+								className: "mt-3 flex flex-wrap gap-2",
+								children: [/* @__PURE__ */ (0, import_jsx_runtime.jsx)(Btn, {
+									kind: "ghost",
+									disabled: minting,
+									onClick: () => void mintIdentity(),
+									children: minting ? "生成中" : profile.identity ? "换一把常驻身份" : "生成本机身份"
+								}), profile.identity ? /* @__PURE__ */ (0, import_jsx_runtime.jsx)(Btn, {
+									kind: "ember",
+									onClick: () => patch({ identity: null }),
+									children: "清掉身份"
+								}) : null]
+							}),
+							/* @__PURE__ */ (0, import_jsx_runtime.jsx)("p", {
+								className: "mt-2 text-sm text-mist",
+								children: "导出配置会带上这把私钥。只放到你自己的常驻进程里。对端只需要公钥。"
+							})
+						]
+					}),
+					/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", {
+						className: "mt-4",
+						children: [
+							/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", {
+								className: "flex items-center justify-between gap-3",
+								children: [/* @__PURE__ */ (0, import_jsx_runtime.jsx)("h3", {
+									className: "text-sm font-medium",
+									children: "加入的节点"
+								}), /* @__PURE__ */ (0, import_jsx_runtime.jsx)(Btn, {
+									kind: "ghost",
+									onClick: () => patch({ peers: [...profile.peers, {
+										id: rid("peer"),
+										name: "节点",
+										endpoint: profile.peerEndpoint,
+										transport: profile.outer.transport,
+										publicRawB64: "",
+										wsPath: profile.outer.wsPath,
+										wsHost: ""
+									}] }),
+									children: "添加节点"
+								})]
+							}),
+							/* @__PURE__ */ (0, import_jsx_runtime.jsx)("p", {
+								className: "mt-2 text-sm text-mist",
+								children: "每个节点都能中继。地址写成 主机:端口。WebSocket 主机名留给 CDN，空着就用地址里的主机。"
+							}),
+							/* @__PURE__ */ (0, import_jsx_runtime.jsx)("div", {
+								className: "mt-3 flex flex-col gap-3",
+								children: profile.peers.map((peer) => /* @__PURE__ */ (0, import_jsx_runtime.jsx)(PeerEditor, {
+									peer,
+									onChange: (next) => patch({ peers: profile.peers.map((item) => item.id === peer.id ? next : item) }),
+									onRemove: () => patch({ peers: profile.peers.filter((item) => item.id !== peer.id) })
+								}, peer.id))
+							})
+						]
+					}),
+					/* @__PURE__ */ (0, import_jsx_runtime.jsx)("p", {
+						className: "mt-4 text-sm text-mist",
+						children: "闸门拨号前会解析域名。回环、内网、链路本地、运营商级 NAT 和文档地址默认拒绝。白名单写成主机、主机:端口或 IPv4 网段。这道拦截不作用于本机 SOCKS 的直连和绕行。公网端口不单独封禁。"
+					}),
+					/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", {
+						className: "mt-4 grid gap-3 sm:grid-cols-2",
+						children: [
+							/* @__PURE__ */ (0, import_jsx_runtime.jsx)(Field, {
+								label: "空闲超时（秒）",
+								children: /* @__PURE__ */ (0, import_jsx_runtime.jsx)("input", {
+									className: control,
+									inputMode: "numeric",
+									value: Math.round(profile.link.idleMs / 1e3),
+									onChange: (e) => patch({ link: {
+										...profile.link,
+										idleMs: Math.round(Number(e.target.value) * 1e3)
+									} })
+								})
+							}),
+							/* @__PURE__ */ (0, import_jsx_runtime.jsx)(Field, {
+								label: "连接上限",
+								children: /* @__PURE__ */ (0, import_jsx_runtime.jsx)("input", {
+									className: control,
+									inputMode: "numeric",
+									value: profile.link.maxConns,
+									onChange: (e) => patch({ link: {
+										...profile.link,
+										maxConns: Number(e.target.value)
+									} })
+								})
+							}),
+							/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", { children: [/* @__PURE__ */ (0, import_jsx_runtime.jsx)("p", {
+								className: "text-sm text-mist",
+								children: "内网拦截"
+							}), /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", {
+								className: "mt-2 flex flex-wrap gap-2",
+								children: [/* @__PURE__ */ (0, import_jsx_runtime.jsx)(Btn, {
+									kind: profile.egress.blockPrivate ? "solid" : "ghost",
+									onClick: () => patch({ egress: {
+										...profile.egress,
+										blockPrivate: true
+									} }),
+									children: "拦截"
+								}), /* @__PURE__ */ (0, import_jsx_runtime.jsx)(Btn, {
+									kind: !profile.egress.blockPrivate ? "solid" : "ghost",
+									onClick: () => patch({ egress: {
+										...profile.egress,
+										blockPrivate: false
+									} }),
+									children: "放行"
+								})]
+							})] })
+						]
+					}),
+					/* @__PURE__ */ (0, import_jsx_runtime.jsx)("div", {
+						className: "mt-4",
+						children: /* @__PURE__ */ (0, import_jsx_runtime.jsx)(Field, {
+							label: "出站白名单，一行一条",
+							children: /* @__PURE__ */ (0, import_jsx_runtime.jsx)(AllowList, {
+								allow: profile.egress.allow,
+								onChange: (allow) => patch({ egress: {
+									...profile.egress,
+									allow
+								} })
+							})
+						})
+					}),
+					/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", {
+						className: "mt-4 flex flex-wrap gap-2",
+						children: [/* @__PURE__ */ (0, import_jsx_runtime.jsx)(Btn, {
+							kind: profile.link.allowLan ? "solid" : "ghost",
+							onClick: () => patch({ link: {
+								...profile.link,
+								allowLan: true
+							} }),
+							children: "允许局域网监听"
+						}), /* @__PURE__ */ (0, import_jsx_runtime.jsx)(Btn, {
+							kind: !profile.link.allowLan ? "solid" : "ghost",
+							onClick: () => patch({ link: {
+								...profile.link,
+								allowLan: false
+							} }),
+							children: "只监听回环"
+						})]
+					}),
+					/* @__PURE__ */ (0, import_jsx_runtime.jsx)("p", {
+						className: "mt-2 text-sm text-mist",
+						children: profile.link.allowLan ? "SOCKS 和固定转发会按填写的地址监听，可能暴露到局域网。" : "SOCKS 和固定转发强制绑在回环。隧道入口仍按填写的地址监听，方便以后做端口映射。"
+					})
+				]
+			}),
+			/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("section", {
+				className: "rounded-md border border-line bg-panel p-4",
 				children: [/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", {
 					className: "flex items-center justify-between gap-3",
 					children: [/* @__PURE__ */ (0, import_jsx_runtime.jsx)("h2", {
@@ -2612,7 +2963,7 @@ function ConfigPanel() {
 							}),
 							/* @__PURE__ */ (0, import_jsx_runtime.jsxs)(Platform, {
 								title: "Windows",
-								body: "portproxy 转发到本地端口，或只记录 WinDivert 过滤。",
+								body: "portproxy 只绑回环，避免把本地端口公布到局域网。WinDivert 只留下记录，驱动不在包里。",
 								children: [/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("select", {
 									className: control,
 									value: profile.windows.method,
@@ -2920,8 +3271,112 @@ function ConfigPanel() {
 					onClick: () => downloadJson("lexis.config.json", profile),
 					children: "导出配置"
 				})
+			}),
+			/* @__PURE__ */ (0, import_jsx_runtime.jsx)("p", {
+				className: "text-sm text-mist",
+				children: "导出的 JSON 含本机私钥。覆盖常驻进程目录里的 lexis.config.json 再重启。"
 			})
 		]
+	});
+}
+function PeerEditor({ peer, onChange, onRemove }) {
+	return /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", {
+		className: "grid gap-2 rounded-sm bg-panel-2 p-3",
+		children: [
+			/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", {
+				className: "grid gap-2 sm:grid-cols-2",
+				children: [
+					/* @__PURE__ */ (0, import_jsx_runtime.jsx)("input", {
+						className: control,
+						"aria-label": "节点名称",
+						value: peer.name,
+						onChange: (e) => onChange({
+							...peer,
+							name: e.target.value
+						})
+					}),
+					/* @__PURE__ */ (0, import_jsx_runtime.jsx)("input", {
+						className: control,
+						"aria-label": "节点地址",
+						placeholder: "主机:端口",
+						value: peer.endpoint,
+						onChange: (e) => onChange({
+							...peer,
+							endpoint: e.target.value
+						})
+					}),
+					/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("select", {
+						className: control,
+						"aria-label": "外层协议",
+						value: peer.transport,
+						onChange: (e) => onChange({
+							...peer,
+							transport: e.target.value
+						}),
+						children: [
+							/* @__PURE__ */ (0, import_jsx_runtime.jsx)("option", {
+								value: "tcp",
+								children: "tcp"
+							}),
+							/* @__PURE__ */ (0, import_jsx_runtime.jsx)("option", {
+								value: "tls",
+								children: "tls"
+							}),
+							/* @__PURE__ */ (0, import_jsx_runtime.jsx)("option", {
+								value: "ws",
+								children: "ws"
+							}),
+							/* @__PURE__ */ (0, import_jsx_runtime.jsx)("option", {
+								value: "wss",
+								children: "wss"
+							})
+						]
+					}),
+					/* @__PURE__ */ (0, import_jsx_runtime.jsx)("input", {
+						className: control,
+						"aria-label": "WebSocket 主机",
+						placeholder: "CDN 主机名，可空",
+						value: peer.wsHost,
+						onChange: (e) => onChange({
+							...peer,
+							wsHost: e.target.value
+						})
+					})
+				]
+			}),
+			/* @__PURE__ */ (0, import_jsx_runtime.jsx)("textarea", {
+				className: "min-h-20 w-full rounded-sm border border-line bg-ink px-3 py-3 font-mono text-xs text-fg",
+				"aria-label": "节点公钥",
+				placeholder: "公钥",
+				value: peer.publicRawB64,
+				onChange: (e) => onChange({
+					...peer,
+					publicRawB64: e.target.value.trim()
+				})
+			}),
+			/* @__PURE__ */ (0, import_jsx_runtime.jsx)(Btn, {
+				kind: "ember",
+				onClick: onRemove,
+				children: "移出名单"
+			})
+		]
+	});
+}
+function AllowList({ allow, onChange }) {
+	const [text, setText] = (0, import_react.useState)(allow.join("\n"));
+	const [focused, setFocused] = (0, import_react.useState)(false);
+	(0, import_react.useEffect)(() => {
+		if (!focused) setText(allow.join("\n"));
+	}, [allow, focused]);
+	return /* @__PURE__ */ (0, import_jsx_runtime.jsx)("textarea", {
+		className: "min-h-24 w-full rounded-sm border border-line bg-ink px-3 py-3 font-mono text-sm text-fg",
+		value: text,
+		onFocus: () => setFocused(true),
+		onBlur: () => {
+			setFocused(false);
+			onChange(text.split(/\r?\n/).map((line) => line.trim()).filter(Boolean));
+		},
+		onChange: (e) => setText(e.target.value)
 	});
 }
 function Platform({ title, body, children }) {
@@ -3275,6 +3730,8 @@ function NodesPanel() {
 	const bindPair = useMesh((s) => s.bindPair);
 	const reset = useMesh((s) => s.reset);
 	const setIdentity = useMesh((s) => s.setIdentity);
+	const profile = useProfile((s) => s.profile);
+	const patch = useProfile((s) => s.patch);
 	const [busy, setBusy] = (0, import_react.useState)(false);
 	const [error, setError] = (0, import_react.useState)(null);
 	const fileRef = (0, import_react.useRef)(null);
@@ -3408,13 +3865,35 @@ function NodesPanel() {
 					onName: (name) => updateNode(node.id, { name }),
 					onBind: (peerId) => bindPair(node.id, peerId),
 					onRemove: () => removeNode(node.id),
-					onDerive: (passphrase) => deriveNode(node.id, passphrase)
+					onDerive: (passphrase) => deriveNode(node.id, passphrase),
+					resident: profile.identity?.id === node.id,
+					joined: profile.peers.some((peer) => peer.id === node.id),
+					onResident: () => patch({ identity: {
+						id: node.id,
+						name: node.name,
+						publicJwk: node.publicJwk,
+						privateJwk: node.privateJwk,
+						publicRawB64: node.publicRawB64,
+						fingerprint: node.fingerprint
+					} }),
+					onJoin: () => {
+						const next = {
+							id: node.id,
+							name: node.name,
+							endpoint: profile.peerEndpoint,
+							transport: profile.outer.transport,
+							publicRawB64: node.publicRawB64,
+							wsPath: profile.outer.wsPath,
+							wsHost: ""
+						};
+						patch({ peers: [...profile.peers.filter((peer) => peer.id !== node.id), next] });
+					}
 				}, node.id))
 			})
 		]
 	});
 }
-function NodeCard({ node, peers, peer, onName, onBind, onRemove, onDerive }) {
+function NodeCard({ node, peers, peer, onName, onBind, onRemove, onDerive, resident, joined, onResident, onJoin }) {
 	const [peerId, setPeerId] = (0, import_react.useState)(node.pinnedPeerId ?? "");
 	const [passphrase, setPassphrase] = (0, import_react.useState)("");
 	const [deriving, setDeriving] = (0, import_react.useState)(false);
@@ -3480,19 +3959,32 @@ function NodeCard({ node, peers, peer, onName, onBind, onRemove, onDerive }) {
 			}),
 			/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", {
 				className: "mt-3 flex flex-wrap gap-2",
-				children: [/* @__PURE__ */ (0, import_jsx_runtime.jsx)(Btn, {
-					kind: "ghost",
-					disabled: !peerId,
-					onClick: () => onBind(peerId),
-					children: "互相绑定"
-				}), /* @__PURE__ */ (0, import_jsx_runtime.jsxs)(Btn, {
-					kind: "ghost",
-					onClick: () => downloadJson(`${node.role}-${node.fingerprint}.json`, sidecarOf(node, peer)),
-					children: [/* @__PURE__ */ (0, import_jsx_runtime.jsx)(Download, {
-						className: "size-4",
-						"aria-hidden": "true"
-					}), "导出侧车"]
-				})]
+				children: [
+					/* @__PURE__ */ (0, import_jsx_runtime.jsx)(Btn, {
+						kind: "ghost",
+						disabled: !peerId,
+						onClick: () => onBind(peerId),
+						children: "互相绑定"
+					}),
+					/* @__PURE__ */ (0, import_jsx_runtime.jsx)(Btn, {
+						kind: resident ? "solid" : "ghost",
+						onClick: onResident,
+						children: resident ? "已是常驻身份" : "当作常驻身份"
+					}),
+					/* @__PURE__ */ (0, import_jsx_runtime.jsx)(Btn, {
+						kind: joined ? "solid" : "ghost",
+						onClick: onJoin,
+						children: joined ? "已在中继名单" : "加入中继名单"
+					}),
+					/* @__PURE__ */ (0, import_jsx_runtime.jsxs)(Btn, {
+						kind: "ghost",
+						onClick: () => downloadJson(`${node.role}-${node.fingerprint}.json`, sidecarOf(node, peer)),
+						children: [/* @__PURE__ */ (0, import_jsx_runtime.jsx)(Download, {
+							className: "size-4",
+							"aria-hidden": "true"
+						}), "导出侧车"]
+					})
+				]
 			}),
 			/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", {
 				className: "mt-3 grid gap-2",
@@ -3618,7 +4110,7 @@ function Overview({ onOpen }) {
 					}, title))
 				}), /* @__PURE__ */ (0, import_jsx_runtime.jsx)("p", {
 					className: "mt-4 text-sm text-mist",
-					children: "浏览器里不能守一个真正的 TCP 端口。这条控制台把握手、词表和封装真实跑完，端口映射按同一帧格式演练。侧车文件留给以后要常驻的进程。"
+					children: "浏览器里不能守一个真正的 TCP 端口。这条控制台把握手、词表和封装真实跑完。下载的常驻进程走同一套词表。TLS 和 WebSocket 只包在外面，方便过 CDN。虚拟网卡、WinDivert 驱动、Linux tproxy 的原始目的地址、Android 的 VpnService 仍然不在这个进程里。"
 				})]
 			}),
 			/* @__PURE__ */ (0, import_jsx_runtime.jsx)("div", {

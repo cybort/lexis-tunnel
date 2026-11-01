@@ -1,7 +1,7 @@
 import { i as __toESM } from "../_runtime.mjs";
 import { q as require_react, x as require_jsx_runtime, y as Link } from "../_libs/@tanstack/react-router+[...].mjs";
 import { i as Smartphone, o as Monitor, r as Terminal } from "../_libs/lucide-react.mjs";
-//#region node_modules/.nitro/vite/services/ssr/assets/download-BD5mVPAS.js
+//#region node_modules/.nitro/vite/services/ssr/assets/download-BLvetMmf.js
 var import_react = /* @__PURE__ */ __toESM(require_react());
 var import_jsx_runtime = require_jsx_runtime();
 var CARDS = [
@@ -10,7 +10,7 @@ var CARDS = [
 		title: "Windows",
 		icon: Monitor,
 		resident: "登录任务常驻，失败会重试",
-		listen: "固定端口，或 netsh portproxy / WinDivert 记录",
+		listen: "固定端口。portproxy 只绑回环，WinDivert 只记录",
 		process: "按进程名接入或绕行"
 	},
 	{
@@ -18,7 +18,7 @@ var CARDS = [
 		title: "Linux",
 		icon: Terminal,
 		resident: "systemd 用户服务，断了自己拉起",
-		listen: "固定端口，或 iptables redirect / tproxy",
+		listen: "固定端口。转发脚本可写，tproxy 还取不到原始目的地址",
 		process: "从 /proc 认出程序名"
 	},
 	{
@@ -26,7 +26,7 @@ var CARDS = [
 		title: "Android",
 		icon: Smartphone,
 		resident: "Termux 后台，Termux:Boot 开机拉起",
-		listen: "固定端口，系统接管写成 VpnService 会话",
+		listen: "固定端口。系统接管只写出 VpnService 会话",
 		process: "程序规则写在配置里，认不到进程时不乱改动作"
 	}
 ];
@@ -93,7 +93,7 @@ function DownloadPage() {
 						}),
 						/* @__PURE__ */ (0, import_jsx_runtime.jsx)("p", {
 							className: "mt-2 max-w-2xl text-sm text-mist",
-							children: "通信进程安装后留在后台。控制台里的「配置」导出 JSON，覆盖客户端目录里的 lexis.config.json 再重启。需要 Node.js 22。状态页在本机 17890 端口。"
+							children: "通信进程安装后留在后台。转发正文和控制台是同一套词表。TLS 和 WebSocket 只做外层，用来过 CDN。SOCKS 可以另加用户名。加入名单的节点都能中继。导出的配置带本机私钥，两端要互相放上对方公钥。需要 Node.js 22。状态页在本机 17890 端口。"
 						})
 					]
 				}),

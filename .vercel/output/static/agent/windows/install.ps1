@@ -2,8 +2,9 @@ $ErrorActionPreference = "Stop"
 $here = Split-Path -Parent $MyInvocation.MyCommand.Path
 $dest = Join-Path $env:LOCALAPPDATA "Lexis"
 New-Item -ItemType Directory -Force -Path $dest | Out-Null
-Copy-Item (Join-Path $here "lexis-agent.mjs") $dest -Force
-Copy-Item (Join-Path $here "lexis.config.json") $dest -Force
+foreach ($name in @("lexis-agent.mjs", "lexis-frame.mjs", "zstd.wasm", "lexis-tls.crt", "lexis-tls.key", "lexis.config.json")) {
+  Copy-Item (Join-Path $here $name) $dest -Force
+}
 $node = (Get-Command node -ErrorAction SilentlyContinue).Source
 if (-not $node) { throw "需要 Node.js 22。安装后再运行本脚本。" }
 $arg = "`"$dest\lexis-agent.mjs`""

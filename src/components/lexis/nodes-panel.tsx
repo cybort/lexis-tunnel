@@ -4,6 +4,7 @@ import { b64, randomBytes } from "@/lib/lexis/bytes";
 import { identityFromJwks, LexisError } from "@/lib/lexis/crypto";
 import { clampKdf, deriveIdentity } from "@/lib/lexis/kdf";
 import { useProfile } from "@/lib/lexis/profile-store";
+import type { NetPeer } from "@/lib/lexis/profile";
 import { SPEC } from "@/lib/lexis/spec";
 import { downloadJson, makeNode, sidecarOf, useMesh } from "@/lib/lexis/store";
 import type { MeshNode, NodeKdf, NodeRole } from "@/lib/lexis/types";
@@ -28,6 +29,8 @@ export function NodesPanel() {
   const bindPair = useMesh((s) => s.bindPair);
   const reset = useMesh((s) => s.reset);
   const setIdentity = useMesh((s) => s.setIdentity);
+  const profile = useProfile((s) => s.profile);
+  const patch = useProfile((s) => s.patch);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const fileRef = useRef<HTMLInputElement>(null);
@@ -151,6 +154,32 @@ export function NodesPanel() {
             onBind={(peerId) => bindPair(node.id, peerId)}
             onRemove={() => removeNode(node.id)}
             onDerive={(passphrase) => deriveNode(node.id, passphrase)}
+            resident={profile.identity?.id === node.id}
+            joined={profile.peers.some((peer) => peer.id === node.id)}
+            onResident={() =>
+              patch({
+                identity: {
+                  id: node.id,
+                  name: node.name,
+                  publicJwk: node.publicJwk,
+                  privateJwk: node.privateJwk,
+                  publicRawB64: node.publicRawB64,
+                  fingerprint: node.fingerprint,
+                },
+              })
+            }
+            onJoin={() => {
+              const next: NetPeer = {
+                id: node.id,
+                name: node.name,
+                endpoint: profile.peerEndpoint,
+                transport: profile.outer.transport,
+                publicRawB64: node.publicRawB64,
+                wsPath: profile.outer.wsPath,
+                wsHost: "",
+              };
+              patch({ peers: [...profile.peers.filter((peer) => peer.id !== node.id), next] });
+            }}
           />
         ))}
       </div>
@@ -166,6 +195,10 @@ function NodeCard({
   onBind,
   onRemove,
   onDerive,
+  resident,
+  joined,
+  onResident,
+  onJoin,
 }: {
   node: MeshNode;
   peers: MeshNode[];
@@ -174,6 +207,10 @@ function NodeCard({
   onBind: (peerId: string) => void;
   onRemove: () => void;
   onDerive: (passphrase: string) => Promise<void>;
+  resident: boolean;
+  joined: boolean;
+  onResident: () => void;
+  onJoin: () => void;
 }) {
   const [peerId, setPeerId] = useState(node.pinnedPeerId ?? "");
   const [passphrase, setPassphrase] = useState("");
@@ -226,6 +263,12 @@ function NodeCard({
       <div className="mt-3 flex flex-wrap gap-2">
         <Btn kind="ghost" disabled={!peerId} onClick={() => onBind(peerId)}>
           互相绑定
+        </Btn>
+        <Btn kind={resident ? "solid" : "ghost"} onClick={onResident}>
+          {resident ? "已是常驻身份" : "当作常驻身份"}
+        </Btn>
+        <Btn kind={joined ? "solid" : "ghost"} onClick={onJoin}>
+          {joined ? "已在中继名单" : "加入中继名单"}
         </Btn>
         <Btn
           kind="ghost"
