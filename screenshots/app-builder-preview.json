@@ -1,0 +1,36 @@
+{
+  "url": "http://127.0.0.1:8080/",
+  "viewports": {
+    "desktop": {
+      "width": 1280,
+      "height": 800,
+      "status": 200,
+      "title": "词隙 LEXIS",
+      "hasCanvas": false,
+      "bodyTextLen": 56,
+      "bodyTextHash": "c25859e685197ceb2e2bba47baf299494f3511c539700f0d055fe78a331ec997",
+      "bodyTextPrefix": "词隙 LEXIS 低熵远程组网 窗长 300s 总览 节点 映射 隧道 词表 正在这台浏览器里准备闸门和内网端。",
+      "horizontalOverflow": false,
+      "consoleErrors": [],
+      "pageErrors": [],
+      "screenshot": "/workspace/screenshots/app-builder-preview.png"
+    },
+    "mobile": {
+      "width": 390,
+      "height": 844,
+      "status": 200,
+      "title": "词隙 LEXIS",
+      "hasCanvas": false,
+      "bodyTextLen": 56,
+      "bodyTextHash": "c25859e685197ceb2e2bba47baf299494f3511c539700f0d055fe78a331ec997",
+      "bodyTextPrefix": "词隙 LEXIS 低熵远程组网 窗长 300s 总览 节点 映射 隧道 词表 正在这台浏览器里准备闸门和内网端。",
+      "horizontalOverflow": false,
+      "consoleErrors": [],
+      "pageErrors": [],
+      "screenshot": "/workspace/screenshots/app-builder-preview-mobile.png"
+    }
+  },
+  "brandWarnings": [],
+  "authWarnings": [],
+  "verdictFile": "/workspace/screenshots/app-builder-preview.json"
+}
