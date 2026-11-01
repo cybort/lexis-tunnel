@@ -104,10 +104,26 @@
     "idleMs": 120000,
     "maxConns": 128,
     "headerBytes": 8192,
-    "allowLan": false
+    "allowLan": false,
+    "handshakeMs": 10000,
+    "dialMs": 10000,
+    "maxHandshakes": 2
   },
   "egress": {
     "blockPrivate": true,
     "allow": []
-  }
+  },
+  "outer": {
+    "transport": "tcp",
+    "wsPath": "/lexis",
+    "tlsVerify": true
+  },
+  "socksAuth": {
+    "user": "",
+    "pass": ""
+  },
+  "identity": null,
+  "peers": [],
+  "exposes": [],
+  "reverses": []
 }

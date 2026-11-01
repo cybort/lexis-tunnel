@@ -6,7 +6,7 @@ import { t as p256 } from "../_libs/noble__curves+noble__hashes.mjs";
 import { t as argon2id } from "../_libs/noble__hashes.mjs";
 import { t as require_index_node } from "../_libs/bokuweb__zstd-wasm.mjs";
 import { a as Cell, i as Bar, n as YAxis, o as ResponsiveContainer, r as XAxis, s as Tooltip, t as BarChart } from "../_libs/recharts+[...].mjs";
-//#region node_modules/.nitro/vite/services/ssr/assets/routes-DVHxtgRZ.js
+//#region node_modules/.nitro/vite/services/ssr/assets/routes-BVoH_aPG.js
 var import_react = /* @__PURE__ */ __toESM(require_react());
 var import_jsx_runtime = require_jsx_runtime();
 var import_index_node = require_index_node();
@@ -372,7 +372,7 @@ var DEFAULT_KDF = {
 var LIMITS = {
 	memoryKiB: {
 		min: 8,
-		max: 65536
+		max: 16384
 	},
 	iterations: {
 		min: 1,
@@ -484,6 +484,10 @@ function deriveSessionKey(ssE, ssS, nonceC, nonceS, window, features, params) {
 		}),
 		ms: Math.max(1, Date.now() - t0)
 	};
+}
+var sessionDeriver = async (ssE, ssS, nonceC, nonceS, window, features, params) => deriveSessionKey(ssE, ssS, nonceC, nonceS, window, features, params);
+function deriveSessionKeyAsync(ssE, ssS, nonceC, nonceS, window, features, params) {
+	return sessionDeriver(ssE, ssS, nonceC, nonceS, window, features, params);
 }
 var RULE_TYPES = [
 	"DOMAIN",
@@ -660,7 +664,10 @@ function defaultProfile() {
 			idleMs: 12e4,
 			maxConns: 128,
 			headerBytes: 8192,
-			allowLan: false
+			allowLan: false,
+			handshakeMs: 1e4,
+			dialMs: 1e4,
+			maxHandshakes: 2
 		},
 		egress: {
 			blockPrivate: true,
@@ -676,7 +683,9 @@ function defaultProfile() {
 			pass: ""
 		},
 		identity: null,
-		peers: []
+		peers: [],
+		exposes: [],
+		reverses: []
 	};
 }
 function actionLabel(action) {
@@ -730,7 +739,10 @@ function normalizeProfile(input) {
 			idleMs: clampNum(raw.link?.idleMs, 1e3, 6e5, base.link.idleMs),
 			maxConns: clampNum(raw.link?.maxConns, 1, 1e4, base.link.maxConns),
 			headerBytes: clampNum(raw.link?.headerBytes, 256, 65536, base.link.headerBytes),
-			allowLan: raw.link?.allowLan === true
+			allowLan: raw.link?.allowLan === true,
+			handshakeMs: clampNum(raw.link?.handshakeMs, 1e3, 6e4, base.link.handshakeMs),
+			dialMs: clampNum(raw.link?.dialMs, 1e3, 6e4, base.link.dialMs),
+			maxHandshakes: clampNum(raw.link?.maxHandshakes, 1, 8, base.link.maxHandshakes)
 		},
 		egress: {
 			blockPrivate: raw.egress?.blockPrivate !== false,
@@ -742,7 +754,9 @@ function normalizeProfile(input) {
 			pass: typeof raw.socksAuth?.pass === "string" ? raw.socksAuth.pass : ""
 		},
 		identity: normalizeIdentity(raw.identity),
-		peers: Array.isArray(raw.peers) ? raw.peers.map((item) => normalizePeer(item)).filter((item) => item !== null) : []
+		peers: Array.isArray(raw.peers) ? raw.peers.map((item) => normalizePeer(item)).filter((item) => item !== null) : [],
+		exposes: Array.isArray(raw.exposes) ? raw.exposes.map((item) => normalizeExpose(item)) : [],
+		reverses: Array.isArray(raw.reverses) ? raw.reverses.map((item) => normalizeReverse(item)) : []
 	};
 }
 function isOuter(value) {
@@ -777,7 +791,29 @@ function normalizePeer(raw) {
 		transport: isOuter(raw.transport) ? raw.transport : "tcp",
 		publicRawB64: String(raw.publicRawB64 || "").trim(),
 		wsPath: typeof raw.wsPath === "string" && raw.wsPath.startsWith("/") ? raw.wsPath : "/lexis",
-		wsHost: String(raw.wsHost || "").trim()
+		wsHost: String(raw.wsHost || "").trim(),
+		relay: raw.relay === true,
+		targets: Array.isArray(raw.targets) ? raw.targets.map((item) => String(item).trim()).filter(Boolean) : []
+	};
+}
+function normalizeExpose(raw) {
+	const row = raw && typeof raw === "object" ? raw : {};
+	return {
+		id: row.id || newId("expose"),
+		name: String(row.name || "").trim() || "服务",
+		host: String(row.host || "127.0.0.1").trim(),
+		port: clampNum(row.port, 1, 65535, 22),
+		allow: Array.isArray(row.allow) ? row.allow.map((item) => String(item).trim()).filter(Boolean) : []
+	};
+}
+function normalizeReverse(raw) {
+	const row = raw && typeof raw === "object" ? raw : {};
+	return {
+		id: row.id || newId("rev"),
+		listen: String(row.listen || "127.0.0.1").trim(),
+		port: clampNum(row.port, 1, 65535, 2222),
+		peer: String(row.peer || "").trim(),
+		service: String(row.service || "").trim()
 	};
 }
 function isAction(value) {
@@ -789,7 +825,7 @@ function clampNum(value, min, max, fallback) {
 	return n;
 }
 function normalizeInbound(raw) {
-	const protocol = raw.protocol === "tcp" || raw.protocol === "tunnel" ? raw.protocol : "socks";
+	const protocol = raw.protocol === "tcp" || raw.protocol === "tunnel" || raw.protocol === "http" ? raw.protocol : "socks";
 	return {
 		id: raw.id || newId("in"),
 		tag: raw.tag || "入站",
@@ -1009,12 +1045,17 @@ function profileIssues(profile) {
 	if (profile.mode === "fixed-port" && profile.inbounds.length === 0) issues.push("固定端口模式至少要有一个入站");
 	for (const proc of profile.processes) if (!proc.name.trim()) issues.push("有一条程序规则没有名字");
 	if (profile.peerEndpoint && !/^.+:\d+$/.test(profile.peerEndpoint)) issues.push("对端地址要写成 主机:端口");
-	if ((profile.peers.length > 0 || profile.inbounds.some((item) => item.protocol === "tunnel") || profile.role === "gate" || profile.peerEndpoint) && !profile.identity) issues.push("常驻转发要有本机身份。在节点页把一把密钥写成常驻身份");
+	const joined = profile.peers.length > 0 || profile.inbounds.some((item) => item.protocol === "tunnel") || profile.reverses.length > 0 || profile.exposes.length > 0;
+	if ((joined || profile.role === "gate" || profile.peerEndpoint) && !profile.identity) issues.push("常驻转发要有本机身份。在节点页把一把密钥写成常驻身份");
+	if (joined && profile.link.token.trim().length < 8) issues.push("常驻握手要有至少 8 个字符的口令，用来在 Argon2 之前挡掉伪造问候");
+	if (!profile.outer.tlsVerify) issues.push("没有校验证书。正式部署请换成自己的证书并打开校验");
 	if (profile.inbounds.some((item) => item.protocol === "tunnel") && profile.peers.length === 0) issues.push("隧道入口还没有对端公钥，握不上手");
 	for (const peer of profile.peers) {
 		if (!/^.+:\d+$/.test(peer.endpoint)) issues.push(`${peer.name} 的地址要写成 主机:端口`);
 		if (peer.publicRawB64.length < 16) issues.push(`${peer.name} 缺少公钥，不能加入词表握手`);
 	}
+	for (const door of profile.exposes) if (!door.allow.length) issues.push(`${door.name} 没有写允许访问的节点`);
+	for (const door of profile.reverses) if (!door.peer || !door.service) issues.push("反向入口要写节点和服务名");
 	if (profile.socksAuth.user && !profile.socksAuth.pass || !profile.socksAuth.user && profile.socksAuth.pass) issues.push("SOCKS 用户名和密码要一起填，或都留空");
 	return issues;
 }
@@ -1253,10 +1294,39 @@ function windowRemain(now = Date.now()) {
 	const sec = Math.floor(now / 1e3);
 	return SPEC.windowSec - sec % SPEC.windowSec;
 }
+var HELLO_CORE = 157;
+var SERVER_CORE = 169;
+var seenHellos = /* @__PURE__ */ new Map();
+/** Current window, plus the previous one only in the first 20 seconds (clock skew). */
+function assertHelloWindow(helloWindow, now = Date.now()) {
+	const current = currentWindow(now);
+	const into = Math.floor(now / 1e3) % SPEC.windowSec;
+	if (!(helloWindow === current || helloWindow === current - 1 && into < 20)) throw new LexisError("握手时间窗已经过期");
+}
+function nonceId(nonce) {
+	let hex = "";
+	for (const b of nonce) hex += b.toString(16).padStart(2, "0");
+	return hex;
+}
+function claimHello(window, nonce) {
+	for (const key of [...seenHellos.keys()]) if (key < window - 1) seenHellos.delete(key);
+	let bag = seenHellos.get(window);
+	if (!bag) {
+		bag = /* @__PURE__ */ new Set();
+		seenHellos.set(window, bag);
+	}
+	const id = nonceId(nonce);
+	if (bag.has(id)) throw new LexisError("握手被重放");
+	if (bag.size >= 4096) throw new LexisError("这个时间窗的握手太多");
+	bag.add(id);
+}
+async function tokenMac(token, body) {
+	return (await hmac(utf8(token), concat(utf8("lexis-admit-v1"), body))).subarray(0, 16);
+}
 function transcript(parts) {
 	return concat(utf8("LEXIS2"), parts.ephC, parts.ephS, parts.ltC, parts.ltS, u32be(parts.window), parts.nonceC, parts.nonceS, parts.kdf, new Uint8Array([parts.features & 255]));
 }
-async function edgeStart(edge, now = Date.now(), offer) {
+async function edgeStart(edge, now = Date.now(), offer, token = "") {
 	const wanted = clampOffer(offer);
 	const eph = await createIdentity();
 	const ltRaw = unb64(edge.publicRawB64);
@@ -1264,17 +1334,20 @@ async function edgeStart(edge, now = Date.now(), offer) {
 	assertPoint(eph.publicRaw, "内网端临时");
 	const nonceC = crypto.getRandomValues(/* @__PURE__ */ new Uint8Array(16));
 	const window = currentWindow(now);
+	let blob = concat(new Uint8Array([1, 1]), eph.publicRaw, ltRaw, u32be(window), nonceC, encodeKdf(wanted), new Uint8Array([featureByte(wanted.honey)]));
+	if (token) blob = concat(blob, await tokenMac(token, blob));
 	return {
 		eph,
 		nonceC,
 		window,
-		helloWire: await encodeStatic(concat(new Uint8Array([1, 1]), eph.publicRaw, ltRaw, u32be(window), nonceC, encodeKdf(wanted), new Uint8Array([featureByte(wanted.honey)]))),
+		helloWire: await encodeStatic(blob),
 		ltRaw
 	};
 }
 function parseHello(buf) {
-	if (buf.length !== 157) throw new LexisError("客户端问候长度不对");
+	if (buf.length !== HELLO_CORE && buf.length !== 173) throw new LexisError("客户端问候长度不对");
 	if (buf[0] !== 1 || buf[1] !== 1) throw new LexisError("客户端问候版本不对");
+	const mac = buf.length === 173 ? buf.slice(HELLO_CORE) : null;
 	const ephRaw = buf.slice(2, 67);
 	const ltRaw = buf.slice(67, 132);
 	const window = buf[132] << 24 | buf[133] << 16 | buf[134] << 8 | buf[135];
@@ -1289,12 +1362,14 @@ function parseHello(buf) {
 		window: window >>> 0,
 		nonce,
 		kdf,
-		features
+		features,
+		mac
 	};
 }
 function parseServer(buf) {
-	if (buf.length !== 169) throw new LexisError("服务端问候长度不对");
+	if (buf.length !== SERVER_CORE && buf.length !== 185) throw new LexisError("服务端问候长度不对");
 	if (buf[0] !== 1 || buf[1] !== 2) throw new LexisError("服务端问候版本不对");
+	const mac = buf.length === 185 ? buf.slice(SERVER_CORE) : null;
 	const ephRaw = buf.slice(2, 67);
 	const ltRaw = buf.slice(67, 132);
 	const nonce = buf.slice(132, 148);
@@ -1309,21 +1384,31 @@ function parseServer(buf) {
 		nonce,
 		confirm,
 		kdf,
-		features
+		features,
+		mac
 	};
 }
-async function gateRespond(gate, peerRawB64, helloWire) {
-	const hello = parseHello(await decodeStatic(helloWire));
+async function gateRespond(gate, peerRawB64, helloWire, opts = {}) {
+	const raw = await decodeStatic(helloWire);
+	const hello = parseHello(raw);
+	assertHelloWindow(hello.window, opts.now ?? Date.now());
+	const token = opts.token || "";
+	if (token) {
+		if (!hello.mac) throw new LexisError("缺少握手口令");
+		if (!timingSafeEqual(await tokenMac(token, raw.slice(0, HELLO_CORE)), hello.mac)) throw new LexisError("握手口令不对");
+	} else if (hello.mac) throw new LexisError("对端带了口令，这边没有");
 	const pinned = unb64(peerRawB64);
 	if (!timingSafeEqual(hello.ltRaw, pinned)) throw new LexisError("内网端长期公钥和闸门上的绑定不一致");
+	claimHello(hello.window, hello.nonce);
 	const ephS = await createIdentity();
 	const ltS = unb64(gate.publicRawB64);
 	const nonceS = crypto.getRandomValues(/* @__PURE__ */ new Uint8Array(16));
 	const ssE = await ecdh(await importPrivateJwk(ephS.privateJwk), await importRawPublic(hello.ephRaw));
 	const ssS = await ecdh(await importPrivateJwk(gate.privateJwk), await importRawPublic(hello.ltRaw));
-	const kdfBytes = encodeKdf(hello.kdf);
+	const agreed = clampKdf(opts.kdf ?? hello.kdf);
+	const kdfBytes = encodeKdf(agreed);
 	const features = hello.features & 255;
-	const sk = deriveSessionKey(ssE, ssS, hello.nonce, nonceS, hello.window, features, hello.kdf).key;
+	const sk = (await deriveSessionKeyAsync(ssE, ssS, hello.nonce, nonceS, hello.window, features, agreed)).key;
 	const tr = transcript({
 		ephC: hello.ephRaw,
 		ephS: ephS.publicRaw,
@@ -1337,7 +1422,9 @@ async function gateRespond(gate, peerRawB64, helloWire) {
 	});
 	const confirmS = (await hmac(sk, concat(utf8("lexis-srv-v1"), tr))).subarray(0, 16);
 	const expectFinish = (await hmac(sk, concat(utf8("lexis-cli-v1"), tr))).subarray(0, 16);
-	const serverWire = await encodeStatic(concat(new Uint8Array([1, 2]), ephS.publicRaw, ltS, nonceS, confirmS, kdfBytes, new Uint8Array([features])));
+	let blob = concat(new Uint8Array([1, 2]), ephS.publicRaw, ltS, nonceS, confirmS, kdfBytes, new Uint8Array([features]));
+	if (token) blob = concat(blob, await tokenMac(token, blob));
+	const serverWire = await encodeStatic(blob);
 	return {
 		sk,
 		window: hello.window,
@@ -1349,18 +1436,23 @@ async function gateRespond(gate, peerRawB64, helloWire) {
 		nonceS,
 		serverWire,
 		expectFinish,
-		kdf: hello.kdf,
+		kdf: agreed,
 		features
 	};
 }
-async function edgeFinish(edge, pending, gateRawB64, serverWire) {
-	const server = parseServer(await decodeStatic(serverWire));
+async function edgeFinish(edge, pending, gateRawB64, serverWire, token = "") {
+	const raw = await decodeStatic(serverWire);
+	const server = parseServer(raw);
 	const pinned = unb64(gateRawB64);
 	if (!timingSafeEqual(server.ltRaw, pinned)) throw new LexisError("闸门长期公钥和内网端上的绑定不一致");
+	if (token) {
+		if (!server.mac) throw new LexisError("闸门没有带回口令");
+		if (!timingSafeEqual(await tokenMac(token, raw.slice(0, SERVER_CORE)), server.mac)) throw new LexisError("握手口令不对");
+	} else if (server.mac) throw new LexisError("对端带了口令，这边没有");
 	const ssE = await ecdh(await importPrivateJwk(pending.eph.privateJwk), await importRawPublic(server.ephRaw));
 	const ssS = await ecdh(await importPrivateJwk(edge.privateJwk), await importRawPublic(server.ltRaw));
 	const features = server.features & 255;
-	const derived = deriveSessionKey(ssE, ssS, pending.nonceC, server.nonce, pending.window, features, server.kdf);
+	const derived = await deriveSessionKeyAsync(ssE, ssS, pending.nonceC, server.nonce, pending.window, features, server.kdf);
 	const sk = derived.key;
 	const tr = transcript({
 		ephC: pending.eph.publicRaw,
@@ -1542,7 +1634,9 @@ var RECORD = {
 	heartbeat: 1,
 	data: 2,
 	open: 3,
-	close: 4
+	close: 4,
+	credit: 5,
+	rekey: 6
 };
 function encodeRecord(type, conn, seq, payload) {
 	const out = new Uint8Array(11 + payload.length);
@@ -1571,6 +1665,8 @@ function recordLabel(type) {
 		case RECORD.data: return "数据";
 		case RECORD.open: return "打开";
 		case RECORD.close: return "关闭";
+		case RECORD.credit: return "信用";
+		case RECORD.rekey: return "换钥";
 		default: return "未知";
 	}
 }
@@ -2437,7 +2533,7 @@ function ConfigPanel() {
 					}),
 					/* @__PURE__ */ (0, import_jsx_runtime.jsx)("p", {
 						className: "mt-2 text-sm text-mist",
-						children: "长期私钥可以用口令做 Argon2id 派生，在节点页操作。会话密钥也是 Argon2id，材料是两次 ECDH 的共享秘密。内存、迭代、并行和蜜文开关放进握手，闸门把超出上限的参数压回来再回声，两端按回声计算。"
+						children: "会话密钥的 Argon2id 由常驻进程自己的参数决定，不听客户端把内存抬高。上限 16384 KiB。口令不对的问候在派生之前就被丢掉。长期私钥的口令派生仍在节点页。"
 					}),
 					/* @__PURE__ */ (0, import_jsx_runtime.jsx)("p", {
 						className: "mt-2 text-sm text-mist",
@@ -2463,8 +2559,7 @@ function ConfigPanel() {
 										1024,
 										4096,
 										8192,
-										19456,
-										65536
+										16384
 									].map((n) => /* @__PURE__ */ (0, import_jsx_runtime.jsx)("option", {
 										value: n,
 										children: n
@@ -2578,7 +2673,7 @@ function ConfigPanel() {
 					}),
 					/* @__PURE__ */ (0, import_jsx_runtime.jsx)("p", {
 						className: "mt-2 text-sm text-mist",
-						children: "一条会话上可以开多路。打开写成 tcp 主机 端口、udp 主机 端口，或 relay 节点 再接后面的命令。名单里的节点都能中继，跳数到 4 就停。SOCKS 的用户名和密码留空就是不认证。"
+						children: "一条会话上可以开多路。打开写成 tcp 主机 端口、udp 主机 端口、relay 节点 再接后面的命令，或 expose 服务名。中继要逐个节点打开，跳数到 4 就停。慢的那一路只堵住自己。SOCKS 的用户名和密码留空就是不认证，HTTP 代理共用这一对。"
 					}),
 					/* @__PURE__ */ (0, import_jsx_runtime.jsx)("div", {
 						className: "mt-4 flex flex-wrap gap-2",
@@ -2599,6 +2694,55 @@ function ConfigPanel() {
 					/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", {
 						className: "mt-4 grid gap-3 sm:grid-cols-2",
 						children: [
+							/* @__PURE__ */ (0, import_jsx_runtime.jsx)(Field, {
+								label: "握手口令",
+								children: /* @__PURE__ */ (0, import_jsx_runtime.jsx)("input", {
+									className: control,
+									type: "password",
+									autoComplete: "off",
+									value: profile.link.token,
+									onChange: (e) => patch({ link: {
+										...profile.link,
+										token: e.target.value
+									} })
+								})
+							}),
+							/* @__PURE__ */ (0, import_jsx_runtime.jsx)(Field, {
+								label: "同时握手数",
+								children: /* @__PURE__ */ (0, import_jsx_runtime.jsx)("input", {
+									className: control,
+									inputMode: "numeric",
+									value: profile.link.maxHandshakes,
+									onChange: (e) => patch({ link: {
+										...profile.link,
+										maxHandshakes: Number(e.target.value)
+									} })
+								})
+							}),
+							/* @__PURE__ */ (0, import_jsx_runtime.jsx)(Field, {
+								label: "握手超时（秒）",
+								children: /* @__PURE__ */ (0, import_jsx_runtime.jsx)("input", {
+									className: control,
+									inputMode: "numeric",
+									value: Math.round(profile.link.handshakeMs / 1e3),
+									onChange: (e) => patch({ link: {
+										...profile.link,
+										handshakeMs: Math.round(Number(e.target.value) * 1e3)
+									} })
+								})
+							}),
+							/* @__PURE__ */ (0, import_jsx_runtime.jsx)(Field, {
+								label: "拨号超时（秒）",
+								children: /* @__PURE__ */ (0, import_jsx_runtime.jsx)("input", {
+									className: control,
+									inputMode: "numeric",
+									value: Math.round(profile.link.dialMs / 1e3),
+									onChange: (e) => patch({ link: {
+										...profile.link,
+										dialMs: Math.round(Number(e.target.value) * 1e3)
+									} })
+								})
+							}),
 							/* @__PURE__ */ (0, import_jsx_runtime.jsx)(Field, {
 								label: "WebSocket 路径",
 								children: /* @__PURE__ */ (0, import_jsx_runtime.jsx)("input", {
@@ -2658,6 +2802,10 @@ function ConfigPanel() {
 							})
 						]
 					}),
+					/* @__PURE__ */ (0, import_jsx_runtime.jsx)("p", {
+						className: "mt-2 text-sm text-mist",
+						children: "握手口令在 Argon2 之前校验，用来挡伪造问候，不是词表密钥。两端要写成同一个，至少 8 个字符。校验关掉时，外层 TLS 认不出对端，正式部署请换自己的证书。"
+					}),
 					/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", {
 						className: "mt-4 rounded-sm bg-panel-2 p-3",
 						children: [
@@ -2705,14 +2853,16 @@ function ConfigPanel() {
 										transport: profile.outer.transport,
 										publicRawB64: "",
 										wsPath: profile.outer.wsPath,
-										wsHost: ""
+										wsHost: "",
+										relay: false,
+										targets: []
 									}] }),
 									children: "添加节点"
 								})]
 							}),
 							/* @__PURE__ */ (0, import_jsx_runtime.jsx)("p", {
 								className: "mt-2 text-sm text-mist",
-								children: "每个节点都能中继。地址写成 主机:端口。WebSocket 主机名留给 CDN，空着就用地址里的主机。"
+								children: "默认不借本机中继。要借，就在那个节点上打开，并可以限定目标。地址写成 主机:端口。WebSocket 主机名留给 CDN，空着就用地址里的主机。"
 							}),
 							/* @__PURE__ */ (0, import_jsx_runtime.jsx)("div", {
 								className: "mt-3 flex flex-col gap-3",
@@ -2863,6 +3013,10 @@ function ConfigPanel() {
 										children: "SOCKS"
 									}),
 									/* @__PURE__ */ (0, import_jsx_runtime.jsx)("option", {
+										value: "http",
+										children: "HTTP 代理"
+									}),
+									/* @__PURE__ */ (0, import_jsx_runtime.jsx)("option", {
 										value: "tcp",
 										children: "固定转发"
 									}),
@@ -2918,6 +3072,160 @@ function ConfigPanel() {
 						]
 					}, inbound.id))
 				})]
+			}),
+			/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("section", {
+				className: "rounded-md border border-line bg-panel p-4",
+				children: [
+					/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", {
+						className: "flex items-center justify-between gap-3",
+						children: [/* @__PURE__ */ (0, import_jsx_runtime.jsx)("h2", {
+							className: "text-base font-medium",
+							children: "暴露给已经连上的节点"
+						}), /* @__PURE__ */ (0, import_jsx_runtime.jsx)(Btn, {
+							kind: "ghost",
+							onClick: () => patch({ exposes: [...profile.exposes, {
+								id: rid("expose"),
+								name: "ssh",
+								host: "127.0.0.1",
+								port: 22,
+								allow: []
+							}] }),
+							children: "添加服务"
+						})]
+					}),
+					/* @__PURE__ */ (0, import_jsx_runtime.jsx)("p", {
+						className: "mt-2 text-sm text-mist",
+						children: "NAT 后面的机器主动连出去之后，对端可以按服务名过来。允许名单写节点的名字或编号，空着谁也不让进。这里拨的是你自己填的本机地址，不走公网出站拦截。"
+					}),
+					/* @__PURE__ */ (0, import_jsx_runtime.jsx)("div", {
+						className: "mt-4 flex flex-col gap-3",
+						children: profile.exposes.map((door) => /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", {
+							className: "grid gap-2 rounded-sm bg-panel-2 p-3 sm:grid-cols-2",
+							children: [
+								/* @__PURE__ */ (0, import_jsx_runtime.jsx)("input", {
+									className: control,
+									"aria-label": "服务名",
+									value: door.name,
+									onChange: (e) => patch({ exposes: profile.exposes.map((item) => item.id === door.id ? {
+										...item,
+										name: e.target.value
+									} : item) })
+								}),
+								/* @__PURE__ */ (0, import_jsx_runtime.jsx)("input", {
+									className: control,
+									"aria-label": "本机主机",
+									value: door.host,
+									onChange: (e) => patch({ exposes: profile.exposes.map((item) => item.id === door.id ? {
+										...item,
+										host: e.target.value
+									} : item) })
+								}),
+								/* @__PURE__ */ (0, import_jsx_runtime.jsx)("input", {
+									className: control,
+									"aria-label": "本机端口",
+									inputMode: "numeric",
+									value: door.port,
+									onChange: (e) => patch({ exposes: profile.exposes.map((item) => item.id === door.id ? {
+										...item,
+										port: Number(e.target.value)
+									} : item) })
+								}),
+								/* @__PURE__ */ (0, import_jsx_runtime.jsx)("input", {
+									className: control,
+									"aria-label": "允许的节点",
+									placeholder: "节点名，逗号分开",
+									value: door.allow.join(", "),
+									onChange: (e) => patch({ exposes: profile.exposes.map((item) => item.id === door.id ? {
+										...item,
+										allow: e.target.value.split(",").map((part) => part.trim()).filter(Boolean)
+									} : item) })
+								}),
+								/* @__PURE__ */ (0, import_jsx_runtime.jsx)(Btn, {
+									kind: "ember",
+									onClick: () => patch({ exposes: profile.exposes.filter((item) => item.id !== door.id) }),
+									children: "删除"
+								})
+							]
+						}, door.id))
+					})
+				]
+			}),
+			/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("section", {
+				className: "rounded-md border border-line bg-panel p-4",
+				children: [
+					/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", {
+						className: "flex items-center justify-between gap-3",
+						children: [/* @__PURE__ */ (0, import_jsx_runtime.jsx)("h2", {
+							className: "text-base font-medium",
+							children: "反向入口"
+						}), /* @__PURE__ */ (0, import_jsx_runtime.jsx)(Btn, {
+							kind: "ghost",
+							onClick: () => patch({ reverses: [...profile.reverses, {
+								id: rid("rev"),
+								listen: "127.0.0.1",
+								port: 2222,
+								peer: "",
+								service: "ssh"
+							}] }),
+							children: "添加入口"
+						})]
+					}),
+					/* @__PURE__ */ (0, import_jsx_runtime.jsx)("p", {
+						className: "mt-2 text-sm text-mist",
+						children: "公网这一侧听一个本地端口，从那个节点已经连进来的会话里打开同名服务。会话不在时会说没有来自该节点的会话。也可以直接访问「节点名:服务名」。"
+					}),
+					/* @__PURE__ */ (0, import_jsx_runtime.jsx)("div", {
+						className: "mt-4 flex flex-col gap-3",
+						children: profile.reverses.map((door) => /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", {
+							className: "grid gap-2 rounded-sm bg-panel-2 p-3 sm:grid-cols-2",
+							children: [
+								/* @__PURE__ */ (0, import_jsx_runtime.jsx)("input", {
+									className: control,
+									"aria-label": "反向监听地址",
+									value: door.listen,
+									onChange: (e) => patch({ reverses: profile.reverses.map((item) => item.id === door.id ? {
+										...item,
+										listen: e.target.value
+									} : item) })
+								}),
+								/* @__PURE__ */ (0, import_jsx_runtime.jsx)("input", {
+									className: control,
+									"aria-label": "反向端口",
+									inputMode: "numeric",
+									value: door.port,
+									onChange: (e) => patch({ reverses: profile.reverses.map((item) => item.id === door.id ? {
+										...item,
+										port: Number(e.target.value)
+									} : item) })
+								}),
+								/* @__PURE__ */ (0, import_jsx_runtime.jsx)("input", {
+									className: control,
+									"aria-label": "节点",
+									placeholder: "节点名或编号",
+									value: door.peer,
+									onChange: (e) => patch({ reverses: profile.reverses.map((item) => item.id === door.id ? {
+										...item,
+										peer: e.target.value
+									} : item) })
+								}),
+								/* @__PURE__ */ (0, import_jsx_runtime.jsx)("input", {
+									className: control,
+									"aria-label": "服务名",
+									value: door.service,
+									onChange: (e) => patch({ reverses: profile.reverses.map((item) => item.id === door.id ? {
+										...item,
+										service: e.target.value
+									} : item) })
+								}),
+								/* @__PURE__ */ (0, import_jsx_runtime.jsx)(Btn, {
+									kind: "ember",
+									onClick: () => patch({ reverses: profile.reverses.filter((item) => item.id !== door.id) }),
+									children: "删除"
+								})
+							]
+						}, door.id))
+					})
+				]
 			}),
 			/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("section", {
 				className: "rounded-md border border-line bg-panel p-4",
@@ -3280,6 +3588,11 @@ function ConfigPanel() {
 	});
 }
 function PeerEditor({ peer, onChange, onRemove }) {
+	const [targetsText, setTargetsText] = (0, import_react.useState)((peer.targets || []).join("\n"));
+	const [targetsFocus, setTargetsFocus] = (0, import_react.useState)(false);
+	(0, import_react.useEffect)(() => {
+		if (!targetsFocus) setTargetsText((peer.targets || []).join("\n"));
+	}, [peer.targets, targetsFocus]);
 	return /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", {
 		className: "grid gap-2 rounded-sm bg-panel-2 p-3",
 		children: [
@@ -3354,10 +3667,35 @@ function PeerEditor({ peer, onChange, onRemove }) {
 					publicRawB64: e.target.value.trim()
 				})
 			}),
-			/* @__PURE__ */ (0, import_jsx_runtime.jsx)(Btn, {
-				kind: "ember",
-				onClick: onRemove,
-				children: "移出名单"
+			/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", {
+				className: "flex flex-wrap gap-2",
+				children: [/* @__PURE__ */ (0, import_jsx_runtime.jsx)(Btn, {
+					kind: peer.relay ? "solid" : "ghost",
+					onClick: () => onChange({
+						...peer,
+						relay: !peer.relay
+					}),
+					children: peer.relay ? "允许借本机中继" : "不借本机中继"
+				}), /* @__PURE__ */ (0, import_jsx_runtime.jsx)(Btn, {
+					kind: "ember",
+					onClick: onRemove,
+					children: "移出名单"
+				})]
+			}),
+			/* @__PURE__ */ (0, import_jsx_runtime.jsx)("textarea", {
+				className: "min-h-16 w-full rounded-sm border border-line bg-ink px-3 py-3 font-mono text-xs text-fg",
+				"aria-label": "中继目标",
+				placeholder: "允许的目标，一行一条。空着表示不限制。例如 tcp 203.0.113.8 22",
+				value: targetsText,
+				onFocus: () => setTargetsFocus(true),
+				onBlur: () => {
+					setTargetsFocus(false);
+					onChange({
+						...peer,
+						targets: targetsText.split("\n").map((item) => item.trim()).filter(Boolean)
+					});
+				},
+				onChange: (e) => setTargetsText(e.target.value)
 			})
 		]
 	});
@@ -3884,7 +4222,9 @@ function NodesPanel() {
 							transport: profile.outer.transport,
 							publicRawB64: node.publicRawB64,
 							wsPath: profile.outer.wsPath,
-							wsHost: ""
+							wsHost: "",
+							relay: false,
+							targets: []
 						};
 						patch({ peers: [...profile.peers.filter((peer) => peer.id !== node.id), next] });
 					}
@@ -4110,7 +4450,7 @@ function Overview({ onOpen }) {
 					}, title))
 				}), /* @__PURE__ */ (0, import_jsx_runtime.jsx)("p", {
 					className: "mt-4 text-sm text-mist",
-					children: "浏览器里不能守一个真正的 TCP 端口。这条控制台把握手、词表和封装真实跑完。下载的常驻进程走同一套词表。TLS 和 WebSocket 只包在外面，方便过 CDN。虚拟网卡、WinDivert 驱动、Linux tproxy 的原始目的地址、Android 的 VpnService 仍然不在这个进程里。"
+					children: "浏览器里不能守一个真正的 TCP 端口。这条控制台把握手、词表和封装真实跑完。下载的常驻进程走同一套词表。TLS 和 WebSocket 只包在外面，方便过 CDN。安装包不再附带 TLS 私钥。中继默认关闭。虚拟网卡、WinDivert 驱动、Linux tproxy 的原始目的地址、Android 的 VpnService 仍然不在这个进程里。"
 				})]
 			}),
 			/* @__PURE__ */ (0, import_jsx_runtime.jsx)("div", {

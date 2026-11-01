@@ -16,6 +16,7 @@ import {
   type NetPeer,
   type OuterTransport,
   type ProcessRule,
+  type ReverseDoor,
   type RouteRule,
 } from "@/lib/lexis/profile";
 import { clampKdf } from "@/lib/lexis/kdf";
@@ -118,7 +119,7 @@ export function ConfigPanel() {
       <section className="rounded-md border border-line bg-panel p-4">
         <h2 className="text-base font-medium">密钥与压缩</h2>
         <p className="mt-2 text-sm text-mist">
-          长期私钥可以用口令做 Argon2id 派生，在节点页操作。会话密钥也是 Argon2id，材料是两次 ECDH 的共享秘密。内存、迭代、并行和蜜文开关放进握手，闸门把超出上限的参数压回来再回声，两端按回声计算。
+          会话密钥的 Argon2id 由常驻进程自己的参数决定，不听客户端把内存抬高。上限 16384 KiB。口令不对的问候在派生之前就被丢掉。长期私钥的口令派生仍在节点页。
         </p>
         <p className="mt-2 text-sm text-mist">
           压缩不靠这份配置在对端对齐。明文第一个字节是类型：0 是原文，1 是 zstd 帧。等级决定窗口，窗口写在帧头里，对端解开以后自己读。比原文更大时这一帧会改回类型 0。
@@ -133,7 +134,7 @@ export function ConfigPanel() {
               value={profile.kdf.memoryKiB}
               onChange={(e) => patch({ kdf: clampKdf({ ...profile.kdf, memoryKiB: Number(e.target.value) }) })}
             >
-              {[1024, 4096, 8192, 19456, 65536].map((n) => (
+              {[1024, 4096, 8192, 16384].map((n) => (
                 <option key={n} value={n}>
                   {n}
                 </option>
@@ -204,7 +205,7 @@ export function ConfigPanel() {
           常驻进程和这条控制台用同一套词表。握手仍是两次 ECDH 加 Argon2id，正文是密钥、计数器和秘密词表。TCP、TLS、WebSocket 只负责协议和头，用来过 CDN。路径默认 /lexis。CDN 若自己终结 TLS，源站可以听 WebSocket。
         </p>
         <p className="mt-2 text-sm text-mist">
-          一条会话上可以开多路。打开写成 tcp 主机 端口、udp 主机 端口，或 relay 节点 再接后面的命令。名单里的节点都能中继，跳数到 4 就停。SOCKS 的用户名和密码留空就是不认证。
+          一条会话上可以开多路。打开写成 tcp 主机 端口、udp 主机 端口、relay 节点 再接后面的命令，或 expose 服务名。中继要逐个节点打开，跳数到 4 就停。慢的那一路只堵住自己。SOCKS 的用户名和密码留空就是不认证，HTTP 代理共用这一对。
         </p>
         <div className="mt-4 flex flex-wrap gap-2">
           {(["tcp", "tls", "ws", "wss"] as OuterTransport[]).map((name) => (
@@ -214,6 +215,39 @@ export function ConfigPanel() {
           ))}
         </div>
         <div className="mt-4 grid gap-3 sm:grid-cols-2">
+          <Field label="握手口令">
+            <input
+              className={control}
+              type="password"
+              autoComplete="off"
+              value={profile.link.token}
+              onChange={(e) => patch({ link: { ...profile.link, token: e.target.value } })}
+            />
+          </Field>
+          <Field label="同时握手数">
+            <input
+              className={control}
+              inputMode="numeric"
+              value={profile.link.maxHandshakes}
+              onChange={(e) => patch({ link: { ...profile.link, maxHandshakes: Number(e.target.value) } })}
+            />
+          </Field>
+          <Field label="握手超时（秒）">
+            <input
+              className={control}
+              inputMode="numeric"
+              value={Math.round(profile.link.handshakeMs / 1000)}
+              onChange={(e) => patch({ link: { ...profile.link, handshakeMs: Math.round(Number(e.target.value) * 1000) } })}
+            />
+          </Field>
+          <Field label="拨号超时（秒）">
+            <input
+              className={control}
+              inputMode="numeric"
+              value={Math.round(profile.link.dialMs / 1000)}
+              onChange={(e) => patch({ link: { ...profile.link, dialMs: Math.round(Number(e.target.value) * 1000) } })}
+            />
+          </Field>
           <Field label="WebSocket 路径">
             <input className={control} value={profile.outer.wsPath} onChange={(e) => patch({ outer: { ...profile.outer, wsPath: e.target.value } })} />
           </Field>
@@ -235,6 +269,7 @@ export function ConfigPanel() {
             <input className={control} type="password" autoComplete="off" value={profile.socksAuth.pass} onChange={(e) => patch({ socksAuth: { ...profile.socksAuth, pass: e.target.value } })} />
           </Field>
         </div>
+        <p className="mt-2 text-sm text-mist">握手口令在 Argon2 之前校验，用来挡伪造问候，不是词表密钥。两端要写成同一个，至少 8 个字符。校验关掉时，外层 TLS 认不出对端，正式部署请换自己的证书。</p>
         <div className="mt-4 rounded-sm bg-panel-2 p-3">
           <p className="text-sm text-mist">本机身份</p>
           <p className="mt-2 break-all font-mono text-xs text-fg">{profile.identity?.fingerprint || "还没有"}</p>
@@ -267,6 +302,8 @@ export function ConfigPanel() {
                       publicRawB64: "",
                       wsPath: profile.outer.wsPath,
                       wsHost: "",
+                      relay: false,
+                      targets: [],
                     },
                   ],
                 })
@@ -275,7 +312,7 @@ export function ConfigPanel() {
               添加节点
             </Btn>
           </div>
-          <p className="mt-2 text-sm text-mist">每个节点都能中继。地址写成 主机:端口。WebSocket 主机名留给 CDN，空着就用地址里的主机。</p>
+          <p className="mt-2 text-sm text-mist">默认不借本机中继。要借，就在那个节点上打开，并可以限定目标。地址写成 主机:端口。WebSocket 主机名留给 CDN，空着就用地址里的主机。</p>
           <div className="mt-3 flex flex-col gap-3">
             {profile.peers.map((peer) => (
               <PeerEditor
@@ -360,6 +397,7 @@ export function ConfigPanel() {
               <input className={control} aria-label="入站名称" value={inbound.tag} onChange={(e) => setInbounds(profile.inbounds.map((item) => (item.id === inbound.id ? { ...item, tag: e.target.value } : item)))} />
               <select className={control} aria-label="入站协议" value={inbound.protocol} onChange={(e) => setInbounds(profile.inbounds.map((item) => (item.id === inbound.id ? { ...item, protocol: e.target.value as Inbound["protocol"] } : item)))}>
                 <option value="socks">SOCKS</option>
+                <option value="http">HTTP 代理</option>
                 <option value="tcp">固定转发</option>
                 <option value="tunnel">隧道入口</option>
               </select>
@@ -372,6 +410,78 @@ export function ConfigPanel() {
                 </>
               ) : null}
               <Btn kind="ember" onClick={() => setInbounds(profile.inbounds.filter((item) => item.id !== inbound.id))}>
+                删除
+              </Btn>
+            </div>
+          ))}
+        </div>
+      </section>
+
+      <section className="rounded-md border border-line bg-panel p-4">
+        <div className="flex items-center justify-between gap-3">
+          <h2 className="text-base font-medium">暴露给已经连上的节点</h2>
+          <Btn
+            kind="ghost"
+            onClick={() =>
+              patch({
+                exposes: [...profile.exposes, { id: rid("expose"), name: "ssh", host: "127.0.0.1", port: 22, allow: [] }],
+              })
+            }
+          >
+            添加服务
+          </Btn>
+        </div>
+        <p className="mt-2 text-sm text-mist">NAT 后面的机器主动连出去之后，对端可以按服务名过来。允许名单写节点的名字或编号，空着谁也不让进。这里拨的是你自己填的本机地址，不走公网出站拦截。</p>
+        <div className="mt-4 flex flex-col gap-3">
+          {profile.exposes.map((door) => (
+            <div key={door.id} className="grid gap-2 rounded-sm bg-panel-2 p-3 sm:grid-cols-2">
+              <input className={control} aria-label="服务名" value={door.name} onChange={(e) => patch({ exposes: profile.exposes.map((item) => (item.id === door.id ? { ...item, name: e.target.value } : item)) })} />
+              <input className={control} aria-label="本机主机" value={door.host} onChange={(e) => patch({ exposes: profile.exposes.map((item) => (item.id === door.id ? { ...item, host: e.target.value } : item)) })} />
+              <input className={control} aria-label="本机端口" inputMode="numeric" value={door.port} onChange={(e) => patch({ exposes: profile.exposes.map((item) => (item.id === door.id ? { ...item, port: Number(e.target.value) } : item)) })} />
+              <input
+                className={control}
+                aria-label="允许的节点"
+                placeholder="节点名，逗号分开"
+                value={door.allow.join(", ")}
+                onChange={(e) =>
+                  patch({
+                    exposes: profile.exposes.map((item) =>
+                      item.id === door.id ? { ...item, allow: e.target.value.split(",").map((part) => part.trim()).filter(Boolean) } : item,
+                    ),
+                  })
+                }
+              />
+              <Btn kind="ember" onClick={() => patch({ exposes: profile.exposes.filter((item) => item.id !== door.id) })}>
+                删除
+              </Btn>
+            </div>
+          ))}
+        </div>
+      </section>
+
+      <section className="rounded-md border border-line bg-panel p-4">
+        <div className="flex items-center justify-between gap-3">
+          <h2 className="text-base font-medium">反向入口</h2>
+          <Btn
+            kind="ghost"
+            onClick={() =>
+              patch({
+                reverses: [...profile.reverses, { id: rid("rev"), listen: "127.0.0.1", port: 2222, peer: "", service: "ssh" } satisfies ReverseDoor],
+              })
+            }
+          >
+            添加入口
+          </Btn>
+        </div>
+        <p className="mt-2 text-sm text-mist">公网这一侧听一个本地端口，从那个节点已经连进来的会话里打开同名服务。会话不在时会说没有来自该节点的会话。也可以直接访问「节点名:服务名」。</p>
+        <div className="mt-4 flex flex-col gap-3">
+          {profile.reverses.map((door) => (
+            <div key={door.id} className="grid gap-2 rounded-sm bg-panel-2 p-3 sm:grid-cols-2">
+              <input className={control} aria-label="反向监听地址" value={door.listen} onChange={(e) => patch({ reverses: profile.reverses.map((item) => (item.id === door.id ? { ...item, listen: e.target.value } : item)) })} />
+              <input className={control} aria-label="反向端口" inputMode="numeric" value={door.port} onChange={(e) => patch({ reverses: profile.reverses.map((item) => (item.id === door.id ? { ...item, port: Number(e.target.value) } : item)) })} />
+              <input className={control} aria-label="节点" placeholder="节点名或编号" value={door.peer} onChange={(e) => patch({ reverses: profile.reverses.map((item) => (item.id === door.id ? { ...item, peer: e.target.value } : item)) })} />
+              <input className={control} aria-label="服务名" value={door.service} onChange={(e) => patch({ reverses: profile.reverses.map((item) => (item.id === door.id ? { ...item, service: e.target.value } : item)) })} />
+              <Btn kind="ember" onClick={() => patch({ reverses: profile.reverses.filter((item) => item.id !== door.id) })}>
                 删除
               </Btn>
             </div>
@@ -542,6 +652,11 @@ export function ConfigPanel() {
 }
 
 function PeerEditor({ peer, onChange, onRemove }: { peer: NetPeer; onChange: (peer: NetPeer) => void; onRemove: () => void }) {
+  const [targetsText, setTargetsText] = useState((peer.targets || []).join("\n"));
+  const [targetsFocus, setTargetsFocus] = useState(false);
+  useEffect(() => {
+    if (!targetsFocus) setTargetsText((peer.targets || []).join("\n"));
+  }, [peer.targets, targetsFocus]);
   return (
     <div className="grid gap-2 rounded-sm bg-panel-2 p-3">
       <div className="grid gap-2 sm:grid-cols-2">
@@ -562,9 +677,26 @@ function PeerEditor({ peer, onChange, onRemove }: { peer: NetPeer; onChange: (pe
         value={peer.publicRawB64}
         onChange={(e) => onChange({ ...peer, publicRawB64: e.target.value.trim() })}
       />
-      <Btn kind="ember" onClick={onRemove}>
-        移出名单
-      </Btn>
+      <div className="flex flex-wrap gap-2">
+        <Btn kind={peer.relay ? "solid" : "ghost"} onClick={() => onChange({ ...peer, relay: !peer.relay })}>
+          {peer.relay ? "允许借本机中继" : "不借本机中继"}
+        </Btn>
+        <Btn kind="ember" onClick={onRemove}>
+          移出名单
+        </Btn>
+      </div>
+      <textarea
+        className="min-h-16 w-full rounded-sm border border-line bg-ink px-3 py-3 font-mono text-xs text-fg"
+        aria-label="中继目标"
+        placeholder="允许的目标，一行一条。空着表示不限制。例如 tcp 203.0.113.8 22"
+        value={targetsText}
+        onFocus={() => setTargetsFocus(true)}
+        onBlur={() => {
+          setTargetsFocus(false);
+          onChange({ ...peer, targets: targetsText.split("\n").map((item) => item.trim()).filter(Boolean) });
+        }}
+        onChange={(e) => setTargetsText(e.target.value)}
+      />
     </div>
   );
 }

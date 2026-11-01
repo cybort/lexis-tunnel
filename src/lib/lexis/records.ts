@@ -5,6 +5,8 @@ export const RECORD = {
   data: 2,
   open: 3,
   close: 4,
+  credit: 5,
+  rekey: 6,
 } as const;
 
 export type DecodedRecord = {
@@ -47,6 +49,10 @@ export function recordLabel(type: number): string {
       return "打开";
     case RECORD.close:
       return "关闭";
+    case RECORD.credit:
+      return "信用";
+    case RECORD.rekey:
+      return "换钥";
     default:
       return "未知";
   }

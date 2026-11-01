@@ -6,15 +6,17 @@ import { createHash, randomBytes } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { connect as connectTcp, createServer as createTcp, isIP, type Socket } from "node:net";
 import { connect as connectTls, createServer as createTls, type TLSSocket } from "node:tls";
+import { isMainThread, parentPort, Worker } from "node:worker_threads";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { Module, waitInitialized } from "../../node_modules/@bokuweb/zstd-wasm/dist/esm/module.js";
 import { compress as zstdCompress } from "../../node_modules/@bokuweb/zstd-wasm/dist/esm/simple/compress.js";
 import { decompress as zstdDecompress } from "../../node_modules/@bokuweb/zstd-wasm/dist/esm/simple/decompress.js";
-import { b64, concat, fromUtf8, utf8 } from "../lib/lexis/bytes";
-import { createIdentity, identityFromJwks } from "../lib/lexis/crypto";
-import { edgeFinish, edgeStart, gateAccept, gateRespond, openSession, type GatePending, type LiveSession } from "../lib/lexis/handshake";
-import { honeyFromFeatures, type SessionOffer } from "../lib/lexis/kdf";
+import { b64, concat, fromUtf8, readU16, u16be, utf8 } from "../lib/lexis/bytes";
+import { createIdentity, hkdf, identityFromJwks } from "../lib/lexis/crypto";
+import { currentWindow, edgeFinish, edgeStart, gateAccept, gateRespond, openSession, type GatePending, type LiveSession } from "../lib/lexis/handshake";
+import { deriveSessionKey, honeyFromFeatures, setSessionKeyDeriver, type ArgonParams, type SessionOffer } from "../lib/lexis/kdf";
+import { invertLexicon, sessionLexicon } from "../lib/lexis/lexicon";
 import { decodeRecord, encodeRecord, heartbeatPayload, RECORD } from "../lib/lexis/records";
 import { open, seal } from "../lib/lexis/seal";
 import type { MeshNode } from "../lib/lexis/types";
@@ -26,13 +28,15 @@ export type OuterName = "tcp" | "tls" | "ws" | "wss";
 
 export type ProsePipe = {
   write(prose: string): Promise<void>;
-  read(): Promise<string>;
+  read(timeoutMs?: number): Promise<string>;
   close(): void;
+  setCap?(n: number): void;
 };
 
 export type OpenCommand = {
   relay: string | null;
   rest: string;
+  expose: string | null;
   udp: boolean;
   host: string;
   port: number;
@@ -79,13 +83,16 @@ export function parseOpen(text: string): OpenCommand {
   if (relay) {
     const rest = relay[2].trim();
     const inner = parseOpen(rest);
-    return { relay: relay[1], rest, udp: inner.udp, host: inner.host, port: inner.port };
+    return { relay: relay[1], rest, expose: null, udp: inner.udp, host: inner.host, port: inner.port };
   }
+  const expose = raw.match(/^expose\s+(\S+)$/);
+  if (expose) return { relay: null, rest: raw, expose: expose[1], udp: false, host: "", port: 0 };
   const cmd = raw.match(/^(tcp|udp)\s+(\S+)\s+(\d+)$/);
-  if (!cmd) return { relay: null, rest: raw, udp: false, host: "", port: 0 };
+  if (!cmd) return { relay: null, rest: raw, expose: null, udp: false, host: "", port: 0 };
   return {
     relay: null,
     rest: raw,
+    expose: null,
     udp: cmd[1] === "udp",
     host: cmd[2],
     port: Number(cmd[3]),
@@ -102,15 +109,19 @@ export function hopCount(text: string): number {
   return n;
 }
 
+const HANDSHAKE_CAP = 64 * 1024;
+const FRAME_CAP = 256 * 1024;
+
 class LinePipe implements ProsePipe {
   private buf = Buffer.alloc(0);
   private waiters: Array<(value: string | Error) => void> = [];
   private dead: Error | null = null;
+  private cap = HANDSHAKE_CAP;
 
   constructor(private socket: Socket) {
     socket.on("data", (chunk) => {
       this.buf = Buffer.concat([this.buf, chunk]);
-      if (this.buf.length > 8 * 1024 * 1024) {
+      if (this.buf.length > this.cap) {
         this.fail(new Error("词表缓冲过大"));
         return;
       }
@@ -118,6 +129,10 @@ class LinePipe implements ProsePipe {
     });
     socket.on("error", (err) => this.fail(err));
     socket.on("close", () => this.fail(new Error("连接关闭")));
+  }
+
+  setCap(n: number) {
+    this.cap = n;
   }
 
   private fail(err: Error) {
@@ -148,17 +163,24 @@ class LinePipe implements ProsePipe {
     });
   }
 
-  read(): Promise<string> {
+  read(timeoutMs = 0): Promise<string> {
     if (this.dead && this.buf.indexOf(0x0a) < 0) return Promise.reject(this.dead);
     const nl = this.buf.indexOf(0x0a);
     if (nl >= 0) {
       const line = this.buf.subarray(0, nl).toString("utf8").replace(/\r$/, "");
       this.buf = this.buf.subarray(nl + 1);
-      if (!line) return this.read();
+      if (!line) return this.read(timeoutMs);
       return Promise.resolve(line);
     }
     return new Promise<string>((resolve, reject) => {
-      this.waiters.push((value) => (value instanceof Error ? reject(value) : resolve(value)));
+      let timer: ReturnType<typeof setTimeout> | null = null;
+      const done = (value: string | Error) => {
+        if (timer) clearTimeout(timer);
+        if (value instanceof Error) reject(value);
+        else resolve(value);
+      };
+      if (timeoutMs > 0) timer = setTimeout(() => this.fail(new Error("握手超时")), timeoutMs);
+      this.waiters.push(done);
     });
   }
 
@@ -175,6 +197,7 @@ class WsPipe implements ProsePipe {
   private dead: Error | null = null;
   private fragments: Buffer[] = [];
   private early: string[] = [];
+  private cap = HANDSHAKE_CAP;
 
   constructor(
     private socket: Socket,
@@ -211,12 +234,16 @@ class WsPipe implements ProsePipe {
       } else if (len === 127) {
         if (this.buf.length < 10) return;
         const big = this.buf.readBigUInt64BE(2);
-        if (big > BigInt(8 * 1024 * 1024)) {
+        if (big > BigInt(this.cap)) {
           this.fail(new Error("WebSocket 帧过大"));
           return;
         }
         len = Number(big);
         offset = 10;
+      }
+      if (len > this.cap) {
+        this.fail(new Error("WebSocket 帧过大"));
+        return;
       }
       const masked = (this.buf[1] & 0x80) !== 0;
       if (this.buf.length < offset + (masked ? 4 : 0) + len) return;
@@ -250,6 +277,10 @@ class WsPipe implements ProsePipe {
     }
   }
 
+  setCap(n: number) {
+    this.cap = n;
+  }
+
   write(prose: string) {
     const frame = wsFrame(0x1, Buffer.from(prose, "utf8"), this.mask);
     return new Promise<void>((resolve, reject) => {
@@ -257,11 +288,18 @@ class WsPipe implements ProsePipe {
     });
   }
 
-  read() {
+  read(timeoutMs = 0): Promise<string> {
     if (this.early.length) return Promise.resolve(this.early.shift() as string);
     if (this.dead) return Promise.reject(this.dead);
     return new Promise<string>((resolve, reject) => {
-      this.waiters.push((value) => (value instanceof Error ? reject(value) : resolve(value)));
+      let timer: ReturnType<typeof setTimeout> | null = null;
+      const done = (value: string | Error) => {
+        if (timer) clearTimeout(timer);
+        if (value instanceof Error) reject(value);
+        else resolve(value);
+      };
+      if (timeoutMs > 0) timer = setTimeout(() => this.fail(new Error("握手超时")), timeoutMs);
+      this.waiters.push(done);
     });
   }
 
@@ -379,6 +417,13 @@ function sniName(host: string): string | undefined {
   return host && !isIP(host) ? host : undefined;
 }
 
+let tlsWarned = false;
+function warnUnverifiedTls() {
+  if (tlsWarned) return;
+  tlsWarned = true;
+  console.warn("词隙：没有校验 TLS 证书。正式部署请换成自己的证书并打开校验。试验证书的私钥不要放进安装包。");
+}
+
 export function dialOuter(opts: {
   transport: OuterName;
   host: string;
@@ -386,11 +431,13 @@ export function dialOuter(opts: {
   path?: string;
   wsHost?: string;
   tlsVerify?: boolean;
+  timeoutMs?: number;
 }): Promise<ProsePipe> {
   const transport = opts.transport || "tcp";
   const tls = transport === "tls" || transport === "wss";
   const ws = transport === "ws" || transport === "wss";
   const name = sniName(opts.wsHost || opts.host);
+  if (tls && opts.tlsVerify === false) warnUnverifiedTls();
   return new Promise((resolve, reject) => {
     const socket = tls
       ? connectTls({
@@ -404,8 +451,13 @@ export function dialOuter(opts: {
       socket.destroy();
       reject(err);
     };
+    if (opts.timeoutMs && opts.timeoutMs > 0) {
+      socket.setTimeout(opts.timeoutMs);
+      socket.once("timeout", () => fail(new Error("拨号超时")));
+    }
     socket.once("error", fail);
     socket.once(tls ? "secureConnect" : "connect", () => {
+      socket.setTimeout(0);
       socket.off("error", fail);
       void (async () => {
         try {
@@ -484,6 +536,8 @@ export class MuxStream {
   private ack: Ack | null = null;
   private ackWaiters: Array<(ack: Ack) => void> = [];
   seq = 1;
+  credit = 16;
+  private creditWait: Array<() => void> = [];
 
   constructor(
     readonly session: LexSession,
@@ -501,6 +555,20 @@ export class MuxStream {
     while (this.ackWaiters.length) this.ackWaiters.shift()?.(ack);
   }
 
+  queued() {
+    return this.chunks.length;
+  }
+
+  waitCredit(): Promise<void> {
+    if (this.credit > 0 || this.ended) return Promise.resolve();
+    return new Promise((resolve) => this.creditWait.push(resolve));
+  }
+
+  grant(n: number) {
+    this.credit = Math.min(32, this.credit + Math.max(0, n));
+    while (this.credit > 0 && this.creditWait.length) this.creditWait.shift()?.();
+  }
+
   push(chunk: Uint8Array) {
     const reader = this.readers.shift();
     if (reader) reader(chunk);
@@ -508,13 +576,25 @@ export class MuxStream {
   }
 
   read(): Promise<Uint8Array | null> {
-    if (this.chunks.length) return Promise.resolve(this.chunks.shift() as Uint8Array);
+    const grant = (chunk: Uint8Array | null) => {
+      if (chunk) void this.session.sendRecord(RECORD.credit, this.id, ++this.seq, u16be(1)).catch(() => undefined);
+      return chunk;
+    };
+    if (this.chunks.length) return Promise.resolve(grant(this.chunks.shift() as Uint8Array));
     if (this.ended) return Promise.resolve(null);
-    return new Promise((resolve) => this.readers.push(resolve));
+    return new Promise((resolve) => this.readers.push((chunk) => resolve(grant(chunk))));
   }
 
-  write(chunk: Uint8Array) {
-    return this.session.sendChunks(this, chunk);
+  async write(chunk: Uint8Array) {
+    const size = 16 * 1024;
+    if (!chunk.length) return;
+    for (let i = 0; i < chunk.length; i += size) {
+      while (this.credit <= 0 && !this.ended) await this.waitCredit();
+      if (this.ended) throw new Error("流已关闭");
+      this.credit -= 1;
+      const part = chunk.subarray(i, Math.min(chunk.length, i + size));
+      await this.session.sendRecord(RECORD.data, this.id, ++this.seq, part);
+    }
   }
 
   accept() {
@@ -541,6 +621,7 @@ export class MuxStream {
     this.ended = true;
     this.session.streams.delete(this.id);
     while (this.readers.length) this.readers.shift()?.(null);
+    while (this.creditWait.length) this.creditWait.shift()?.();
     if (!this.ack) this.resolveAck({ ok: false, reason: "连接关闭" });
   }
 }
@@ -554,6 +635,12 @@ export class LexSession {
   private closeWaiters: Array<() => void> = [];
   onStream: ((stream: MuxStream) => void) | null = null;
   live: LiveSession;
+  private sendLive: LiveSession;
+  private recvLive: LiveSession;
+  peerId = "";
+  private lastRx = Date.now();
+  private rekeyBusy = false;
+  readonly rekeyAt: number;
 
   constructor(
     readonly pipe: ProsePipe,
@@ -562,11 +649,19 @@ export class LexSession {
     readonly zstd: ZstdPref,
     readonly maxStreams: number,
     heartbeatMs: number,
+    rekeyAt = 0xffff00,
   ) {
     this.live = live;
+    this.sendLive = live;
+    this.recvLive = live;
+    this.rekeyAt = rekeyAt;
     this.nextId = initiator ? 1 : 2;
     if (heartbeatMs > 0) {
       this.heart = setInterval(() => {
+        if (Date.now() - this.lastRx > heartbeatMs * 3) {
+          this.shutdown();
+          return;
+        }
         void this.sendRecord(RECORD.heartbeat, 0, 0, heartbeatPayload()).catch(() => this.shutdown());
       }, heartbeatMs);
       this.heart.unref?.();
@@ -596,34 +691,73 @@ export class LexSession {
     return run;
   }
 
-  sendRecord(type: number, conn: number, seq: number, payload: Uint8Array) {
+  sendRecord(type: number, conn: number, seq: number, payload: Uint8Array, rekeyNonce?: Uint8Array) {
     return this.enqueue(async () => {
       if (this.closed) throw new Error("会话已关闭");
+      const live = this.sendLive;
       const packed = await packRecord(encodeRecord(type, conn, seq, payload), this.zstd);
       const dir = this.initiator ? "e2g" : "g2e";
-      const counter = this.live.counters[dir] + 1;
+      const counter = live.counters[dir] + 1;
       const prose = await seal({
-        key: this.live.sk,
-        lexicon: this.live.lexicon,
+        key: live.sk,
+        lexicon: live.lexicon,
         counter,
-        window: this.live.window,
+        window: live.window,
         direction: dir,
         plaintext: packed,
       });
-      this.live = {
-        ...this.live,
-        counters: { ...this.live.counters, [dir]: counter },
-      };
+      live.counters[dir] = counter;
       await this.pipe.write(prose);
+      if (rekeyNonce) this.sendLive = await this.deriveNext(live, rekeyNonce);
+      else this.kickRekey();
     });
   }
 
+  private kickRekey() {
+    if (this.rekeyBusy || this.closed || !this.initiator || this.sendLive !== this.recvLive) return;
+    const dir = this.initiator ? "e2g" : "g2e";
+    const peer = this.recvLive.seen[dir === "e2g" ? "g2e" : "e2g"];
+    const stale = currentWindow() !== this.sendLive.window;
+    if (Math.max(this.sendLive.counters[dir], peer) < this.rekeyAt && !stale) return;
+    this.rekeyBusy = true;
+    const nonce = crypto.getRandomValues(new Uint8Array(16));
+    void this.sendRecord(RECORD.rekey, 0, 0, nonce, nonce).finally(() => {
+      if (this.sendLive === this.recvLive) this.rekeyBusy = false;
+    });
+  }
+
+  private async deriveNext(base: LiveSession, nonce: Uint8Array) {
+    const sk = await hkdf(base.sk, nonce, utf8("lexis-rekey-v1"), 32);
+    const window = currentWindow();
+    const lexicon = await sessionLexicon(sk, window);
+    return {
+      ...base,
+      sk,
+      window,
+      lexicon,
+      inverse: invertLexicon(lexicon),
+      counters: { e2g: 0, g2e: 0 },
+      seen: { e2g: 0, g2e: 0 },
+    };
+  }
+
+  private async openLive(live: LiveSession, prose: string) {
+    const dir = this.initiator ? "g2e" : "e2g";
+    const opened = await open({
+      key: live.sk,
+      inverse: live.inverse,
+      window: live.window,
+      direction: dir,
+      prose,
+      lastSeen: live.seen[dir],
+      honey: live.honey,
+    });
+    if (!opened.honey) live.seen[dir] = opened.counter;
+    return opened;
+  }
+
   async sendChunks(stream: MuxStream, chunk: Uint8Array) {
-    const size = 16 * 1024;
-    for (let i = 0; i < chunk.length; i += size) {
-      const part = chunk.subarray(i, i + size);
-      await this.sendRecord(RECORD.data, stream.id, ++stream.seq, part);
-    }
+    await stream.write(chunk);
   }
 
   async open(command: string): Promise<MuxStream> {
@@ -647,6 +781,19 @@ export class LexSession {
 
   private async onRecord(type: number, conn: number, payload: Uint8Array) {
     if (type === RECORD.heartbeat) return;
+    if (type === RECORD.credit) {
+      const n = payload.length >= 2 ? readU16(payload, 0) : 1;
+      this.streams.get(conn)?.grant(n);
+      return;
+    }
+    if (type === RECORD.rekey) {
+      if (this.initiator) return;
+      const next = await this.deriveNext(this.recvLive, payload);
+      this.recvLive = next;
+      this.sendLive = next;
+      this.live = next;
+      return;
+    }
     if (type === RECORD.close) {
       this.streams.get(conn)?.finish();
       return;
@@ -670,8 +817,8 @@ export class LexSession {
     if (type === RECORD.data) {
       const stream = this.streams.get(conn);
       if (!stream || stream.ended) return;
-      if (stream.chunks.length > 256) {
-        this.shutdown();
+      if (stream.queued() > 32) {
+        void stream.close();
         return;
       }
       stream.push(payload);
@@ -682,23 +829,25 @@ export class LexSession {
     try {
       for (;;) {
         const prose = await this.pipe.read();
-        const dir = this.initiator ? "g2e" : "e2g";
-        const opened = await open({
-          key: this.live.sk,
-          inverse: this.live.inverse,
-          window: this.live.window,
-          direction: dir,
-          prose,
-          lastSeen: this.live.seen[dir],
-          honey: this.live.honey,
-        });
+        let opened;
+        try {
+          opened = await this.openLive(this.recvLive, prose);
+        } catch (err) {
+          if (this.sendLive === this.recvLive) throw err;
+          opened = await this.openLive(this.sendLive, prose);
+          this.recvLive = this.sendLive;
+          this.live = this.sendLive;
+          this.rekeyBusy = false;
+        }
         if (opened.honey) continue;
-        this.live = { ...this.live, seen: { ...this.live.seen, [dir]: opened.counter } };
+        this.lastRx = Date.now();
         const raw = await unpackRecord(opened.plaintext);
         const rec = decodeRecord(raw);
         await this.onRecord(rec.type, rec.conn, rec.payload);
       }
-    } catch {
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      if (!this.closed && message !== "连接关闭") console.error("词隙会话结束", message);
       this.shutdown();
     }
   }
@@ -712,9 +861,15 @@ async function sessionFrom(
   maxStreams: number,
   heartbeatMs: number,
   onStream?: (stream: MuxStream) => void,
+  rekeyAt = 0xffff00,
+  peerId = "",
+  onReady?: (session: LexSession) => void,
 ) {
-  const session = new LexSession(pipe, live, initiator, zstd, maxStreams, heartbeatMs);
+  pipe.setCap?.(FRAME_CAP);
+  const session = new LexSession(pipe, live, initiator, zstd, maxStreams, heartbeatMs, rekeyAt);
+  session.peerId = peerId;
   if (onStream) session.onStream = onStream;
+  onReady?.(session);
   void session.readLoop();
   return session;
 }
@@ -724,16 +879,23 @@ export async function connectSession(opts: {
   self: MeshNode;
   peerRawB64: string;
   offer?: Partial<SessionOffer>;
+  token?: string;
   zstd?: ZstdPref;
   maxStreams?: number;
   heartbeatMs?: number;
+  handshakeMs?: number;
+  rekeyAt?: number;
+  peerId?: string;
+  onReady?: (session: LexSession) => void;
   onStream?: (stream: MuxStream) => void;
 }) {
   const self = { ...opts.self, role: "edge" as const };
-  const pending = await edgeStart(self, Date.now(), opts.offer);
+  const token = opts.token || "";
+  const wait = opts.handshakeMs ?? 10000;
+  const pending = await edgeStart(self, Date.now(), opts.offer, token);
   await opts.pipe.write(pending.helloWire);
-  const serverWire = await opts.pipe.read();
-  const finished = await edgeFinish(self, pending, opts.peerRawB64, serverWire);
+  const serverWire = await opts.pipe.read(wait);
+  const finished = await edgeFinish(self, pending, opts.peerRawB64, serverWire, token);
   await opts.pipe.write(finished.finishWire);
   const live = await openSession({
     edge: self,
@@ -747,26 +909,45 @@ export async function connectSession(opts: {
     honey: finished.honey,
     kdfMs: finished.kdfMs,
   });
-  return sessionFrom(opts.pipe, live, true, opts.zstd || { enabled: false, level: 3 }, opts.maxStreams || 128, opts.heartbeatMs ?? 15000, opts.onStream);
+  return sessionFrom(
+    opts.pipe,
+    live,
+    true,
+    opts.zstd || { enabled: false, level: 3 },
+    opts.maxStreams || 128,
+    opts.heartbeatMs ?? 15000,
+    opts.onStream,
+    opts.rekeyAt,
+    opts.peerId || "",
+    opts.onReady,
+  );
 }
 
 export async function acceptSession(opts: {
   pipe: ProsePipe;
   self: MeshNode;
-  peers: { publicRawB64: string }[];
+  peers: { id?: string; publicRawB64: string }[];
+  token?: string;
+  kdf?: ArgonParams;
   zstd?: ZstdPref;
   maxStreams?: number;
   heartbeatMs?: number;
+  handshakeMs?: number;
+  rekeyAt?: number;
+  onReady?: (session: LexSession) => void;
   onStream?: (stream: MuxStream) => void;
 }) {
   const self = { ...opts.self, role: "gate" as const };
-  const helloWire = await opts.pipe.read();
+  const wait = opts.handshakeMs ?? 10000;
+  const helloWire = await opts.pipe.read(wait);
   let pending: GatePending | null = null;
+  let matched = "";
   let last = "没有匹配的节点公钥";
   for (const peer of opts.peers) {
     if (!peer.publicRawB64) continue;
     try {
-      pending = await gateRespond(self, peer.publicRawB64, helloWire);
+      pending = await gateRespond(self, peer.publicRawB64, helloWire, { token: opts.token, kdf: opts.kdf });
+      matched = peer.id || "";
       break;
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
@@ -776,11 +957,11 @@ export async function acceptSession(opts: {
   }
   if (!pending) throw new Error(last);
   await opts.pipe.write(pending.serverWire);
-  const finishWire = await opts.pipe.read();
+  const finishWire = await opts.pipe.read(wait);
   await gateAccept(pending, finishWire);
   const honey = honeyFromFeatures(pending.features);
   const live = await openSession({
-    edge: { ...self, id: "peer", name: "对端", role: "edge", publicRawB64: b64(pending.ltC) },
+    edge: { ...self, id: matched || "peer", name: "对端", role: "edge", publicRawB64: b64(pending.ltC) },
     gate: self,
     sk: pending.sk,
     window: pending.window,
@@ -791,7 +972,18 @@ export async function acceptSession(opts: {
     honey,
     kdfMs: 0,
   });
-  return sessionFrom(opts.pipe, live, false, opts.zstd || { enabled: false, level: 3 }, opts.maxStreams || 128, opts.heartbeatMs ?? 15000, opts.onStream);
+  return sessionFrom(
+    opts.pipe,
+    live,
+    false,
+    opts.zstd || { enabled: false, level: 3 },
+    opts.maxStreams || 128,
+    opts.heartbeatMs ?? 15000,
+    opts.onStream,
+    opts.rekeyAt,
+    matched,
+    opts.onReady,
+  );
 }
 
 export async function pipeMux(left: MuxStream, right: MuxStream) {
@@ -812,4 +1004,65 @@ export async function pipeMux(left: MuxStream, right: MuxStream) {
   };
   void pump(left, right);
   void pump(right, left);
+}
+
+type KdfMsg = {
+  id: number;
+  ssE: Uint8Array;
+  ssS: Uint8Array;
+  nonceC: Uint8Array;
+  nonceS: Uint8Array;
+  window: number;
+  features: number;
+  params: ArgonParams;
+};
+
+if (!isMainThread && parentPort) {
+  parentPort.on("message", (msg: KdfMsg) => {
+    try {
+      const out = deriveSessionKey(msg.ssE, msg.ssS, msg.nonceC, msg.nonceS, msg.window, msg.features, msg.params);
+      parentPort?.postMessage({ id: msg.id, key: out.key, ms: out.ms });
+    } catch (err) {
+      parentPort?.postMessage({ id: msg.id, error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+}
+
+let kdfWorker: Worker | null = null;
+let kdfSeq = 0;
+let kdfInflight = 0;
+let kdfMax = 2;
+const kdfWait = new Map<number, { resolve: (v: { key: Uint8Array; ms: number }) => void; reject: (e: Error) => void }>();
+
+export function startKdfPool(maxConcurrent = 2) {
+  kdfMax = Math.max(1, Math.min(8, maxConcurrent || 2));
+  if (isMainThread && !kdfWorker) {
+    kdfWorker = new Worker(new URL(import.meta.url));
+    kdfWorker.unref?.();
+    kdfWorker.on("message", (msg: { id: number; key?: Uint8Array; ms?: number; error?: string }) => {
+      const job = kdfWait.get(msg.id);
+      if (!job) return;
+      kdfWait.delete(msg.id);
+      if (msg.error || !msg.key) job.reject(new Error(msg.error || "派生失败"));
+      else job.resolve({ key: new Uint8Array(msg.key), ms: msg.ms || 1 });
+    });
+    kdfWorker.on("error", (err) => {
+      for (const job of kdfWait.values()) job.reject(err instanceof Error ? err : new Error(String(err)));
+      kdfWait.clear();
+    });
+  }
+  setSessionKeyDeriver(async (ssE, ssS, nonceC, nonceS, window, features, params) => {
+    if (!kdfWorker) return deriveSessionKey(ssE, ssS, nonceC, nonceS, window, features, params);
+    if (kdfInflight >= kdfMax) throw new Error("握手太多");
+    kdfInflight += 1;
+    const id = ++kdfSeq;
+    try {
+      return await new Promise<{ key: Uint8Array; ms: number }>((resolve, reject) => {
+        kdfWait.set(id, { resolve, reject });
+        kdfWorker?.postMessage({ id, ssE, ssS, nonceC, nonceS, window, features, params });
+      });
+    } finally {
+      kdfInflight -= 1;
+    }
+  });
 }

@@ -700,6 +700,7 @@ import { createHash, randomBytes } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { connect as connectTcp, createServer as createTcp, isIP } from "node:net";
 import { connect as connectTls, createServer as createTls } from "node:tls";
+import { isMainThread, parentPort, Worker } from "node:worker_threads";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -2602,7 +2603,7 @@ var DEFAULT_KDF = {
   parallelism: 1
 };
 var LIMITS = {
-  memoryKiB: { min: 8, max: 65536 },
+  memoryKiB: { min: 8, max: 16384 },
   iterations: { min: 1, max: 4 },
   parallelism: { min: 1, max: 2 }
 };
@@ -2656,10 +2657,48 @@ function deriveSessionKey(ssE, ssS, nonceC, nonceS, window, features, params) {
   });
   return { key: key2, ms: Math.max(1, Date.now() - t0) };
 }
+var sessionDeriver = async (ssE, ssS, nonceC, nonceS, window, features, params) => deriveSessionKey(ssE, ssS, nonceC, nonceS, window, features, params);
+function setSessionKeyDeriver(fn) {
+  sessionDeriver = fn ?? (async (ssE, ssS, nonceC, nonceS, window, features, params) => deriveSessionKey(ssE, ssS, nonceC, nonceS, window, features, params));
+}
+function deriveSessionKeyAsync(ssE, ssS, nonceC, nonceS, window, features, params) {
+  return sessionDeriver(ssE, ssS, nonceC, nonceS, window, features, params);
+}
 
 // src/lib/lexis/handshake.ts
 function currentWindow(now = Date.now()) {
   return Math.floor(now / 1e3 / SPEC.windowSec);
+}
+var HELLO_CORE = 2 + 65 + 65 + 4 + 16 + 4 + 1;
+var SERVER_CORE = 2 + 65 + 65 + 16 + 16 + 4 + 1;
+var seenHellos = /* @__PURE__ */ new Map();
+function assertHelloWindow(helloWindow, now = Date.now()) {
+  const current = currentWindow(now);
+  const into = Math.floor(now / 1e3) % SPEC.windowSec;
+  const ok = helloWindow === current || helloWindow === current - 1 && into < 20;
+  if (!ok) throw new LexisError("\u63E1\u624B\u65F6\u95F4\u7A97\u5DF2\u7ECF\u8FC7\u671F");
+}
+function nonceId(nonce) {
+  let hex2 = "";
+  for (const b of nonce) hex2 += b.toString(16).padStart(2, "0");
+  return hex2;
+}
+function claimHello(window, nonce) {
+  for (const key2 of [...seenHellos.keys()]) {
+    if (key2 < window - 1) seenHellos.delete(key2);
+  }
+  let bag = seenHellos.get(window);
+  if (!bag) {
+    bag = /* @__PURE__ */ new Set();
+    seenHellos.set(window, bag);
+  }
+  const id = nonceId(nonce);
+  if (bag.has(id)) throw new LexisError("\u63E1\u624B\u88AB\u91CD\u653E");
+  if (bag.size >= 4096) throw new LexisError("\u8FD9\u4E2A\u65F6\u95F4\u7A97\u7684\u63E1\u624B\u592A\u591A");
+  bag.add(id);
+}
+async function tokenMac(token, body) {
+  return (await hmac(utf8(token), concat(utf8("lexis-admit-v1"), body))).subarray(0, 16);
 }
 function transcript(parts) {
   return concat(
@@ -2675,7 +2714,7 @@ function transcript(parts) {
     new Uint8Array([parts.features & 255])
   );
 }
-async function edgeStart(edge, now = Date.now(), offer) {
+async function edgeStart(edge, now = Date.now(), offer, token = "") {
   const wanted = clampOffer(offer);
   const eph = await createIdentity();
   const ltRaw = unb64(edge.publicRawB64);
@@ -2683,7 +2722,7 @@ async function edgeStart(edge, now = Date.now(), offer) {
   assertPoint(eph.publicRaw, "\u5185\u7F51\u7AEF\u4E34\u65F6");
   const nonceC = crypto.getRandomValues(new Uint8Array(16));
   const window = currentWindow(now);
-  const blob = concat(
+  let blob = concat(
     new Uint8Array([1, 1]),
     eph.publicRaw,
     ltRaw,
@@ -2692,12 +2731,14 @@ async function edgeStart(edge, now = Date.now(), offer) {
     encodeKdf(wanted),
     new Uint8Array([featureByte(wanted.honey)])
   );
+  if (token) blob = concat(blob, await tokenMac(token, blob));
   const helloWire = await encodeStatic(blob);
   return { eph, nonceC, window, helloWire, ltRaw };
 }
 function parseHello(buf2) {
-  if (buf2.length !== 2 + 65 + 65 + 4 + 16 + 4 + 1) throw new LexisError("\u5BA2\u6237\u7AEF\u95EE\u5019\u957F\u5EA6\u4E0D\u5BF9");
+  if (buf2.length !== HELLO_CORE && buf2.length !== HELLO_CORE + 16) throw new LexisError("\u5BA2\u6237\u7AEF\u95EE\u5019\u957F\u5EA6\u4E0D\u5BF9");
   if (buf2[0] !== 1 || buf2[1] !== 1) throw new LexisError("\u5BA2\u6237\u7AEF\u95EE\u5019\u7248\u672C\u4E0D\u5BF9");
+  const mac = buf2.length === HELLO_CORE + 16 ? buf2.slice(HELLO_CORE) : null;
   const ephRaw = buf2.slice(2, 67);
   const ltRaw = buf2.slice(67, 132);
   const window = buf2[132] << 24 | buf2[133] << 16 | buf2[134] << 8 | buf2[135];
@@ -2706,11 +2747,12 @@ function parseHello(buf2) {
   const features = buf2[156];
   assertPoint(ephRaw, "\u5BF9\u7AEF\u4E34\u65F6");
   assertPoint(ltRaw, "\u5BF9\u7AEF\u957F\u671F");
-  return { ephRaw, ltRaw, window: window >>> 0, nonce, kdf, features };
+  return { ephRaw, ltRaw, window: window >>> 0, nonce, kdf, features, mac };
 }
 function parseServer(buf2) {
-  if (buf2.length !== 2 + 65 + 65 + 16 + 16 + 4 + 1) throw new LexisError("\u670D\u52A1\u7AEF\u95EE\u5019\u957F\u5EA6\u4E0D\u5BF9");
+  if (buf2.length !== SERVER_CORE && buf2.length !== SERVER_CORE + 16) throw new LexisError("\u670D\u52A1\u7AEF\u95EE\u5019\u957F\u5EA6\u4E0D\u5BF9");
   if (buf2[0] !== 1 || buf2[1] !== 2) throw new LexisError("\u670D\u52A1\u7AEF\u95EE\u5019\u7248\u672C\u4E0D\u5BF9");
+  const mac = buf2.length === SERVER_CORE + 16 ? buf2.slice(SERVER_CORE) : null;
   const ephRaw = buf2.slice(2, 67);
   const ltRaw = buf2.slice(67, 132);
   const nonce = buf2.slice(132, 148);
@@ -2719,22 +2761,34 @@ function parseServer(buf2) {
   const features = buf2[168];
   assertPoint(ephRaw, "\u95F8\u95E8\u4E34\u65F6");
   assertPoint(ltRaw, "\u95F8\u95E8\u957F\u671F");
-  return { ephRaw, ltRaw, nonce, confirm, kdf, features };
+  return { ephRaw, ltRaw, nonce, confirm, kdf, features, mac };
 }
-async function gateRespond(gate, peerRawB64, helloWire) {
-  const hello = parseHello(await decodeStatic(helloWire));
+async function gateRespond(gate, peerRawB64, helloWire, opts = {}) {
+  const raw = await decodeStatic(helloWire);
+  const hello = parseHello(raw);
+  assertHelloWindow(hello.window, opts.now ?? Date.now());
+  const token = opts.token || "";
+  if (token) {
+    if (!hello.mac) throw new LexisError("\u7F3A\u5C11\u63E1\u624B\u53E3\u4EE4");
+    const expect = await tokenMac(token, raw.slice(0, HELLO_CORE));
+    if (!timingSafeEqual(expect, hello.mac)) throw new LexisError("\u63E1\u624B\u53E3\u4EE4\u4E0D\u5BF9");
+  } else if (hello.mac) {
+    throw new LexisError("\u5BF9\u7AEF\u5E26\u4E86\u53E3\u4EE4\uFF0C\u8FD9\u8FB9\u6CA1\u6709");
+  }
   const pinned = unb64(peerRawB64);
   if (!timingSafeEqual(hello.ltRaw, pinned)) {
     throw new LexisError("\u5185\u7F51\u7AEF\u957F\u671F\u516C\u94A5\u548C\u95F8\u95E8\u4E0A\u7684\u7ED1\u5B9A\u4E0D\u4E00\u81F4");
   }
+  claimHello(hello.window, hello.nonce);
   const ephS = await createIdentity();
   const ltS = unb64(gate.publicRawB64);
   const nonceS = crypto.getRandomValues(new Uint8Array(16));
   const ssE = await ecdh(await importPrivateJwk(ephS.privateJwk), await importRawPublic(hello.ephRaw));
   const ssS = await ecdh(await importPrivateJwk(gate.privateJwk), await importRawPublic(hello.ltRaw));
-  const kdfBytes = encodeKdf(hello.kdf);
+  const agreed = clampKdf(opts.kdf ?? hello.kdf);
+  const kdfBytes = encodeKdf(agreed);
   const features = hello.features & 255;
-  const derived = deriveSessionKey(ssE, ssS, hello.nonce, nonceS, hello.window, features, hello.kdf);
+  const derived = await deriveSessionKeyAsync(ssE, ssS, hello.nonce, nonceS, hello.window, features, agreed);
   const sk = derived.key;
   const tr = transcript({
     ephC: hello.ephRaw,
@@ -2749,7 +2803,8 @@ async function gateRespond(gate, peerRawB64, helloWire) {
   });
   const confirmS = (await hmac(sk, concat(utf8("lexis-srv-v1"), tr))).subarray(0, 16);
   const expectFinish = (await hmac(sk, concat(utf8("lexis-cli-v1"), tr))).subarray(0, 16);
-  const blob = concat(new Uint8Array([1, 2]), ephS.publicRaw, ltS, nonceS, confirmS, kdfBytes, new Uint8Array([features]));
+  let blob = concat(new Uint8Array([1, 2]), ephS.publicRaw, ltS, nonceS, confirmS, kdfBytes, new Uint8Array([features]));
+  if (token) blob = concat(blob, await tokenMac(token, blob));
   const serverWire = await encodeStatic(blob);
   return {
     sk,
@@ -2762,15 +2817,23 @@ async function gateRespond(gate, peerRawB64, helloWire) {
     nonceS,
     serverWire,
     expectFinish,
-    kdf: hello.kdf,
+    kdf: agreed,
     features
   };
 }
-async function edgeFinish(edge, pending, gateRawB64, serverWire) {
-  const server = parseServer(await decodeStatic(serverWire));
+async function edgeFinish(edge, pending, gateRawB64, serverWire, token = "") {
+  const raw = await decodeStatic(serverWire);
+  const server = parseServer(raw);
   const pinned = unb64(gateRawB64);
   if (!timingSafeEqual(server.ltRaw, pinned)) {
     throw new LexisError("\u95F8\u95E8\u957F\u671F\u516C\u94A5\u548C\u5185\u7F51\u7AEF\u4E0A\u7684\u7ED1\u5B9A\u4E0D\u4E00\u81F4");
+  }
+  if (token) {
+    if (!server.mac) throw new LexisError("\u95F8\u95E8\u6CA1\u6709\u5E26\u56DE\u53E3\u4EE4");
+    const expectMac = await tokenMac(token, raw.slice(0, SERVER_CORE));
+    if (!timingSafeEqual(expectMac, server.mac)) throw new LexisError("\u63E1\u624B\u53E3\u4EE4\u4E0D\u5BF9");
+  } else if (server.mac) {
+    throw new LexisError("\u5BF9\u7AEF\u5E26\u4E86\u53E3\u4EE4\uFF0C\u8FD9\u8FB9\u6CA1\u6709");
   }
   const ssE = await ecdh(
     await importPrivateJwk(pending.eph.privateJwk),
@@ -2781,7 +2844,7 @@ async function edgeFinish(edge, pending, gateRawB64, serverWire) {
     await importRawPublic(server.ltRaw)
   );
   const features = server.features & 255;
-  const derived = deriveSessionKey(ssE, ssS, pending.nonceC, server.nonce, pending.window, features, server.kdf);
+  const derived = await deriveSessionKeyAsync(ssE, ssS, pending.nonceC, server.nonce, pending.window, features, server.kdf);
   const sk = derived.key;
   const tr = transcript({
     ephC: pending.eph.publicRaw,
@@ -2847,7 +2910,9 @@ var RECORD = {
   heartbeat: 1,
   data: 2,
   open: 3,
-  close: 4
+  close: 4,
+  credit: 5,
+  rekey: 6
 };
 function encodeRecord(type, conn, seq, payload) {
   const out = new Uint8Array(11 + payload.length);
@@ -3011,13 +3076,16 @@ function parseOpen(text) {
   if (relay) {
     const rest = relay[2].trim();
     const inner = parseOpen(rest);
-    return { relay: relay[1], rest, udp: inner.udp, host: inner.host, port: inner.port };
+    return { relay: relay[1], rest, expose: null, udp: inner.udp, host: inner.host, port: inner.port };
   }
+  const expose = raw.match(/^expose\s+(\S+)$/);
+  if (expose) return { relay: null, rest: raw, expose: expose[1], udp: false, host: "", port: 0 };
   const cmd = raw.match(/^(tcp|udp)\s+(\S+)\s+(\d+)$/);
-  if (!cmd) return { relay: null, rest: raw, udp: false, host: "", port: 0 };
+  if (!cmd) return { relay: null, rest: raw, expose: null, udp: false, host: "", port: 0 };
   return {
     relay: null,
     rest: raw,
+    expose: null,
     udp: cmd[1] === "udp",
     host: cmd[2],
     port: Number(cmd[3])
@@ -3032,12 +3100,14 @@ function hopCount(text) {
   }
   return n;
 }
+var HANDSHAKE_CAP = 64 * 1024;
+var FRAME_CAP = 256 * 1024;
 var LinePipe = class {
   constructor(socket) {
     this.socket = socket;
     socket.on("data", (chunk) => {
       this.buf = Buffer.concat([this.buf, chunk]);
-      if (this.buf.length > 8 * 1024 * 1024) {
+      if (this.buf.length > this.cap) {
         this.fail(new Error("\u8BCD\u8868\u7F13\u51B2\u8FC7\u5927"));
         return;
       }
@@ -3050,6 +3120,10 @@ var LinePipe = class {
   buf = Buffer.alloc(0);
   waiters = [];
   dead = null;
+  cap = HANDSHAKE_CAP;
+  setCap(n) {
+    this.cap = n;
+  }
   fail(err2) {
     if (!this.dead) this.dead = err2;
     while (this.waiters.length) {
@@ -3076,17 +3150,24 @@ var LinePipe = class {
       this.socket.write(body, (err2) => err2 ? reject(err2) : resolve());
     });
   }
-  read() {
+  read(timeoutMs = 0) {
     if (this.dead && this.buf.indexOf(10) < 0) return Promise.reject(this.dead);
     const nl = this.buf.indexOf(10);
     if (nl >= 0) {
       const line = this.buf.subarray(0, nl).toString("utf8").replace(/\r$/, "");
       this.buf = this.buf.subarray(nl + 1);
-      if (!line) return this.read();
+      if (!line) return this.read(timeoutMs);
       return Promise.resolve(line);
     }
     return new Promise((resolve, reject) => {
-      this.waiters.push((value) => value instanceof Error ? reject(value) : resolve(value));
+      let timer = null;
+      const done = (value) => {
+        if (timer) clearTimeout(timer);
+        if (value instanceof Error) reject(value);
+        else resolve(value);
+      };
+      if (timeoutMs > 0) timer = setTimeout(() => this.fail(new Error("\u63E1\u624B\u8D85\u65F6")), timeoutMs);
+      this.waiters.push(done);
     });
   }
   close() {
@@ -3114,6 +3195,7 @@ var WsPipe = class {
   dead = null;
   fragments = [];
   early = [];
+  cap = HANDSHAKE_CAP;
   fail(err2) {
     if (!this.dead) this.dead = err2;
     while (this.waiters.length) this.waiters.shift()?.(this.dead);
@@ -3133,12 +3215,16 @@ var WsPipe = class {
       } else if (len === 127) {
         if (this.buf.length < 10) return;
         const big = this.buf.readBigUInt64BE(2);
-        if (big > BigInt(8 * 1024 * 1024)) {
+        if (big > BigInt(this.cap)) {
           this.fail(new Error("WebSocket \u5E27\u8FC7\u5927"));
           return;
         }
         len = Number(big);
         offset = 10;
+      }
+      if (len > this.cap) {
+        this.fail(new Error("WebSocket \u5E27\u8FC7\u5927"));
+        return;
       }
       const masked = (this.buf[1] & 128) !== 0;
       if (this.buf.length < offset + (masked ? 4 : 0) + len) return;
@@ -3171,17 +3257,27 @@ var WsPipe = class {
       }
     }
   }
+  setCap(n) {
+    this.cap = n;
+  }
   write(prose) {
     const frame = wsFrame(1, Buffer.from(prose, "utf8"), this.mask);
     return new Promise((resolve, reject) => {
       this.socket.write(frame, (err2) => err2 ? reject(err2) : resolve());
     });
   }
-  read() {
+  read(timeoutMs = 0) {
     if (this.early.length) return Promise.resolve(this.early.shift());
     if (this.dead) return Promise.reject(this.dead);
     return new Promise((resolve, reject) => {
-      this.waiters.push((value) => value instanceof Error ? reject(value) : resolve(value));
+      let timer = null;
+      const done = (value) => {
+        if (timer) clearTimeout(timer);
+        if (value instanceof Error) reject(value);
+        else resolve(value);
+      };
+      if (timeoutMs > 0) timer = setTimeout(() => this.fail(new Error("\u63E1\u624B\u8D85\u65F6")), timeoutMs);
+      this.waiters.push(done);
     });
   }
   close() {
@@ -3301,11 +3397,18 @@ function tlsMaterial(certPath, keyPath) {
 function sniName(host) {
   return host && !isIP(host) ? host : void 0;
 }
+var tlsWarned = false;
+function warnUnverifiedTls() {
+  if (tlsWarned) return;
+  tlsWarned = true;
+  console.warn("\u8BCD\u9699\uFF1A\u6CA1\u6709\u6821\u9A8C TLS \u8BC1\u4E66\u3002\u6B63\u5F0F\u90E8\u7F72\u8BF7\u6362\u6210\u81EA\u5DF1\u7684\u8BC1\u4E66\u5E76\u6253\u5F00\u6821\u9A8C\u3002\u8BD5\u9A8C\u8BC1\u4E66\u7684\u79C1\u94A5\u4E0D\u8981\u653E\u8FDB\u5B89\u88C5\u5305\u3002");
+}
 function dialOuter(opts) {
   const transport = opts.transport || "tcp";
   const tls = transport === "tls" || transport === "wss";
   const ws = transport === "ws" || transport === "wss";
   const name = sniName(opts.wsHost || opts.host);
+  if (tls && opts.tlsVerify === false) warnUnverifiedTls();
   return new Promise((resolve, reject) => {
     const socket = tls ? connectTls({
       host: opts.host,
@@ -3317,8 +3420,13 @@ function dialOuter(opts) {
       socket.destroy();
       reject(err2);
     };
+    if (opts.timeoutMs && opts.timeoutMs > 0) {
+      socket.setTimeout(opts.timeoutMs);
+      socket.once("timeout", () => fail(new Error("\u62E8\u53F7\u8D85\u65F6")));
+    }
     socket.once("error", fail);
     socket.once(tls ? "secureConnect" : "connect", () => {
+      socket.setTimeout(0);
       socket.off("error", fail);
       void (async () => {
         try {
@@ -3383,6 +3491,8 @@ var MuxStream = class {
   ack = null;
   ackWaiters = [];
   seq = 1;
+  credit = 16;
+  creditWait = [];
   waitAck() {
     if (this.ack) return Promise.resolve(this.ack);
     return new Promise((resolve) => this.ackWaiters.push(resolve));
@@ -3391,18 +3501,41 @@ var MuxStream = class {
     this.ack = ack;
     while (this.ackWaiters.length) this.ackWaiters.shift()?.(ack);
   }
+  queued() {
+    return this.chunks.length;
+  }
+  waitCredit() {
+    if (this.credit > 0 || this.ended) return Promise.resolve();
+    return new Promise((resolve) => this.creditWait.push(resolve));
+  }
+  grant(n) {
+    this.credit = Math.min(32, this.credit + Math.max(0, n));
+    while (this.credit > 0 && this.creditWait.length) this.creditWait.shift()?.();
+  }
   push(chunk) {
     const reader = this.readers.shift();
     if (reader) reader(chunk);
     else this.chunks.push(chunk);
   }
   read() {
-    if (this.chunks.length) return Promise.resolve(this.chunks.shift());
+    const grant = (chunk) => {
+      if (chunk) void this.session.sendRecord(RECORD.credit, this.id, ++this.seq, u16be(1)).catch(() => void 0);
+      return chunk;
+    };
+    if (this.chunks.length) return Promise.resolve(grant(this.chunks.shift()));
     if (this.ended) return Promise.resolve(null);
-    return new Promise((resolve) => this.readers.push(resolve));
+    return new Promise((resolve) => this.readers.push((chunk) => resolve(grant(chunk))));
   }
-  write(chunk) {
-    return this.session.sendChunks(this, chunk);
+  async write(chunk) {
+    const size = 16 * 1024;
+    if (!chunk.length) return;
+    for (let i = 0; i < chunk.length; i += size) {
+      while (this.credit <= 0 && !this.ended) await this.waitCredit();
+      if (this.ended) throw new Error("\u6D41\u5DF2\u5173\u95ED");
+      this.credit -= 1;
+      const part = chunk.subarray(i, Math.min(chunk.length, i + size));
+      await this.session.sendRecord(RECORD.data, this.id, ++this.seq, part);
+    }
   }
   accept() {
     return this.session.sendRecord(RECORD.open, this.id, ++this.seq, utf8("ok"));
@@ -3424,19 +3557,27 @@ var MuxStream = class {
     this.ended = true;
     this.session.streams.delete(this.id);
     while (this.readers.length) this.readers.shift()?.(null);
+    while (this.creditWait.length) this.creditWait.shift()?.();
     if (!this.ack) this.resolveAck({ ok: false, reason: "\u8FDE\u63A5\u5173\u95ED" });
   }
 };
 var LexSession = class {
-  constructor(pipe, live, initiator, zstd, maxStreams, heartbeatMs) {
+  constructor(pipe, live, initiator, zstd, maxStreams, heartbeatMs, rekeyAt = 16776960) {
     this.pipe = pipe;
     this.initiator = initiator;
     this.zstd = zstd;
     this.maxStreams = maxStreams;
     this.live = live;
+    this.sendLive = live;
+    this.recvLive = live;
+    this.rekeyAt = rekeyAt;
     this.nextId = initiator ? 1 : 2;
     if (heartbeatMs > 0) {
       this.heart = setInterval(() => {
+        if (Date.now() - this.lastRx > heartbeatMs * 3) {
+          this.shutdown();
+          return;
+        }
         void this.sendRecord(RECORD.heartbeat, 0, 0, heartbeatPayload()).catch(() => this.shutdown());
       }, heartbeatMs);
       this.heart.unref?.();
@@ -3454,6 +3595,12 @@ var LexSession = class {
   closeWaiters = [];
   onStream = null;
   live;
+  sendLive;
+  recvLive;
+  peerId = "";
+  lastRx = Date.now();
+  rekeyBusy = false;
+  rekeyAt;
   whenClosed() {
     if (this.closed) return Promise.resolve();
     return new Promise((resolve) => this.closeWaiters.push(resolve));
@@ -3474,33 +3621,69 @@ var LexSession = class {
     );
     return run2;
   }
-  sendRecord(type, conn, seq, payload) {
+  sendRecord(type, conn, seq, payload, rekeyNonce) {
     return this.enqueue(async () => {
       if (this.closed) throw new Error("\u4F1A\u8BDD\u5DF2\u5173\u95ED");
+      const live = this.sendLive;
       const packed = await packRecord(encodeRecord(type, conn, seq, payload), this.zstd);
       const dir = this.initiator ? "e2g" : "g2e";
-      const counter = this.live.counters[dir] + 1;
+      const counter = live.counters[dir] + 1;
       const prose = await seal({
-        key: this.live.sk,
-        lexicon: this.live.lexicon,
+        key: live.sk,
+        lexicon: live.lexicon,
         counter,
-        window: this.live.window,
+        window: live.window,
         direction: dir,
         plaintext: packed
       });
-      this.live = {
-        ...this.live,
-        counters: { ...this.live.counters, [dir]: counter }
-      };
+      live.counters[dir] = counter;
       await this.pipe.write(prose);
+      if (rekeyNonce) this.sendLive = await this.deriveNext(live, rekeyNonce);
+      else this.kickRekey();
     });
   }
+  kickRekey() {
+    if (this.rekeyBusy || this.closed || !this.initiator || this.sendLive !== this.recvLive) return;
+    const dir = this.initiator ? "e2g" : "g2e";
+    const peer = this.recvLive.seen[dir === "e2g" ? "g2e" : "e2g"];
+    const stale = currentWindow() !== this.sendLive.window;
+    if (Math.max(this.sendLive.counters[dir], peer) < this.rekeyAt && !stale) return;
+    this.rekeyBusy = true;
+    const nonce = crypto.getRandomValues(new Uint8Array(16));
+    void this.sendRecord(RECORD.rekey, 0, 0, nonce, nonce).finally(() => {
+      if (this.sendLive === this.recvLive) this.rekeyBusy = false;
+    });
+  }
+  async deriveNext(base, nonce) {
+    const sk = await hkdf(base.sk, nonce, utf8("lexis-rekey-v1"), 32);
+    const window = currentWindow();
+    const lexicon = await sessionLexicon(sk, window);
+    return {
+      ...base,
+      sk,
+      window,
+      lexicon,
+      inverse: invertLexicon(lexicon),
+      counters: { e2g: 0, g2e: 0 },
+      seen: { e2g: 0, g2e: 0 }
+    };
+  }
+  async openLive(live, prose) {
+    const dir = this.initiator ? "g2e" : "e2g";
+    const opened = await open({
+      key: live.sk,
+      inverse: live.inverse,
+      window: live.window,
+      direction: dir,
+      prose,
+      lastSeen: live.seen[dir],
+      honey: live.honey
+    });
+    if (!opened.honey) live.seen[dir] = opened.counter;
+    return opened;
+  }
   async sendChunks(stream, chunk) {
-    const size = 16 * 1024;
-    for (let i = 0; i < chunk.length; i += size) {
-      const part = chunk.subarray(i, i + size);
-      await this.sendRecord(RECORD.data, stream.id, ++stream.seq, part);
-    }
+    await stream.write(chunk);
   }
   async open(command) {
     if (this.streams.size >= this.maxStreams) throw new Error("\u8FD9\u6761\u94FE\u8DEF\u7684\u8FDE\u63A5\u6570\u5DF2\u6EE1");
@@ -3522,6 +3705,19 @@ var LexSession = class {
   }
   async onRecord(type, conn, payload) {
     if (type === RECORD.heartbeat) return;
+    if (type === RECORD.credit) {
+      const n = payload.length >= 2 ? readU16(payload, 0) : 1;
+      this.streams.get(conn)?.grant(n);
+      return;
+    }
+    if (type === RECORD.rekey) {
+      if (this.initiator) return;
+      const next = await this.deriveNext(this.recvLive, payload);
+      this.recvLive = next;
+      this.sendLive = next;
+      this.live = next;
+      return;
+    }
     if (type === RECORD.close) {
       this.streams.get(conn)?.finish();
       return;
@@ -3545,8 +3741,8 @@ var LexSession = class {
     if (type === RECORD.data) {
       const stream = this.streams.get(conn);
       if (!stream || stream.ended) return;
-      if (stream.chunks.length > 256) {
-        this.shutdown();
+      if (stream.queued() > 32) {
+        void stream.close();
         return;
       }
       stream.push(payload);
@@ -3556,39 +3752,46 @@ var LexSession = class {
     try {
       for (; ; ) {
         const prose = await this.pipe.read();
-        const dir = this.initiator ? "g2e" : "e2g";
-        const opened = await open({
-          key: this.live.sk,
-          inverse: this.live.inverse,
-          window: this.live.window,
-          direction: dir,
-          prose,
-          lastSeen: this.live.seen[dir],
-          honey: this.live.honey
-        });
+        let opened;
+        try {
+          opened = await this.openLive(this.recvLive, prose);
+        } catch (err2) {
+          if (this.sendLive === this.recvLive) throw err2;
+          opened = await this.openLive(this.sendLive, prose);
+          this.recvLive = this.sendLive;
+          this.live = this.sendLive;
+          this.rekeyBusy = false;
+        }
         if (opened.honey) continue;
-        this.live = { ...this.live, seen: { ...this.live.seen, [dir]: opened.counter } };
+        this.lastRx = Date.now();
         const raw = await unpackRecord(opened.plaintext);
         const rec = decodeRecord(raw);
         await this.onRecord(rec.type, rec.conn, rec.payload);
       }
-    } catch {
+    } catch (err2) {
+      const message = err2 instanceof Error ? err2.message : String(err2);
+      if (!this.closed && message !== "\u8FDE\u63A5\u5173\u95ED") console.error("\u8BCD\u9699\u4F1A\u8BDD\u7ED3\u675F", message);
       this.shutdown();
     }
   }
 };
-async function sessionFrom(pipe, live, initiator, zstd, maxStreams, heartbeatMs, onStream) {
-  const session = new LexSession(pipe, live, initiator, zstd, maxStreams, heartbeatMs);
+async function sessionFrom(pipe, live, initiator, zstd, maxStreams, heartbeatMs, onStream, rekeyAt = 16776960, peerId = "", onReady) {
+  pipe.setCap?.(FRAME_CAP);
+  const session = new LexSession(pipe, live, initiator, zstd, maxStreams, heartbeatMs, rekeyAt);
+  session.peerId = peerId;
   if (onStream) session.onStream = onStream;
+  onReady?.(session);
   void session.readLoop();
   return session;
 }
 async function connectSession(opts) {
   const self = { ...opts.self, role: "edge" };
-  const pending = await edgeStart(self, Date.now(), opts.offer);
+  const token = opts.token || "";
+  const wait = opts.handshakeMs ?? 1e4;
+  const pending = await edgeStart(self, Date.now(), opts.offer, token);
   await opts.pipe.write(pending.helloWire);
-  const serverWire = await opts.pipe.read();
-  const finished = await edgeFinish(self, pending, opts.peerRawB64, serverWire);
+  const serverWire = await opts.pipe.read(wait);
+  const finished = await edgeFinish(self, pending, opts.peerRawB64, serverWire, token);
   await opts.pipe.write(finished.finishWire);
   const live = await openSession({
     edge: self,
@@ -3602,17 +3805,31 @@ async function connectSession(opts) {
     honey: finished.honey,
     kdfMs: finished.kdfMs
   });
-  return sessionFrom(opts.pipe, live, true, opts.zstd || { enabled: false, level: 3 }, opts.maxStreams || 128, opts.heartbeatMs ?? 15e3, opts.onStream);
+  return sessionFrom(
+    opts.pipe,
+    live,
+    true,
+    opts.zstd || { enabled: false, level: 3 },
+    opts.maxStreams || 128,
+    opts.heartbeatMs ?? 15e3,
+    opts.onStream,
+    opts.rekeyAt,
+    opts.peerId || "",
+    opts.onReady
+  );
 }
 async function acceptSession(opts) {
   const self = { ...opts.self, role: "gate" };
-  const helloWire = await opts.pipe.read();
+  const wait = opts.handshakeMs ?? 1e4;
+  const helloWire = await opts.pipe.read(wait);
   let pending = null;
+  let matched = "";
   let last = "\u6CA1\u6709\u5339\u914D\u7684\u8282\u70B9\u516C\u94A5";
   for (const peer of opts.peers) {
     if (!peer.publicRawB64) continue;
     try {
-      pending = await gateRespond(self, peer.publicRawB64, helloWire);
+      pending = await gateRespond(self, peer.publicRawB64, helloWire, { token: opts.token, kdf: opts.kdf });
+      matched = peer.id || "";
       break;
     } catch (err2) {
       const message = err2 instanceof Error ? err2.message : String(err2);
@@ -3622,11 +3839,11 @@ async function acceptSession(opts) {
   }
   if (!pending) throw new Error(last);
   await opts.pipe.write(pending.serverWire);
-  const finishWire = await opts.pipe.read();
+  const finishWire = await opts.pipe.read(wait);
   await gateAccept(pending, finishWire);
   const honey = honeyFromFeatures(pending.features);
   const live = await openSession({
-    edge: { ...self, id: "peer", name: "\u5BF9\u7AEF", role: "edge", publicRawB64: b64(pending.ltC) },
+    edge: { ...self, id: matched || "peer", name: "\u5BF9\u7AEF", role: "edge", publicRawB64: b64(pending.ltC) },
     gate: self,
     sk: pending.sk,
     window: pending.window,
@@ -3637,7 +3854,18 @@ async function acceptSession(opts) {
     honey,
     kdfMs: 0
   });
-  return sessionFrom(opts.pipe, live, false, opts.zstd || { enabled: false, level: 3 }, opts.maxStreams || 128, opts.heartbeatMs ?? 15e3, opts.onStream);
+  return sessionFrom(
+    opts.pipe,
+    live,
+    false,
+    opts.zstd || { enabled: false, level: 3 },
+    opts.maxStreams || 128,
+    opts.heartbeatMs ?? 15e3,
+    opts.onStream,
+    opts.rekeyAt,
+    matched,
+    opts.onReady
+  );
 }
 async function pipeMux(left, right) {
   const pump = async (src, dst) => {
@@ -3658,6 +3886,53 @@ async function pipeMux(left, right) {
   void pump(left, right);
   void pump(right, left);
 }
+if (!isMainThread && parentPort) {
+  parentPort.on("message", (msg) => {
+    try {
+      const out = deriveSessionKey(msg.ssE, msg.ssS, msg.nonceC, msg.nonceS, msg.window, msg.features, msg.params);
+      parentPort?.postMessage({ id: msg.id, key: out.key, ms: out.ms });
+    } catch (err2) {
+      parentPort?.postMessage({ id: msg.id, error: err2 instanceof Error ? err2.message : String(err2) });
+    }
+  });
+}
+var kdfWorker = null;
+var kdfSeq = 0;
+var kdfInflight = 0;
+var kdfMax = 2;
+var kdfWait = /* @__PURE__ */ new Map();
+function startKdfPool(maxConcurrent = 2) {
+  kdfMax = Math.max(1, Math.min(8, maxConcurrent || 2));
+  if (isMainThread && !kdfWorker) {
+    kdfWorker = new Worker(new URL(import.meta.url));
+    kdfWorker.unref?.();
+    kdfWorker.on("message", (msg) => {
+      const job = kdfWait.get(msg.id);
+      if (!job) return;
+      kdfWait.delete(msg.id);
+      if (msg.error || !msg.key) job.reject(new Error(msg.error || "\u6D3E\u751F\u5931\u8D25"));
+      else job.resolve({ key: new Uint8Array(msg.key), ms: msg.ms || 1 });
+    });
+    kdfWorker.on("error", (err2) => {
+      for (const job of kdfWait.values()) job.reject(err2 instanceof Error ? err2 : new Error(String(err2)));
+      kdfWait.clear();
+    });
+  }
+  setSessionKeyDeriver(async (ssE, ssS, nonceC, nonceS, window, features, params) => {
+    if (!kdfWorker) return deriveSessionKey(ssE, ssS, nonceC, nonceS, window, features, params);
+    if (kdfInflight >= kdfMax) throw new Error("\u63E1\u624B\u592A\u591A");
+    kdfInflight += 1;
+    const id = ++kdfSeq;
+    try {
+      return await new Promise((resolve, reject) => {
+        kdfWait.set(id, { resolve, reject });
+        kdfWorker?.postMessage({ id, ssE, ssS, nonceC, nonceS, window, features, params });
+      });
+    } finally {
+      kdfInflight -= 1;
+    }
+  });
+}
 export {
   LexSession,
   MuxStream,
@@ -3670,6 +3945,7 @@ export {
   nodeFromIdentity,
   parseOpen,
   pipeMux,
+  startKdfPool,
   tcpPipe,
   wsClientPipe,
   wsServerPipe

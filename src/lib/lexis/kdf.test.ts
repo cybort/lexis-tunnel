@@ -28,7 +28,7 @@ async function makeNode(name: string, role: MeshNode["role"]): Promise<MeshNode>
 
 async function main() {
   const clamped = clampKdf({ memoryKiB: 999999, iterations: 9, parallelism: 4 });
-  assert.equal(clamped.memoryKiB, 65536);
+  assert.equal(clamped.memoryKiB, 16384);
   assert.equal(clamped.iterations, 4);
   assert.equal(clamped.parallelism, 2);
 

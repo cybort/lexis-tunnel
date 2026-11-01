@@ -3,7 +3,10 @@ set -eu
 HERE=$(CDPATH= cd -- "$(dirname "$0")" && pwd)
 DEST="${HOME}/.lexis"
 mkdir -p "$DEST"
-cp "$HERE/lexis-agent.mjs" "$HERE/lexis-frame.mjs" "$HERE/zstd.wasm" "$HERE/lexis-tls.crt" "$HERE/lexis-tls.key" "$HERE/lexis.config.json" "$DEST/"
+cp "$HERE/lexis-agent.mjs" "$HERE/lexis-frame.mjs" "$HERE/zstd.wasm" "$HERE/lexis.config.json" "$DEST/"
+if [ -f "$HERE/lexis-tls.crt" ] && [ -f "$HERE/lexis-tls.key" ]; then
+  cp "$HERE/lexis-tls.crt" "$HERE/lexis-tls.key" "$DEST/"
+fi
 if ! command -v node >/dev/null 2>&1; then
   echo "在 Termux 里先安装 Node.js 22：pkg install nodejs"
   exit 1

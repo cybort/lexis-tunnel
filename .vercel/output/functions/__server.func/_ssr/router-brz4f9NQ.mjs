@@ -2,8 +2,8 @@ import { i as __toESM, n as __exportAll } from "../_runtime.mjs";
 import { _ as createFileRoute, b as useRouter, d as Scripts, f as HeadContent, g as lazyRouteComponent, h as Outlet, m as createRouter, q as require_react, v as createRootRoute, x as require_jsx_runtime } from "../_libs/@tanstack/react-router+[...].mjs";
 import { t as TriangleAlert } from "../_libs/lucide-react.mjs";
 import { a as union, i as string, n as number, r as object, t as literal } from "../_libs/zod.mjs";
-//#region node_modules/.nitro/vite/services/ssr/assets/router-p8iLxh77.js
-var router_p8iLxh77_exports = /* @__PURE__ */ __exportAll({ getRouter: () => getRouter });
+//#region node_modules/.nitro/vite/services/ssr/assets/router-brz4f9NQ.js
+var router_brz4f9NQ_exports = /* @__PURE__ */ __exportAll({ getRouter: () => getRouter });
 var import_react = /* @__PURE__ */ __toESM(require_react());
 var import_jsx_runtime = require_jsx_runtime();
 var FALLBACK_MESSAGE = "An unexpected error occurred. Try reloading the page.";
@@ -331,7 +331,7 @@ function PreviewHostBridge() {
 	}, [router]);
 	return null;
 }
-var styles_default = "/assets/styles-DYfSzxhz.css";
+var styles_default = "/assets/styles-BEMDtH7h.css";
 var APP_NAME = "词隙 LEXIS";
 var Route$2 = createRootRoute({
 	head: () => ({
@@ -381,9 +381,9 @@ var Route$2 = createRootRoute({
 		] })]
 	})
 });
-var $$splitComponentImporter$1 = () => import("./routes-DVHxtgRZ.mjs");
+var $$splitComponentImporter$1 = () => import("./routes-BVoH_aPG.mjs");
 var Route$1 = createFileRoute("/")({ component: lazyRouteComponent($$splitComponentImporter$1, "component") });
-var $$splitComponentImporter = () => import("./download-BLvetMmf.mjs");
+var $$splitComponentImporter = () => import("./download-DmPibeet.mjs");
 var Route = createFileRoute("/download")({ component: lazyRouteComponent($$splitComponentImporter, "component") });
 var rootRouteChildren = {
 	IndexRoute: Route$1.update({
@@ -406,4 +406,4 @@ function getRouter() {
 	});
 }
 //#endregion
-export { getRouter, router_p8iLxh77_exports as t };
+export { getRouter, router_brz4f9NQ_exports as t };

@@ -177,6 +177,8 @@ export function NodesPanel() {
                 publicRawB64: node.publicRawB64,
                 wsPath: profile.outer.wsPath,
                 wsHost: "",
+                relay: false,
+                targets: [],
               };
               patch({ peers: [...profile.peers.filter((peer) => peer.id !== node.id), next] });
             }}

@@ -12,9 +12,10 @@ import {
   type KeyMaterial,
 } from "./crypto";
 import {
+  clampKdf,
   clampOffer,
   decodeKdf,
-  deriveSessionKey,
+  deriveSessionKeyAsync,
   encodeKdf,
   featureByte,
   honeyFromFeatures,
@@ -79,6 +80,54 @@ export function windowRemain(now = Date.now()): number {
   return SPEC.windowSec - (sec % SPEC.windowSec);
 }
 
+const HELLO_CORE = 2 + 65 + 65 + 4 + 16 + 4 + 1;
+const SERVER_CORE = 2 + 65 + 65 + 16 + 16 + 4 + 1;
+const seenHellos = new Map<number, Set<string>>();
+
+export function resetHandshakeGuards() {
+  seenHellos.clear();
+}
+
+/** Current window, plus the previous one only in the first 20 seconds (clock skew). */
+export function assertHelloWindow(helloWindow: number, now = Date.now()) {
+  const current = currentWindow(now);
+  const into = Math.floor(now / 1000) % SPEC.windowSec;
+  const ok = helloWindow === current || (helloWindow === current - 1 && into < 20);
+  if (!ok) throw new LexisError("握手时间窗已经过期");
+}
+
+function nonceId(nonce: Uint8Array): string {
+  let hex = "";
+  for (const b of nonce) hex += b.toString(16).padStart(2, "0");
+  return hex;
+}
+
+export function claimHello(window: number, nonce: Uint8Array) {
+  for (const key of [...seenHellos.keys()]) {
+    if (key < window - 1) seenHellos.delete(key);
+  }
+  let bag = seenHellos.get(window);
+  if (!bag) {
+    bag = new Set();
+    seenHellos.set(window, bag);
+  }
+  const id = nonceId(nonce);
+  if (bag.has(id)) throw new LexisError("握手被重放");
+  if (bag.size >= 4096) throw new LexisError("这个时间窗的握手太多");
+  bag.add(id);
+}
+
+async function tokenMac(token: string, body: Uint8Array): Promise<Uint8Array> {
+  return (await hmac(utf8(token), concat(utf8("lexis-admit-v1"), body))).subarray(0, 16);
+}
+
+export type AdmitOpts = {
+  token?: string;
+  /** Gate's own Argon2 parameters. The client's offer cannot raise this cost. */
+  kdf?: ArgonParams;
+  now?: number;
+};
+
 function transcript(parts: {
   ephC: Uint8Array;
   ephS: Uint8Array;
@@ -104,7 +153,12 @@ function transcript(parts: {
   );
 }
 
-export async function edgeStart(edge: MeshNode, now = Date.now(), offer?: Partial<SessionOffer>): Promise<EdgePending> {
+export async function edgeStart(
+  edge: MeshNode,
+  now = Date.now(),
+  offer?: Partial<SessionOffer>,
+  token = "",
+): Promise<EdgePending> {
   const wanted = clampOffer(offer);
   const eph = await createIdentity();
   const ltRaw = unb64(edge.publicRawB64);
@@ -112,7 +166,7 @@ export async function edgeStart(edge: MeshNode, now = Date.now(), offer?: Partia
   assertPoint(eph.publicRaw, "内网端临时");
   const nonceC = crypto.getRandomValues(new Uint8Array(16));
   const window = currentWindow(now);
-  const blob = concat(
+  let blob = concat(
     new Uint8Array([1, 1]),
     eph.publicRaw,
     ltRaw,
@@ -121,13 +175,15 @@ export async function edgeStart(edge: MeshNode, now = Date.now(), offer?: Partia
     encodeKdf(wanted),
     new Uint8Array([featureByte(wanted.honey)]),
   );
+  if (token) blob = concat(blob, await tokenMac(token, blob));
   const helloWire = await encodeStatic(blob);
   return { eph, nonceC, window, helloWire, ltRaw };
 }
 
 function parseHello(buf: Uint8Array) {
-  if (buf.length !== 2 + 65 + 65 + 4 + 16 + 4 + 1) throw new LexisError("客户端问候长度不对");
+  if (buf.length !== HELLO_CORE && buf.length !== HELLO_CORE + 16) throw new LexisError("客户端问候长度不对");
   if (buf[0] !== 1 || buf[1] !== 1) throw new LexisError("客户端问候版本不对");
+  const mac = buf.length === HELLO_CORE + 16 ? buf.slice(HELLO_CORE) : null;
   const ephRaw = buf.slice(2, 67);
   const ltRaw = buf.slice(67, 132);
   const window = (buf[132] << 24) | (buf[133] << 16) | (buf[134] << 8) | buf[135];
@@ -136,12 +192,13 @@ function parseHello(buf: Uint8Array) {
   const features = buf[156];
   assertPoint(ephRaw, "对端临时");
   assertPoint(ltRaw, "对端长期");
-  return { ephRaw, ltRaw, window: window >>> 0, nonce, kdf, features };
+  return { ephRaw, ltRaw, window: window >>> 0, nonce, kdf, features, mac };
 }
 
 function parseServer(buf: Uint8Array) {
-  if (buf.length !== 2 + 65 + 65 + 16 + 16 + 4 + 1) throw new LexisError("服务端问候长度不对");
+  if (buf.length !== SERVER_CORE && buf.length !== SERVER_CORE + 16) throw new LexisError("服务端问候长度不对");
   if (buf[0] !== 1 || buf[1] !== 2) throw new LexisError("服务端问候版本不对");
+  const mac = buf.length === SERVER_CORE + 16 ? buf.slice(SERVER_CORE) : null;
   const ephRaw = buf.slice(2, 67);
   const ltRaw = buf.slice(67, 132);
   const nonce = buf.slice(132, 148);
@@ -150,27 +207,40 @@ function parseServer(buf: Uint8Array) {
   const features = buf[168];
   assertPoint(ephRaw, "闸门临时");
   assertPoint(ltRaw, "闸门长期");
-  return { ephRaw, ltRaw, nonce, confirm, kdf, features };
+  return { ephRaw, ltRaw, nonce, confirm, kdf, features, mac };
 }
 
 export async function gateRespond(
   gate: MeshNode,
   peerRawB64: string,
   helloWire: string,
+  opts: AdmitOpts = {},
 ): Promise<GatePending> {
-  const hello = parseHello(await decodeStatic(helloWire));
+  const raw = await decodeStatic(helloWire);
+  const hello = parseHello(raw);
+  assertHelloWindow(hello.window, opts.now ?? Date.now());
+  const token = opts.token || "";
+  if (token) {
+    if (!hello.mac) throw new LexisError("缺少握手口令");
+    const expect = await tokenMac(token, raw.slice(0, HELLO_CORE));
+    if (!timingSafeEqual(expect, hello.mac)) throw new LexisError("握手口令不对");
+  } else if (hello.mac) {
+    throw new LexisError("对端带了口令，这边没有");
+  }
   const pinned = unb64(peerRawB64);
   if (!timingSafeEqual(hello.ltRaw, pinned)) {
     throw new LexisError("内网端长期公钥和闸门上的绑定不一致");
   }
+  claimHello(hello.window, hello.nonce);
   const ephS = await createIdentity();
   const ltS = unb64(gate.publicRawB64);
   const nonceS = crypto.getRandomValues(new Uint8Array(16));
   const ssE = await ecdh(await importPrivateJwk(ephS.privateJwk), await importRawPublic(hello.ephRaw));
   const ssS = await ecdh(await importPrivateJwk(gate.privateJwk), await importRawPublic(hello.ltRaw));
-  const kdfBytes = encodeKdf(hello.kdf);
+  const agreed = clampKdf(opts.kdf ?? hello.kdf);
+  const kdfBytes = encodeKdf(agreed);
   const features = hello.features & 0xff;
-  const derived = deriveSessionKey(ssE, ssS, hello.nonce, nonceS, hello.window, features, hello.kdf);
+  const derived = await deriveSessionKeyAsync(ssE, ssS, hello.nonce, nonceS, hello.window, features, agreed);
   const sk = derived.key;
   const tr = transcript({
     ephC: hello.ephRaw,
@@ -185,7 +255,8 @@ export async function gateRespond(
   });
   const confirmS = (await hmac(sk, concat(utf8("lexis-srv-v1"), tr))).subarray(0, 16);
   const expectFinish = (await hmac(sk, concat(utf8("lexis-cli-v1"), tr))).subarray(0, 16);
-  const blob = concat(new Uint8Array([1, 2]), ephS.publicRaw, ltS, nonceS, confirmS, kdfBytes, new Uint8Array([features]));
+  let blob = concat(new Uint8Array([1, 2]), ephS.publicRaw, ltS, nonceS, confirmS, kdfBytes, new Uint8Array([features]));
+  if (token) blob = concat(blob, await tokenMac(token, blob));
   const serverWire = await encodeStatic(blob);
   return {
     sk,
@@ -198,7 +269,7 @@ export async function gateRespond(
     nonceS,
     serverWire,
     expectFinish,
-    kdf: hello.kdf,
+    kdf: agreed,
     features,
   };
 }
@@ -208,11 +279,20 @@ export async function edgeFinish(
   pending: EdgePending,
   gateRawB64: string,
   serverWire: string,
+  token = "",
 ): Promise<{ sk: Uint8Array; finishWire: string; window: number; kdf: ArgonParams; honey: boolean; kdfMs: number }> {
-  const server = parseServer(await decodeStatic(serverWire));
+  const raw = await decodeStatic(serverWire);
+  const server = parseServer(raw);
   const pinned = unb64(gateRawB64);
   if (!timingSafeEqual(server.ltRaw, pinned)) {
     throw new LexisError("闸门长期公钥和内网端上的绑定不一致");
+  }
+  if (token) {
+    if (!server.mac) throw new LexisError("闸门没有带回口令");
+    const expectMac = await tokenMac(token, raw.slice(0, SERVER_CORE));
+    if (!timingSafeEqual(expectMac, server.mac)) throw new LexisError("握手口令不对");
+  } else if (server.mac) {
+    throw new LexisError("对端带了口令，这边没有");
   }
   const ssE = await ecdh(
     await importPrivateJwk(pending.eph.privateJwk),
@@ -223,7 +303,7 @@ export async function edgeFinish(
     await importRawPublic(server.ltRaw),
   );
   const features = server.features & 0xff;
-  const derived = deriveSessionKey(ssE, ssS, pending.nonceC, server.nonce, pending.window, features, server.kdf);
+  const derived = await deriveSessionKeyAsync(ssE, ssS, pending.nonceC, server.nonce, pending.window, features, server.kdf);
   const sk = derived.key;
   const tr = transcript({
     ephC: pending.eph.publicRaw,

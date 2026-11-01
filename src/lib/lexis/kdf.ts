@@ -19,7 +19,7 @@ export const DEFAULT_KDF: ArgonParams = {
 };
 
 const LIMITS = {
-  memoryKiB: { min: 8, max: 65536 },
+  memoryKiB: { min: 8, max: 16384 },
   iterations: { min: 1, max: 4 },
   parallelism: { min: 1, max: 2 },
 };
@@ -132,4 +132,37 @@ export function deriveSessionKey(
     dkLen: 32,
   });
   return { key, ms: Math.max(1, Date.now() - t0) };
+}
+
+type SessionDeriver = (
+  ssE: Uint8Array,
+  ssS: Uint8Array,
+  nonceC: Uint8Array,
+  nonceS: Uint8Array,
+  window: number,
+  features: number,
+  params: ArgonParams,
+) => Promise<{ key: Uint8Array; ms: number }>;
+
+let sessionDeriver: SessionDeriver = async (ssE, ssS, nonceC, nonceS, window, features, params) =>
+  deriveSessionKey(ssE, ssS, nonceC, nonceS, window, features, params);
+
+/** Node agent points this at a worker pool. The browser keeps the inline call. */
+export function setSessionKeyDeriver(fn: SessionDeriver | null) {
+  sessionDeriver =
+    fn ??
+    (async (ssE, ssS, nonceC, nonceS, window, features, params) =>
+      deriveSessionKey(ssE, ssS, nonceC, nonceS, window, features, params));
+}
+
+export function deriveSessionKeyAsync(
+  ssE: Uint8Array,
+  ssS: Uint8Array,
+  nonceC: Uint8Array,
+  nonceS: Uint8Array,
+  window: number,
+  features: number,
+  params: ArgonParams,
+) {
+  return sessionDeriver(ssE, ssS, nonceC, nonceS, window, features, params);
 }
