@@ -2,6 +2,7 @@ import { useState } from "react";
 import { fromUtf8, hex, isPrintableText, randomBytes, utf8 } from "@/lib/lexis/bytes";
 import { entropyPair } from "@/lib/lexis/entropy";
 import { establish, type LiveSession } from "@/lib/lexis/handshake";
+import { programFromStored } from "@/lib/lexis/honey";
 import { LexisError } from "@/lib/lexis/crypto";
 import { invertLexicon, sessionLexicon } from "@/lib/lexis/lexicon";
 import { packPayload, unpackPayload } from "@/lib/lexis/pack";
@@ -288,6 +289,7 @@ export function Bench({
         prose: lastFrame.prose,
         lastSeen: 0,
         honey: session.honey,
+        program: programFromStored(profile.honeyProgram),
       });
       const text = isPrintableText(opened.plaintext) ? fromUtf8(opened.plaintext) : hex(opened.plaintext);
       push({

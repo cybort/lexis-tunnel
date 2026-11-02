@@ -16,7 +16,7 @@ import { createRequire } from "node:module";
 import { platform } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { acceptSession, connectSession, dialOuter, hopCount, listenOuter, nodeFromIdentity, parseOpen, pipeMux, startKdfPool } from "./lexis-frame.mjs";
+import { acceptSession, connectSession, dialOuter, hopCount, listenOuter, nodeFromIdentity, parseOpen, pipeMux, programFromStored, startKdfPool } from "./lexis-frame.mjs";
 import { serveHttpProxy, classifyFraming, hostsAgree, sanitizeHeaders } from "./lexis-http.mjs";
 import { buildTcpPacket, createEngine, parseIpv4, parseTcp, redirectTcp } from "./lexis-tun.mjs";
 
@@ -537,6 +537,7 @@ async function sessionFor(config, peer) {
       maxStreams: link.maxConns,
       heartbeatMs: Math.max(5, config.heartbeatSec || 15) * 1000,
       handshakeMs: link.handshakeMs,
+      program: programFromStored(config.honeyProgram),
       peerId: peer.id || "",
       onStream: (stream) => void handleRemoteStream(stream, config, { peerId: stream.session.peerId || peer.id || "" }),
     });
@@ -862,6 +863,7 @@ async function acceptTunnel(socket, pipeReady, config) {
       maxStreams: link.maxConns,
       heartbeatMs: Math.max(5, config.heartbeatSec || 15) * 1000,
       handshakeMs: link.handshakeMs,
+      program: programFromStored(config.honeyProgram),
       sourceIp: sourceIp(socket),
       onReady: (ready) => {
         if (ready.peerId) inboundSessions.set(ready.peerId, ready);

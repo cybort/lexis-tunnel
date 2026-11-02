@@ -85,15 +85,29 @@ export function staticLexicon(): Promise<string[]> {
   return staticCache;
 }
 
-/** Secret codebook: HKDF(sessionKey, window) then the same generator both ends run. */
+/** Secret codebook: HKDF(key, window) then the same generator. Any key yields a lexicon of the same shape. */
+const lexiconCache = new Map<string, Promise<string[]>>();
+
+function cacheId(key: Uint8Array, window: number): string {
+  let hex = `${window}:`;
+  for (const b of key) hex += b.toString(16).padStart(2, "0");
+  return hex;
+}
+
 export async function sessionLexicon(sessionKey: Uint8Array, window: number): Promise<string[]> {
-  const seed = await hkdfStream(
-    sessionKey,
-    utf8("LEXIS-LEX-SALT"),
-    `win-${window}`,
-    32,
-  );
-  return buildLexicon(seed);
+  const id = cacheId(sessionKey, window);
+  const hit = lexiconCache.get(id);
+  if (hit) return hit;
+  const pending = (async () => {
+    const seed = await hkdfStream(sessionKey, utf8("LEXIS-LEX-SALT"), `win-${window}`, 32);
+    return buildLexicon(seed);
+  })();
+  lexiconCache.set(id, pending);
+  if (lexiconCache.size > 32) {
+    const oldest = lexiconCache.keys().next().value;
+    if (oldest !== undefined) lexiconCache.delete(oldest);
+  }
+  return pending;
 }
 
 export function invertLexicon(words: string[]): Map<string, number> {

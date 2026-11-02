@@ -1,13 +1,16 @@
-import { useRef, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { Download, Trash2 } from "lucide-react";
 import { b64, randomBytes } from "@/lib/lexis/bytes";
 import { identityFromJwks, LexisError } from "@/lib/lexis/crypto";
+import { currentWindow } from "@/lib/lexis/handshake";
+import { openIdentityVault, privateScalar, sealIdentityVault, vaultFromStored, vaultToStored } from "@/lib/lexis/honey";
 import { clampKdf, deriveIdentity } from "@/lib/lexis/kdf";
+import { sessionLexicon } from "@/lib/lexis/lexicon";
 import { useProfile } from "@/lib/lexis/profile-store";
 import type { NetPeer } from "@/lib/lexis/profile";
 import { SPEC } from "@/lib/lexis/spec";
 import { downloadJson, makeNode, sidecarOf, useMesh } from "@/lib/lexis/store";
-import type { MeshNode, NodeKdf, NodeRole } from "@/lib/lexis/types";
+import type { MeshNode, NodeKdf, NodeRole, StoredVault } from "@/lib/lexis/types";
 import { Btn, control, Field } from "./ui";
 
 function roleLabel(role: NodeRole) {
@@ -19,6 +22,11 @@ function readKdf(value: unknown): NodeKdf | null {
   const raw = value as Partial<NodeKdf>;
   if (typeof raw.saltB64 !== "string" || !raw.saltB64) return null;
   return { saltB64: raw.saltB64, ...clampKdf(raw) };
+}
+
+function readVault(value: unknown): StoredVault | null {
+  const vault = vaultFromStored(value);
+  return vault ? vaultToStored(vault) : null;
 }
 
 export function NodesPanel() {
@@ -68,6 +76,7 @@ export function NodesPanel() {
         pinnedPeerId: null,
         createdAt: Date.now(),
         kdf: readKdf(data.kdf),
+        vault: readVault(data.vault),
       };
       addNode(node);
       const peerFp = data.pinnedPeerFingerprint;
@@ -80,10 +89,15 @@ export function NodesPanel() {
     }
   }
 
-  async function deriveNode(id: string, passphrase: string) {
+  async function deriveNode(id: string, passphrase: string, spare: string) {
     const trimmed = passphrase.trim();
+    const alt = spare.trim();
     if (!trimmed) {
       setError("先写口令");
+      return;
+    }
+    if (alt && alt === trimmed) {
+      setError("备用口令要和原口令不同");
       return;
     }
     setBusy(true);
@@ -91,17 +105,56 @@ export function NodesPanel() {
     try {
       const params = clampKdf(useProfile.getState().profile.kdf);
       const salt = randomBytes(16);
-      const ident = await deriveIdentity(trimmed, salt, params);
+      const primary = await deriveIdentity(trimmed, salt, params);
+      const entries = [{ passphrase: trimmed, scalar: privateScalar(primary.privateJwk) }];
+      if (alt) {
+        const other = await deriveIdentity(alt, salt, params);
+        entries.push({ passphrase: alt, scalar: privateScalar(other.privateJwk) });
+      }
+      const sealed = await sealIdentityVault(entries, salt, params, 4);
+      const opened = await openIdentityVault(sealed, trimmed);
       const kdf: NodeKdf = { saltB64: b64(salt), ...params };
       setIdentity(id, {
-        publicJwk: ident.publicJwk,
-        privateJwk: ident.privateJwk,
-        publicRawB64: b64(ident.publicRaw),
-        fingerprint: ident.fingerprint,
+        publicJwk: opened.publicJwk,
+        privateJwk: opened.privateJwk,
+        publicRawB64: b64(opened.publicRaw),
+        fingerprint: opened.fingerprint,
         kdf,
+        vault: vaultToStored(sealed),
       });
     } catch (err) {
       setError(err instanceof Error ? err.message : "派生失败");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function unlockNode(id: string, passphrase: string) {
+    const trimmed = passphrase.trim();
+    if (!trimmed) {
+      setError("先写口令");
+      return;
+    }
+    const node = useMesh.getState().nodes.find((item) => item.id === id);
+    const sealed = node?.vault ? vaultFromStored(node.vault) : null;
+    if (!node || !sealed) {
+      setError("这把私钥还没有封存");
+      return;
+    }
+    setBusy(true);
+    setError(null);
+    try {
+      const opened = await openIdentityVault(sealed, trimmed);
+      setIdentity(id, {
+        publicJwk: opened.publicJwk,
+        privateJwk: opened.privateJwk,
+        publicRawB64: b64(opened.publicRaw),
+        fingerprint: opened.fingerprint,
+        kdf: node.kdf,
+        vault: node.vault,
+      });
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "解不开");
     } finally {
       setBusy(false);
     }
@@ -141,7 +194,7 @@ export function NodesPanel() {
       </div>
       {error ? <p className="text-sm text-ember">{error}</p> : null}
       <p className="text-sm text-mist">
-        私钥只留在这台浏览器。口令派生不保存口令，也不存校验位：换一个口令只会得到另一把合法私钥，不会提示口令错误。
+        初始私钥按口令派生后，封成同一条求值的系数，口令本身不留下。任意一句口令都会解开一把合法私钥，再叠上当前时间窗，得到一份同样格式的词表。口令不同，或时间窗不同，词就不同，两句错误口令之间也不会撞成同一份。不会提示哪一句是当初那句。刷新之后标量不在浏览器里，要再解一次。
       </p>
       <div className="grid gap-3 lg:grid-cols-2">
         {nodes.map((node) => (
@@ -153,10 +206,22 @@ export function NodesPanel() {
             onName={(name) => updateNode(node.id, { name })}
             onBind={(peerId) => bindPair(node.id, peerId)}
             onRemove={() => removeNode(node.id)}
-            onDerive={(passphrase) => deriveNode(node.id, passphrase)}
+            onExport={() => {
+              if (node.vault && !node.privateJwk.d) {
+                setError("先解开，导出的侧车才带得走常驻进程要的私钥");
+                return;
+              }
+              downloadJson(`${node.role}-${node.fingerprint}.json`, sidecarOf(node, nodes.find((n) => n.id === node.pinnedPeerId)));
+            }}
+            onDerive={(passphrase, spare) => deriveNode(node.id, passphrase, spare)}
+            onUnlock={(passphrase) => unlockNode(node.id, passphrase)}
             resident={profile.identity?.id === node.id}
             joined={profile.peers.some((peer) => peer.id === node.id)}
-            onResident={() =>
+            onResident={() => {
+              if (node.vault && !node.privateJwk.d) {
+                setError("先解开，常驻身份才拿得到私钥");
+                return;
+              }
               patch({
                 identity: {
                   id: node.id,
@@ -166,8 +231,8 @@ export function NodesPanel() {
                   publicRawB64: node.publicRawB64,
                   fingerprint: node.fingerprint,
                 },
-              })
-            }
+              });
+            }}
             onJoin={() => {
               const next: NetPeer = {
                 id: node.id,
@@ -197,7 +262,9 @@ function NodeCard({
   onName,
   onBind,
   onRemove,
+  onExport,
   onDerive,
+  onUnlock,
   resident,
   joined,
   onResident,
@@ -209,7 +276,9 @@ function NodeCard({
   onName: (name: string) => void;
   onBind: (peerId: string) => void;
   onRemove: () => void;
-  onDerive: (passphrase: string) => Promise<void>;
+  onExport: () => void;
+  onDerive: (passphrase: string, spare: string) => Promise<void>;
+  onUnlock: (passphrase: string) => Promise<void>;
   resident: boolean;
   joined: boolean;
   onResident: () => void;
@@ -217,7 +286,30 @@ function NodeCard({
 }) {
   const [peerId, setPeerId] = useState(node.pinnedPeerId ?? "");
   const [passphrase, setPassphrase] = useState("");
+  const [spare, setSpare] = useState("");
   const [deriving, setDeriving] = useState(false);
+  const [words, setWords] = useState("");
+  const sealed = Boolean(node.vault);
+  const unlocked = Boolean(node.privateJwk.d);
+
+  useEffect(() => {
+    let cancel = false;
+    if (!node.privateJwk.d) {
+      setWords("");
+      return;
+    }
+    void sessionLexicon(privateScalar(node.privateJwk), currentWindow())
+      .then((lex) => {
+        if (!cancel) setWords(`${lex[0]} · ${lex[1]} · ${lex[2]} · ${lex[3]}`);
+      })
+      .catch(() => {
+        if (!cancel) setWords("");
+      });
+    return () => {
+      cancel = true;
+    };
+  }, [node.privateJwk.d, node.fingerprint]);
+
   return (
     <article className="rounded-md border border-line bg-panel p-4">
       <div className="flex items-start justify-between gap-3">
@@ -243,10 +335,13 @@ function NodeCard({
       {node.kdf ? (
         <p className="mt-2 text-sm text-mist">
           Argon2id · 内存 {node.kdf.memoryKiB} KiB · 迭代 {node.kdf.iterations} · 并行 {node.kdf.parallelism}
+          {sealed ? " · 私钥以系数封存" : ""}
         </p>
       ) : (
         <p className="mt-2 text-sm text-mist">这把私钥是随机生成的，还没有用口令派生。</p>
       )}
+      {sealed && !unlocked ? <p className="mt-2 text-sm text-mist">标量不在这台浏览器里。输入任意口令都会解开一把合法私钥。</p> : null}
+      {words ? <p className="mt-2 text-sm text-mist">本窗词表开头：{words}</p> : null}
       <div className="mt-3 flex flex-col gap-2 sm:flex-row">
         <Field label="绑定到">
           <select
@@ -273,10 +368,7 @@ function NodeCard({
         <Btn kind={joined ? "solid" : "ghost"} onClick={onJoin}>
           {joined ? "已在中继名单" : "加入中继名单"}
         </Btn>
-        <Btn
-          kind="ghost"
-          onClick={() => downloadJson(`${node.role}-${node.fingerprint}.json`, sidecarOf(node, peer))}
-        >
+        <Btn kind="ghost" onClick={onExport}>
           <Download className="size-4" aria-hidden="true" />
           导出侧车
         </Btn>
@@ -292,20 +384,49 @@ function NodeCard({
             onChange={(e) => setPassphrase(e.target.value)}
           />
         </Field>
-        <Btn
-          kind="ghost"
-          disabled={deriving || !passphrase.trim()}
-          onClick={() => {
-            setDeriving(true);
-            void onDerive(passphrase).finally(() => {
-              setPassphrase("");
-              setDeriving(false);
-            });
-          }}
-        >
-          {deriving ? "派生中" : "用 Argon2id 派生私钥"}
-        </Btn>
-        <p className="text-sm text-mist">参数用配置页里的内存和迭代。派生会换掉指纹，绑定仍按节点编号。</p>
+        <Field label="备用口令">
+          <input
+            className={control}
+            type="password"
+            autoComplete="off"
+            value={spare}
+            placeholder="只在封存时写入，可留空"
+            aria-label={`${node.name}的备用口令`}
+            onChange={(e) => setSpare(e.target.value)}
+          />
+        </Field>
+        <div className="flex flex-wrap gap-2">
+          <Btn
+            kind="ghost"
+            disabled={deriving || !passphrase.trim()}
+            onClick={() => {
+              setDeriving(true);
+              void onDerive(passphrase, spare).finally(() => {
+                setPassphrase("");
+                setSpare("");
+                setDeriving(false);
+              });
+            }}
+          >
+            {deriving ? "封存中" : "派生并封存"}
+          </Btn>
+          {sealed ? (
+            <Btn
+              kind="ghost"
+              disabled={deriving || !passphrase.trim()}
+              onClick={() => {
+                setDeriving(true);
+                void onUnlock(passphrase).finally(() => {
+                  setPassphrase("");
+                  setDeriving(false);
+                });
+              }}
+            >
+              用这句口令解开
+            </Btn>
+          ) : null}
+        </div>
+        <p className="text-sm text-mist">参数用配置页里的内存和迭代。封存会换掉指纹，绑定仍按节点编号。解开不区分原口令和备用口令。</p>
       </div>
       {node.pinnedPeerId ? (
         <p className="mt-3 text-sm text-mist">已指向 {peer?.name ?? "一个已经删掉的节点"}</p>

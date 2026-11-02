@@ -1,702 +1,5 @@
-var __create = Object.create;
-var __defProp = Object.defineProperty;
-var __getOwnPropDesc = Object.getOwnPropertyDescriptor;
-var __getOwnPropNames = Object.getOwnPropertyNames;
-var __getProtoOf = Object.getPrototypeOf;
-var __hasOwnProp = Object.prototype.hasOwnProperty;
-var __require = /* @__PURE__ */ ((x) => typeof require !== "undefined" ? require : typeof Proxy !== "undefined" ? new Proxy(x, {
-  get: (a, b) => (typeof require !== "undefined" ? require : a)[b]
-}) : x)(function(x) {
-  if (typeof require !== "undefined") return require.apply(this, arguments);
-  throw Error('Dynamic require of "' + x + '" is not supported');
-});
-var __commonJS = (cb, mod) => function __require2() {
-  try {
-    return mod || (0, cb[__getOwnPropNames(cb)[0]])((mod = { exports: {} }).exports, mod), mod.exports;
-  } catch (e) {
-    throw mod = 0, e;
-  }
-};
-var __copyProps = (to, from, except, desc) => {
-  if (from && typeof from === "object" || typeof from === "function") {
-    for (let key2 of __getOwnPropNames(from))
-      if (!__hasOwnProp.call(to, key2) && key2 !== except)
-        __defProp(to, key2, { get: () => from[key2], enumerable: !(desc = __getOwnPropDesc(from, key2)) || desc.enumerable });
-  }
-  return to;
-};
-var __toESM = (mod, isNodeMode, target) => (target = mod != null ? __create(__getProtoOf(mod)) : {}, __copyProps(
-  // If the importer is in node compatibility mode or this is not an ESM
-  // file that has been converted to a CommonJS file using a Babel-
-  // compatible transform (i.e. "__esModule" has not been set), then set
-  // "default" to the CommonJS "module.exports" for node compatibility.
-  isNodeMode || !mod || !mod.__esModule ? __defProp(target, "default", { value: mod, enumerable: true }) : target,
-  mod
-));
-
-// node_modules/@bokuweb/zstd-wasm/dist/common/zstd.js
-var require_zstd = __commonJS({
-  "node_modules/@bokuweb/zstd-wasm/dist/common/zstd.js"(exports) {
-    "use strict";
-    Object.defineProperty(exports, "__esModule", { value: true });
-    exports.Module = void 0;
-    var Module2 = typeof Module2 !== "undefined" ? Module2 : {};
-    exports.Module = Module2;
-    var moduleOverrides2 = {};
-    var key2;
-    for (key2 in Module2) {
-      if (Module2.hasOwnProperty(key2)) {
-        moduleOverrides2[key2] = Module2[key2];
-      }
-    }
-    var arguments_2 = [];
-    var err2 = Module2["printErr"] || console.warn.bind(console);
-    for (key2 in moduleOverrides2) {
-      if (moduleOverrides2.hasOwnProperty(key2)) {
-        Module2[key2] = moduleOverrides2[key2];
-      }
-    }
-    var quit_2 = (status, toThrow) => {
-      throw toThrow;
-    };
-    moduleOverrides2 = null;
-    if (Module2["arguments"])
-      arguments_2 = Module2["arguments"];
-    if (Module2["thisProgram"])
-      thisProgram = Module2["thisProgram"];
-    if (Module2["quit"])
-      quit_2 = Module2["quit"];
-    if (typeof WebAssembly !== "object") {
-      abort2("no native wasm support detected");
-    }
-    var wasmMemory2;
-    var ABORT2 = false;
-    var EXITSTATUS2;
-    var HEAPU82;
-    var HEAP82;
-    function updateMemoryViews2() {
-      var b = wasmMemory2.buffer;
-      Module2["HEAP8"] = HEAP82 = new Int8Array(b);
-      Module2["HEAPU8"] = HEAPU82 = new Uint8Array(b);
-    }
-    var __ATPRERUN__2 = [];
-    var __ATINIT__2 = [];
-    var __ATPOSTRUN__2 = [];
-    var runtimeInitialized2 = false;
-    function preRun2() {
-      if (Module2["preRun"]) {
-        if (typeof Module2["preRun"] == "function")
-          Module2["preRun"] = [Module2["preRun"]];
-        while (Module2["preRun"].length) {
-          addOnPreRun2(Module2["preRun"].shift());
-        }
-      }
-      callRuntimeCallbacks2(__ATPRERUN__2);
-    }
-    function initRuntime2() {
-      runtimeInitialized2 = true;
-      callRuntimeCallbacks2(__ATINIT__2);
-    }
-    function postRun2() {
-      if (Module2["postRun"]) {
-        if (typeof Module2["postRun"] == "function")
-          Module2["postRun"] = [Module2["postRun"]];
-        while (Module2["postRun"].length) {
-          addOnPostRun2(Module2["postRun"].shift());
-        }
-      }
-      callRuntimeCallbacks2(__ATPOSTRUN__2);
-    }
-    function addOnPreRun2(cb) {
-      __ATPRERUN__2.unshift(cb);
-    }
-    function addOnInit2(cb) {
-      __ATINIT__2.unshift(cb);
-    }
-    function addOnPostRun2(cb) {
-      __ATPOSTRUN__2.unshift(cb);
-    }
-    var runDependencies2 = 0;
-    var dependenciesFulfilled2 = null;
-    function addRunDependency2(id) {
-      var _a;
-      runDependencies2++;
-      (_a = Module2["monitorRunDependencies"]) === null || _a === void 0 ? void 0 : _a.call(Module2, runDependencies2);
-    }
-    function removeRunDependency2(id) {
-      var _a;
-      runDependencies2--;
-      (_a = Module2["monitorRunDependencies"]) === null || _a === void 0 ? void 0 : _a.call(Module2, runDependencies2);
-      if (runDependencies2 == 0) {
-        if (dependenciesFulfilled2) {
-          var callback = dependenciesFulfilled2;
-          dependenciesFulfilled2 = null;
-          callback();
-        }
-      }
-    }
-    function abort2(what) {
-      var _a;
-      (_a = Module2["onAbort"]) === null || _a === void 0 ? void 0 : _a.call(Module2, what);
-      what = "Aborted(" + what + ")";
-      err2(what);
-      ABORT2 = true;
-      what += ". Build with -sASSERTIONS for more info.";
-      var e = new WebAssembly.RuntimeError(what);
-      throw e;
-    }
-    function getWasmImports2() {
-      return { a: wasmImports2 };
-    }
-    function getBinaryPromise2(url) {
-      return fetch(url, { credentials: "same-origin" }).then(function(response) {
-        if (!response["ok"]) {
-          throw "failed to load wasm binary file at '" + url + "'";
-        }
-        return response["arrayBuffer"]();
-      });
-    }
-    function init3(filePathOrBuf) {
-      var info = getWasmImports2();
-      function receiveInstance(instance, module2) {
-        wasmExports2 = instance.exports;
-        wasmMemory2 = wasmExports2["f"];
-        updateMemoryViews2();
-        addOnInit2(wasmExports2["g"]);
-        removeRunDependency2("wasm-instantiate");
-        return wasmExports2;
-      }
-      addRunDependency2("wasm-instantiate");
-      function receiveInstantiationResult(result) {
-        receiveInstance(result["instance"]);
-      }
-      function instantiateArrayBuffer(receiver) {
-        return getBinaryPromise2(filePathOrBuf).then(function(binary) {
-          var result = WebAssembly.instantiate(binary, info);
-          return result;
-        }).then(receiver, function(reason) {
-          err2("failed to asynchronously prepare wasm: " + reason);
-          abort2(reason);
-        });
-      }
-      function instantiateAsync() {
-        if (filePathOrBuf && filePathOrBuf.byteLength > 0) {
-          return WebAssembly.instantiate(filePathOrBuf, info).then(receiveInstantiationResult, function(reason) {
-            err2("wasm compile failed: " + reason);
-          });
-        } else if (typeof WebAssembly.instantiateStreaming === "function" && typeof filePathOrBuf === "string" && typeof fetch === "function") {
-          return fetch(filePathOrBuf, { credentials: "same-origin" }).then(function(response) {
-            var result = WebAssembly.instantiateStreaming(response, info);
-            return result.then(receiveInstantiationResult, function(reason) {
-              err2("wasm streaming compile failed: " + reason);
-              err2("falling back to ArrayBuffer instantiation");
-              return instantiateArrayBuffer(receiveInstantiationResult);
-            });
-          });
-        } else {
-          return instantiateArrayBuffer(receiveInstantiationResult);
-        }
-      }
-      if (Module2["instantiateWasm"]) {
-        try {
-          var exports2 = Module2["instantiateWasm"](info, receiveInstance);
-          return exports2;
-        } catch (e) {
-          err2("Module.instantiateWasm callback failed with error: " + e);
-          return false;
-        }
-      }
-      instantiateAsync();
-      return {};
-    }
-    var ExitStatus2 = class {
-      constructor(status) {
-        this.name = "ExitStatus";
-        this.message = `Program terminated with exit(${status})`;
-        this.status = status;
-      }
-    };
-    var callRuntimeCallbacks2 = (callbacks) => {
-      while (callbacks.length > 0) {
-        callbacks.shift()(Module2);
-      }
-    };
-    var noExitRuntime2 = Module2["noExitRuntime"] || true;
-    var __abort_js2 = () => abort2("");
-    var runtimeKeepaliveCounter2 = 0;
-    var __emscripten_runtime_keepalive_clear2 = () => {
-      noExitRuntime2 = false;
-      runtimeKeepaliveCounter2 = 0;
-    };
-    var timers2 = {};
-    var handleException2 = (e) => {
-      if (e instanceof ExitStatus2 || e == "unwind") {
-        return EXITSTATUS2;
-      }
-      quit_2(1, e);
-    };
-    var keepRuntimeAlive2 = () => noExitRuntime2 || runtimeKeepaliveCounter2 > 0;
-    var _proc_exit2 = (code) => {
-      var _a;
-      EXITSTATUS2 = code;
-      if (!keepRuntimeAlive2()) {
-        (_a = Module2["onExit"]) === null || _a === void 0 ? void 0 : _a.call(Module2, code);
-        ABORT2 = true;
-      }
-      quit_2(code, new ExitStatus2(code));
-    };
-    var exitJS2 = (status, implicit) => {
-      EXITSTATUS2 = status;
-      _proc_exit2(status);
-    };
-    var _exit2 = exitJS2;
-    var maybeExit2 = () => {
-      if (!keepRuntimeAlive2()) {
-        try {
-          _exit2(EXITSTATUS2);
-        } catch (e) {
-          handleException2(e);
-        }
-      }
-    };
-    var callUserCallback2 = (func) => {
-      if (ABORT2) {
-        return;
-      }
-      try {
-        func();
-        maybeExit2();
-      } catch (e) {
-        handleException2(e);
-      }
-    };
-    var _emscripten_get_now2 = () => performance.now();
-    var __setitimer_js2 = (which, timeout_ms) => {
-      if (timers2[which]) {
-        clearTimeout(timers2[which].id);
-        delete timers2[which];
-      }
-      if (!timeout_ms)
-        return 0;
-      var id = setTimeout(() => {
-        delete timers2[which];
-        callUserCallback2(() => __emscripten_timeout2(which, _emscripten_get_now2()));
-      }, timeout_ms);
-      timers2[which] = { id, timeout_ms };
-      return 0;
-    };
-    var getHeapMax2 = () => 2147483648;
-    var alignMemory2 = (size, alignment) => Math.ceil(size / alignment) * alignment;
-    var growMemory2 = (size) => {
-      var b = wasmMemory2.buffer;
-      var pages = (size - b.byteLength + 65535) / 65536 | 0;
-      try {
-        wasmMemory2.grow(pages);
-        updateMemoryViews2();
-        return 1;
-      } catch (e) {
-      }
-    };
-    var _emscripten_resize_heap2 = (requestedSize) => {
-      var oldSize = HEAPU82.length;
-      requestedSize >>>= 0;
-      var maxHeapSize = getHeapMax2();
-      if (requestedSize > maxHeapSize) {
-        return false;
-      }
-      for (var cutDown = 1; cutDown <= 4; cutDown *= 2) {
-        var overGrownHeapSize = oldSize * (1 + 0.2 / cutDown);
-        overGrownHeapSize = Math.min(overGrownHeapSize, requestedSize + 100663296);
-        var newSize = Math.min(maxHeapSize, alignMemory2(Math.max(requestedSize, overGrownHeapSize), 65536));
-        var replacement = growMemory2(newSize);
-        if (replacement) {
-          return true;
-        }
-      }
-      return false;
-    };
-    var wasmImports2 = {
-      c: __abort_js2,
-      b: __emscripten_runtime_keepalive_clear2,
-      d: __setitimer_js2,
-      e: _emscripten_resize_heap2,
-      a: _proc_exit2
-    };
-    var wasmExports2;
-    var _ZSTD_isError2 = Module2["_ZSTD_isError"] = (a0) => (_ZSTD_isError2 = Module2["_ZSTD_isError"] = wasmExports2["h"])(a0);
-    var _ZSTD_compressBound2 = Module2["_ZSTD_compressBound"] = (a0) => (_ZSTD_compressBound2 = Module2["_ZSTD_compressBound"] = wasmExports2["i"])(a0);
-    var _ZSTD_createCCtx2 = Module2["_ZSTD_createCCtx"] = () => (_ZSTD_createCCtx2 = Module2["_ZSTD_createCCtx"] = wasmExports2["j"])();
-    var _ZSTD_freeCCtx2 = Module2["_ZSTD_freeCCtx"] = (a0) => (_ZSTD_freeCCtx2 = Module2["_ZSTD_freeCCtx"] = wasmExports2["k"])(a0);
-    var _ZSTD_compress_usingDict2 = Module2["_ZSTD_compress_usingDict"] = (a0, a1, a2, a3, a4, a5, a6, a7) => (_ZSTD_compress_usingDict2 = Module2["_ZSTD_compress_usingDict"] = wasmExports2["l"])(a0, a1, a2, a3, a4, a5, a6, a7);
-    var _ZSTD_compress2 = Module2["_ZSTD_compress"] = (a0, a1, a2, a3, a4) => (_ZSTD_compress2 = Module2["_ZSTD_compress"] = wasmExports2["m"])(a0, a1, a2, a3, a4);
-    var _ZSTD_createDCtx2 = Module2["_ZSTD_createDCtx"] = () => (_ZSTD_createDCtx2 = Module2["_ZSTD_createDCtx"] = wasmExports2["n"])();
-    var _ZSTD_freeDCtx2 = Module2["_ZSTD_freeDCtx"] = (a0) => (_ZSTD_freeDCtx2 = Module2["_ZSTD_freeDCtx"] = wasmExports2["o"])(a0);
-    var _ZSTD_getFrameContentSize2 = Module2["_ZSTD_getFrameContentSize"] = (a0, a1) => (_ZSTD_getFrameContentSize2 = Module2["_ZSTD_getFrameContentSize"] = wasmExports2["p"])(a0, a1);
-    var _ZSTD_decompress_usingDict2 = Module2["_ZSTD_decompress_usingDict"] = (a0, a1, a2, a3, a4, a5, a6) => (_ZSTD_decompress_usingDict2 = Module2["_ZSTD_decompress_usingDict"] = wasmExports2["q"])(a0, a1, a2, a3, a4, a5, a6);
-    var _ZSTD_decompress2 = Module2["_ZSTD_decompress"] = (a0, a1, a2, a3) => (_ZSTD_decompress2 = Module2["_ZSTD_decompress"] = wasmExports2["r"])(a0, a1, a2, a3);
-    var _malloc2 = Module2["_malloc"] = (a0) => (_malloc2 = Module2["_malloc"] = wasmExports2["s"])(a0);
-    var _free2 = Module2["_free"] = (a0) => (_free2 = Module2["_free"] = wasmExports2["t"])(a0);
-    var __emscripten_timeout2 = (a0, a1) => (__emscripten_timeout2 = wasmExports2["v"])(a0, a1);
-    var calledRun2;
-    dependenciesFulfilled2 = function runCaller2() {
-      if (!calledRun2)
-        run2();
-      if (!calledRun2)
-        dependenciesFulfilled2 = runCaller2;
-    };
-    function run2() {
-      if (runDependencies2 > 0) {
-        return;
-      }
-      preRun2();
-      if (runDependencies2 > 0) {
-        return;
-      }
-      function doRun() {
-        var _a;
-        if (calledRun2)
-          return;
-        calledRun2 = true;
-        Module2["calledRun"] = true;
-        if (ABORT2)
-          return;
-        initRuntime2();
-        (_a = Module2["onRuntimeInitialized"]) === null || _a === void 0 ? void 0 : _a.call(Module2);
-        postRun2();
-      }
-      if (Module2["setStatus"]) {
-        Module2["setStatus"]("Running...");
-        setTimeout(() => {
-          setTimeout(() => Module2["setStatus"](""), 1);
-          doRun();
-        }, 1);
-      } else {
-        doRun();
-      }
-    }
-    Module2["run"] = run2;
-    if (Module2["preInit"]) {
-      if (typeof Module2["preInit"] == "function")
-        Module2["preInit"] = [Module2["preInit"]];
-      while (Module2["preInit"].length > 0) {
-        Module2["preInit"].pop()();
-      }
-    }
-    Module2["init"] = init3;
-  }
-});
-
-// node_modules/@bokuweb/zstd-wasm/dist/common/module.js
-var require_module = __commonJS({
-  "node_modules/@bokuweb/zstd-wasm/dist/common/module.js"(exports) {
-    "use strict";
-    var __awaiter2 = exports && exports.__awaiter || function(thisArg, _arguments, P2, generator) {
-      function adopt(value) {
-        return value instanceof P2 ? value : new P2(function(resolve) {
-          resolve(value);
-        });
-      }
-      return new (P2 || (P2 = Promise))(function(resolve, reject) {
-        function fulfilled(value) {
-          try {
-            step(generator.next(value));
-          } catch (e) {
-            reject(e);
-          }
-        }
-        function rejected(value) {
-          try {
-            step(generator["throw"](value));
-          } catch (e) {
-            reject(e);
-          }
-        }
-        function step(result) {
-          result.done ? resolve(result.value) : adopt(result.value).then(fulfilled, rejected);
-        }
-        step((generator = generator.apply(thisArg, _arguments || [])).next());
-      });
-    };
-    Object.defineProperty(exports, "__esModule", { value: true });
-    exports.Module = exports.waitInitialized = void 0;
-    var zstd_1 = require_zstd();
-    Object.defineProperty(exports, "Module", { enumerable: true, get: function() {
-      return zstd_1.Module;
-    } });
-    var initialized2 = (() => new Promise((resolve) => {
-      zstd_1.Module.onRuntimeInitialized = resolve;
-    }))();
-    var waitInitialized2 = () => __awaiter2(void 0, void 0, void 0, function* () {
-      yield initialized2;
-    });
-    exports.waitInitialized = waitInitialized2;
-  }
-});
-
-// node_modules/@bokuweb/zstd-wasm/dist/common/errors/index.js
-var require_errors = __commonJS({
-  "node_modules/@bokuweb/zstd-wasm/dist/common/errors/index.js"(exports) {
-    "use strict";
-    Object.defineProperty(exports, "__esModule", { value: true });
-    exports.isError = void 0;
-    var module_1 = require_module();
-    var isError2 = (code) => {
-      const _isError = module_1.Module["_ZSTD_isError"];
-      return _isError(code);
-    };
-    exports.isError = isError2;
-  }
-});
-
-// node_modules/@bokuweb/zstd-wasm/dist/common/simple/decompress.js
-var require_decompress = __commonJS({
-  "node_modules/@bokuweb/zstd-wasm/dist/common/simple/decompress.js"(exports) {
-    "use strict";
-    Object.defineProperty(exports, "__esModule", { value: true });
-    exports.decompress = void 0;
-    var module_1 = require_module();
-    var errors_1 = require_errors();
-    var getFrameContentSize2 = (src, size) => {
-      const getSize = module_1.Module["_ZSTD_getFrameContentSize"];
-      return getSize(src, size);
-    };
-    var decompress3 = (buf2, opts = { defaultHeapSize: 1024 * 1024 }) => {
-      const malloc = module_1.Module["_malloc"];
-      const src = malloc(buf2.byteLength);
-      module_1.Module.HEAP8.set(buf2, src);
-      const contentSize = getFrameContentSize2(src, buf2.byteLength);
-      const size = contentSize === -1 ? opts.defaultHeapSize : contentSize;
-      const free = module_1.Module["_free"];
-      const heap = malloc(size);
-      try {
-        const _decompress = module_1.Module["_ZSTD_decompress"];
-        const sizeOrError = _decompress(heap, size, src, buf2.byteLength);
-        if ((0, errors_1.isError)(sizeOrError)) {
-          throw new Error(`Failed to compress with code ${sizeOrError}`);
-        }
-        const data = new Uint8Array(module_1.Module.HEAPU8.buffer, heap, sizeOrError).slice();
-        free(heap, size);
-        free(src, buf2.byteLength);
-        return data;
-      } catch (e) {
-        free(heap, size);
-        free(src, buf2.byteLength);
-        throw e;
-      }
-    };
-    exports.decompress = decompress3;
-  }
-});
-
-// node_modules/@bokuweb/zstd-wasm/dist/common/simple/compress.js
-var require_compress = __commonJS({
-  "node_modules/@bokuweb/zstd-wasm/dist/common/simple/compress.js"(exports) {
-    "use strict";
-    Object.defineProperty(exports, "__esModule", { value: true });
-    exports.compress = void 0;
-    var module_1 = require_module();
-    var errors_1 = require_errors();
-    var compressBound2 = (size) => {
-      const bound = module_1.Module["_ZSTD_compressBound"];
-      return bound(size);
-    };
-    var compress3 = (buf2, level) => {
-      const bound = compressBound2(buf2.byteLength);
-      const malloc = module_1.Module["_malloc"];
-      const compressed = malloc(bound);
-      const src = malloc(buf2.byteLength);
-      module_1.Module.HEAP8.set(buf2, src);
-      const free = module_1.Module["_free"];
-      try {
-        const _compress = module_1.Module["_ZSTD_compress"];
-        const sizeOrError = _compress(compressed, bound, src, buf2.byteLength, level !== null && level !== void 0 ? level : 3);
-        if ((0, errors_1.isError)(sizeOrError)) {
-          throw new Error(`Failed to compress with code ${sizeOrError}`);
-        }
-        const data = new Uint8Array(module_1.Module.HEAPU8.buffer, compressed, sizeOrError).slice();
-        free(compressed, bound);
-        free(src, buf2.byteLength);
-        return data;
-      } catch (e) {
-        free(compressed, bound);
-        free(src, buf2.byteLength);
-        throw e;
-      }
-    };
-    exports.compress = compress3;
-  }
-});
-
-// node_modules/@bokuweb/zstd-wasm/dist/common/simple/decompress_using_dict.js
-var require_decompress_using_dict = __commonJS({
-  "node_modules/@bokuweb/zstd-wasm/dist/common/simple/decompress_using_dict.js"(exports) {
-    "use strict";
-    Object.defineProperty(exports, "__esModule", { value: true });
-    exports.decompressUsingDict = exports.freeDCtx = exports.createDCtx = void 0;
-    var module_1 = require_module();
-    var errors_1 = require_errors();
-    var getFrameContentSize2 = (src, size) => {
-      const getSize = module_1.Module["_ZSTD_getFrameContentSize"];
-      return getSize(src, size);
-    };
-    var createDCtx = () => {
-      return module_1.Module["_ZSTD_createDCtx"]();
-    };
-    exports.createDCtx = createDCtx;
-    var freeDCtx = (dctx) => {
-      return module_1.Module["_ZSTD_freeDCtx"](dctx);
-    };
-    exports.freeDCtx = freeDCtx;
-    var decompressUsingDict = (dctx, buf2, dict, opts = { defaultHeapSize: 1024 * 1024 }) => {
-      const malloc = module_1.Module["_malloc"];
-      const src = malloc(buf2.byteLength);
-      module_1.Module.HEAP8.set(buf2, src);
-      const pdict = malloc(dict.byteLength);
-      module_1.Module.HEAP8.set(dict, pdict);
-      const contentSize = getFrameContentSize2(src, buf2.byteLength);
-      const size = contentSize === -1 ? opts.defaultHeapSize : contentSize;
-      const free = module_1.Module["_free"];
-      const heap = malloc(size);
-      try {
-        const _decompress = module_1.Module["_ZSTD_decompress_usingDict"];
-        const sizeOrError = _decompress(dctx, heap, size, src, buf2.byteLength, pdict, dict.byteLength);
-        if ((0, errors_1.isError)(sizeOrError)) {
-          throw new Error(`Failed to compress with code ${sizeOrError}`);
-        }
-        const data = new Uint8Array(module_1.Module.HEAPU8.buffer, heap, sizeOrError).slice();
-        free(heap, size);
-        free(src, buf2.byteLength);
-        free(pdict, dict.byteLength);
-        return data;
-      } catch (e) {
-        free(heap, size);
-        free(src, buf2.byteLength);
-        free(pdict, dict.byteLength);
-        throw e;
-      }
-    };
-    exports.decompressUsingDict = decompressUsingDict;
-  }
-});
-
-// node_modules/@bokuweb/zstd-wasm/dist/common/simple/compress_using_dict.js
-var require_compress_using_dict = __commonJS({
-  "node_modules/@bokuweb/zstd-wasm/dist/common/simple/compress_using_dict.js"(exports) {
-    "use strict";
-    Object.defineProperty(exports, "__esModule", { value: true });
-    exports.compressUsingDict = exports.freeCCtx = exports.createCCtx = void 0;
-    var module_1 = require_module();
-    var errors_1 = require_errors();
-    var compressBound2 = (size) => {
-      const bound = module_1.Module["_ZSTD_compressBound"];
-      return bound(size);
-    };
-    var createCCtx = () => {
-      return module_1.Module["_ZSTD_createCCtx"]();
-    };
-    exports.createCCtx = createCCtx;
-    var freeCCtx = (cctx) => {
-      return module_1.Module["_ZSTD_freeCCtx"](cctx);
-    };
-    exports.freeCCtx = freeCCtx;
-    var compressUsingDict = (cctx, buf2, dict, level) => {
-      const bound = compressBound2(buf2.byteLength);
-      const malloc = module_1.Module["_malloc"];
-      const compressed = malloc(bound);
-      const src = malloc(buf2.byteLength);
-      module_1.Module.HEAP8.set(buf2, src);
-      const pdict = malloc(dict.byteLength);
-      module_1.Module.HEAP8.set(dict, pdict);
-      const free = module_1.Module["_free"];
-      try {
-        const _compress = module_1.Module["_ZSTD_compress_usingDict"];
-        const sizeOrError = _compress(cctx, compressed, bound, src, buf2.byteLength, pdict, dict.byteLength, level !== null && level !== void 0 ? level : 3);
-        if ((0, errors_1.isError)(sizeOrError)) {
-          throw new Error(`Failed to compress with code ${sizeOrError}`);
-        }
-        const data = new Uint8Array(module_1.Module.HEAPU8.buffer, compressed, sizeOrError).slice();
-        free(compressed, bound);
-        free(src, buf2.byteLength);
-        free(pdict, dict.byteLength);
-        return data;
-      } catch (e) {
-        free(compressed, bound);
-        free(src, buf2.byteLength);
-        free(pdict, dict.byteLength);
-        throw e;
-      }
-    };
-    exports.compressUsingDict = compressUsingDict;
-  }
-});
-
-// node_modules/@bokuweb/zstd-wasm/dist/common/index.node.js
-var require_index_node = __commonJS({
-  "node_modules/@bokuweb/zstd-wasm/dist/common/index.node.js"(exports) {
-    "use strict";
-    var __createBinding = exports && exports.__createBinding || (Object.create ? (function(o, m, k, k2) {
-      if (k2 === void 0) k2 = k;
-      var desc = Object.getOwnPropertyDescriptor(m, k);
-      if (!desc || ("get" in desc ? !m.__esModule : desc.writable || desc.configurable)) {
-        desc = { enumerable: true, get: function() {
-          return m[k];
-        } };
-      }
-      Object.defineProperty(o, k2, desc);
-    }) : (function(o, m, k, k2) {
-      if (k2 === void 0) k2 = k;
-      o[k2] = m[k];
-    }));
-    var __exportStar = exports && exports.__exportStar || function(m, exports2) {
-      for (var p in m) if (p !== "default" && !Object.prototype.hasOwnProperty.call(exports2, p)) __createBinding(exports2, m, p);
-    };
-    var __awaiter2 = exports && exports.__awaiter || function(thisArg, _arguments, P2, generator) {
-      function adopt(value) {
-        return value instanceof P2 ? value : new P2(function(resolve) {
-          resolve(value);
-        });
-      }
-      return new (P2 || (P2 = Promise))(function(resolve, reject) {
-        function fulfilled(value) {
-          try {
-            step(generator.next(value));
-          } catch (e) {
-            reject(e);
-          }
-        }
-        function rejected(value) {
-          try {
-            step(generator["throw"](value));
-          } catch (e) {
-            reject(e);
-          }
-        }
-        function step(result) {
-          result.done ? resolve(result.value) : adopt(result.value).then(fulfilled, rejected);
-        }
-        step((generator = generator.apply(thisArg, _arguments || [])).next());
-      });
-    };
-    Object.defineProperty(exports, "__esModule", { value: true });
-    exports.init = void 0;
-    var module_1 = require_module();
-    var init3 = () => __awaiter2(void 0, void 0, void 0, function* () {
-      const { readFile } = __require("fs/promises");
-      const { resolve } = __require("path");
-      const buf2 = yield readFile(resolve(__dirname, "./zstd.wasm"));
-      module_1.Module["init"](buf2);
-      yield (0, module_1.waitInitialized)();
-    });
-    exports.init = init3;
-    __exportStar(require_decompress(), exports);
-    __exportStar(require_compress(), exports);
-    __exportStar(require_decompress_using_dict(), exports);
-    __exportStar(require_compress_using_dict(), exports);
-  }
-});
-
 // src/agent/frame.ts
-import { createHash, randomBytes } from "node:crypto";
+import { createHash, randomBytes as randomBytes2 } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { connect as connectTcp, createServer as createTcp, isIP } from "node:net";
 import { connect as connectTls, createServer as createTls } from "node:tls";
@@ -1489,14 +792,26 @@ function staticLexicon() {
   }
   return staticCache;
 }
+var lexiconCache = /* @__PURE__ */ new Map();
+function cacheId(key2, window) {
+  let hex2 = `${window}:`;
+  for (const b of key2) hex2 += b.toString(16).padStart(2, "0");
+  return hex2;
+}
 async function sessionLexicon(sessionKey, window) {
-  const seed = await hkdfStream(
-    sessionKey,
-    utf8("LEXIS-LEX-SALT"),
-    `win-${window}`,
-    32
-  );
-  return buildLexicon(seed);
+  const id = cacheId(sessionKey, window);
+  const hit = lexiconCache.get(id);
+  if (hit) return hit;
+  const pending = (async () => {
+    const seed = await hkdfStream(sessionKey, utf8("LEXIS-LEX-SALT"), `win-${window}`, 32);
+    return buildLexicon(seed);
+  })();
+  lexiconCache.set(id, pending);
+  if (lexiconCache.size > 32) {
+    const oldest = lexiconCache.keys().next().value;
+    if (oldest !== void 0) lexiconCache.delete(oldest);
+  }
+  return pending;
 }
 function invertLexicon(words) {
   const map = /* @__PURE__ */ new Map();
@@ -2927,7 +2242,8 @@ async function openSession(opts) {
     gateFp: opts.gate.fingerprint,
     kdf: opts.kdf,
     honey: opts.honey,
-    kdfMs: opts.kdfMs
+    kdfMs: opts.kdfMs,
+    program: opts.program ?? null
   };
 }
 
@@ -2965,18 +2281,103 @@ function heartbeatPayload(now = Date.now()) {
   return utf8(`hb ${now}`);
 }
 
-// src/lib/lexis/pack.ts
-var import_zstd_wasm = __toESM(require_index_node(), 1);
-async function honeySentence(seed) {
-  const lex = await staticLexicon();
-  const words = [];
-  let material = seed.length ? seed : utf8("empty");
-  for (let i = 0; i < 4; i++) {
-    material = await sha256(concat(material, new Uint8Array([i])));
-    const idx = ((material[0] << 8 | material[1]) & 4095) % lex.length;
-    words.push(lex[idx]);
+// src/lib/lexis/honey.ts
+var POLY = 1n << 128n | 0x87n;
+var MASK = (1n << 128n) - 1n;
+function add2(a, b) {
+  return a ^ b;
+}
+function mul(a, b) {
+  let res = 0n;
+  let x = a;
+  let y = b;
+  while (y > 0n) {
+    if (y & 1n) res ^= x;
+    x <<= 1n;
+    if (x & 1n << 128n) x ^= POLY;
+    y >>= 1n;
   }
-  return `the ${words[0]} and our ${words[1]} that its ${words[2]} and the ${words[3]}`;
+  return res & MASK;
+}
+function fromBytes(bytes) {
+  let n = 0n;
+  for (const b of bytes) n = n << 8n | BigInt(b);
+  return n & MASK;
+}
+function toBytes(n) {
+  const out = new Uint8Array(16);
+  let x = n & MASK;
+  for (let i = 15; i >= 0; i -= 1) {
+    out[i] = Number(x & 0xffn);
+    x >>= 8n;
+  }
+  return out;
+}
+function xor16(a, b) {
+  const out = new Uint8Array(16);
+  for (let i = 0; i < 16; i += 1) out[i] = a[i] ^ b[i];
+  return out;
+}
+function horner(coeffs, x) {
+  let result = 0n;
+  for (let i = coeffs.length - 1; i >= 0; i -= 1) result = add2(mul(result, x), coeffs[i]);
+  return result;
+}
+async function lane(key2, salt, label) {
+  const mac = await hmac(key2, concat(salt, utf8(label)));
+  return mac.subarray(0, 16);
+}
+function indicesFrom(block2) {
+  const out = [0, 0, 0, 0];
+  for (let i = 0; i < 4; i += 1) {
+    const v = (block2[i * 2] << 8 | block2[i * 2 + 1]) & 65535;
+    out[i] = v % SPEC.lexiconSize;
+  }
+  return out;
+}
+async function evalHoney(program, key2) {
+  const x = await lane(key2, program.salt, "x");
+  const r = await lane(key2, program.salt, "r");
+  const y = horner(program.coeffs.map(fromBytes), fromBytes(x));
+  return xor16(toBytes(y), r);
+}
+async function honeyPhrase(key2, window, seed, program) {
+  const lex = await sessionLexicon(key2, window);
+  const block2 = program ? await evalHoney(program, key2) : await hkdf(key2, u32be(window), seed.length ? seed : utf8("honey"), 16);
+  const idx = indicesFrom(block2);
+  return `the ${lex[idx[0]]} and our ${lex[idx[1]]} that its ${lex[idx[2]]} and the ${lex[idx[3]]}`;
+}
+function programFromStored(raw) {
+  if (!raw || typeof raw !== "object") return null;
+  const rec = raw;
+  if (typeof rec.saltB64 !== "string" || !Array.isArray(rec.coeffsB64) || rec.coeffsB64.length < 1 || rec.coeffsB64.length > 8) {
+    return null;
+  }
+  try {
+    const salt = unb64(rec.saltB64);
+    if (salt.length !== 16) return null;
+    const coeffs = rec.coeffsB64.map((item) => {
+      if (typeof item !== "string") throw new Error("\u7CFB\u6570\u4E0D\u5BF9");
+      const bytes = unb64(item);
+      if (bytes.length !== 16) throw new Error("\u7CFB\u6570\u4E0D\u5BF9");
+      return bytes;
+    });
+    return { salt, coeffs };
+  } catch {
+    return null;
+  }
+}
+function blendBytes(real, cover, takeReal) {
+  const m = takeReal & 1;
+  const inv = 1 - m;
+  const n = m * real.length + inv * cover.length;
+  const out = new Uint8Array(n);
+  for (let i = 0; i < n; i += 1) {
+    const a = i < real.length ? real[i] : 0;
+    const b = i < cover.length ? cover[i] : 0;
+    out[i] = a * m + b * inv & 255;
+  }
+  return out;
 }
 
 // src/lib/lexis/seal.ts
@@ -3011,20 +2412,27 @@ async function seal(input) {
   const c1 = lexicon[masked & 4095];
   return dress([c0, c1, ...body], counter);
 }
+function macBit(a, b) {
+  const n = Math.max(a.length, b.length);
+  let diff = a.length === b.length ? 0 : 1;
+  for (let i = 0; i < n; i += 1) diff |= (a[i] ?? 0) ^ (b[i] ?? 0);
+  return Number(diff === 0);
+}
 async function open(input) {
   const { key: key2, inverse, window, direction, prose, lastSeen } = input;
+  const honey = input.honey === true;
   const words = undress(prose);
   if (words.length < 3) throw new LexisError("\u62A5\u6587\u592A\u77ED\uFF0C\u4E0D\u50CF\u4E00\u5E27\u8BCD\u9699");
+  let missing = false;
   const take = (w) => {
     const idx = inverse.get(w);
     if (idx === void 0) {
-      throw new LexisError("\u6709\u8BCD\u4E0D\u5728\u672C\u65F6\u95F4\u7A97\u7684\u8BCD\u8868\u91CC\u3002\u5BC6\u94A5\u6216\u65F6\u95F4\u7A97\u4E0D\u4E00\u81F4\uFF0C\u6216\u62A5\u6587\u88AB\u6539\u8FC7\u3002");
+      missing = true;
+      return 0;
     }
     return idx;
   };
-  const mask = mask24(
-    await hmac(key2, utf8(`lexis-counter-mask-v1|${direction}|${window}`))
-  );
+  const mask = mask24(await hmac(key2, utf8(`lexis-counter-mask-v1|${direction}|${window}`)));
   const masked = (take(words[0]) & 4095) << 12 | take(words[1]) & 4095;
   const counter = (masked ^ mask) & 16777215;
   const bodyWords = words.slice(2);
@@ -3039,31 +2447,37 @@ async function open(input) {
     return (take(w) - ks12 + SPEC.lexiconSize) % SPEC.lexiconSize;
   });
   const raw = chunksToBytes(chunks);
-  const honey = input.honey === true;
-  const asHoney = async () => ({
-    counter: lastSeen,
-    plaintext: utf8(await honeySentence(raw.length ? raw : utf8(prose))),
-    honey: true
-  });
-  if (raw.length < 2 + SPEC.macBytes) {
-    if (honey) return asHoney();
-    throw new LexisError("\u6B63\u6587\u957F\u5EA6\u4E0D\u591F");
+  const seed = raw.length ? raw : utf8(prose);
+  const coverOf = () => honeyPhrase(key2, window, seed, input.program);
+  const release = async (takeReal, real) => {
+    const cover = honey ? utf8(await coverOf()) : real;
+    const bit = honey ? takeReal & 1 : 1;
+    return {
+      counter: bit * counter + (1 - bit) * lastSeen,
+      plaintext: blendBytes(real, cover, bit),
+      honey: honey && bit === 0
+    };
+  };
+  if (missing || raw.length < 2 + SPEC.macBytes) {
+    if (!honey) throw new LexisError(missing ? "\u6709\u8BCD\u4E0D\u5728\u672C\u65F6\u95F4\u7A97\u7684\u8BCD\u8868\u91CC\u3002\u5BC6\u94A5\u6216\u65F6\u95F4\u7A97\u4E0D\u4E00\u81F4\uFF0C\u6216\u62A5\u6587\u88AB\u6539\u8FC7\u3002" : "\u6B63\u6587\u957F\u5EA6\u4E0D\u591F");
+    return release(0, new Uint8Array());
   }
   const len = readU16(raw, 0);
   if (2 + len + SPEC.macBytes > raw.length) {
-    if (honey) return asHoney();
-    throw new LexisError("\u6B63\u6587\u5B57\u6BB5\u88AB\u622A\u65AD");
+    if (!honey) throw new LexisError("\u6B63\u6587\u5B57\u6BB5\u88AB\u622A\u65AD");
+    return release(0, new Uint8Array());
   }
   const plaintext = raw.slice(2, 2 + len);
   const tag = raw.slice(2 + len, 2 + len + SPEC.macBytes);
   const expect = (await hmac(key2, concat(utf8(`lexis-mac-v1|${direction}|`), u32be(counter), plaintext))).subarray(0, SPEC.macBytes);
-  if (!timingSafeEqual(tag, expect)) {
-    if (honey) return asHoney();
+  const ok = macBit(tag, expect);
+  if (ok === 1) {
+    if (counter < 1) throw new LexisError("\u8BA1\u6570\u5668\u65E0\u6548");
+    if (counter <= lastSeen) throw new LexisError("\u8BA1\u6570\u5668\u6CA1\u6709\u524D\u8FDB\uFF0C\u6309\u56DE\u653E\u4E22\u5F03");
+  } else if (!honey) {
     throw new LexisError("\u6821\u9A8C\u5931\u8D25\u3002\u5BC6\u94A5\u3001\u8BA1\u6570\u5668\u6216\u8BCD\u8868\u5BF9\u4E0D\u4E0A\u3002");
   }
-  if (counter < 1) throw new LexisError("\u8BA1\u6570\u5668\u65E0\u6548");
-  if (counter <= lastSeen) throw new LexisError("\u8BA1\u6570\u5668\u6CA1\u6709\u524D\u8FDB\uFF0C\u6309\u56DE\u653E\u4E22\u5F03");
-  return { counter, plaintext, honey: false };
+  return release(ok, plaintext);
 }
 
 // src/agent/frame.ts
@@ -3332,7 +2746,7 @@ function wsFrame(opcode, payload, mask) {
   }
   let offset = 2 + extra;
   if (mask) {
-    const key2 = randomBytes(4);
+    const key2 = randomBytes2(4);
     key2.copy(out, offset);
     offset += 4;
     for (let i = 0; i < len; i++) out[offset + i] = payload[i] ^ key2[i & 3];
@@ -3363,7 +2777,7 @@ function readHttpHead(socket, cap) {
   });
 }
 async function wsClientPipe(socket, host, path) {
-  const key2 = randomBytes(16).toString("base64");
+  const key2 = randomBytes2(16).toString("base64");
   socket.write(
     `GET ${path || "/lexis"} HTTP/1.1\r
 Host: ${host}\r
@@ -3713,7 +3127,8 @@ var LexSession = class {
       direction: dir,
       prose,
       lastSeen: live.seen[dir],
-      honey
+      honey,
+      program: live.program ?? null
     });
     if (!opened.honey) live.seen[dir] = opened.counter;
     return opened;
@@ -3845,7 +3260,8 @@ async function connectSession(opts) {
     finishWire: finished.finishWire,
     kdf: finished.kdf,
     honey: finished.honey,
-    kdfMs: finished.kdfMs
+    kdfMs: finished.kdfMs,
+    program: opts.program ?? null
   });
   return sessionFrom(
     opts.pipe,
@@ -3899,7 +3315,8 @@ async function acceptSession(opts) {
     finishWire,
     kdf: pending.kdf,
     honey,
-    kdfMs: 0
+    kdfMs: 0,
+    program: opts.program ?? null
   });
   return sessionFrom(
     opts.pipe,
@@ -4048,6 +3465,7 @@ export {
   nodeFromIdentity,
   parseOpen,
   pipeMux,
+  programFromStored,
   startKdfPool,
   tcpPipe,
   wsClientPipe,

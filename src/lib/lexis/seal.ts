@@ -3,14 +3,13 @@ import {
   bytesToChunks,
   concat,
   readU16,
-  timingSafeEqual,
   u16be,
   u32be,
   utf8,
 } from "./bytes";
 import { dress, undress } from "./codec";
 import { hmac, hkdfStream, LexisError } from "./crypto";
-import { honeySentence } from "./pack";
+import { honeyPhrase, blendBytes, type HoneyProgram } from "./honey";
 import { SPEC } from "./spec";
 
 export type Direction = "e2g" | "g2e";
@@ -31,8 +30,10 @@ export type OpenInput = {
   direction: Direction;
   prose: string;
   lastSeen: number;
-  /** When set, a bad MAC becomes a honey sentence instead of an error. Negotiated in the handshake. */
+  /** When set, a bad MAC becomes a sentence from this key's own lexicon. Negotiated in the handshake. */
   honey?: boolean;
+  /** Optional programmed cover. Evaluated for every key; no per-key branch. */
+  program?: HoneyProgram | null;
 };
 
 export type Opened = {
@@ -85,25 +86,32 @@ export async function seal(input: SealInput): Promise<string> {
   return dress([c0, c1, ...body], counter);
 }
 
+function macBit(a: Uint8Array, b: Uint8Array): number {
+  const n = Math.max(a.length, b.length);
+  let diff = a.length === b.length ? 0 : 1;
+  for (let i = 0; i < n; i += 1) diff |= (a[i] ?? 0) ^ (b[i] ?? 0);
+  return Number(diff === 0);
+}
+
 export async function open(input: OpenInput): Promise<Opened> {
   const { key, inverse, window, direction, prose, lastSeen } = input;
+  const honey = input.honey === true;
   const words = undress(prose);
   if (words.length < 3) throw new LexisError("报文太短，不像一帧词隙");
 
+  let missing = false;
   const take = (w: string) => {
     const idx = inverse.get(w);
     if (idx === undefined) {
-      throw new LexisError("有词不在本时间窗的词表里。密钥或时间窗不一致，或报文被改过。");
+      missing = true;
+      return 0;
     }
     return idx;
   };
 
-  const mask = mask24(
-    await hmac(key, utf8(`lexis-counter-mask-v1|${direction}|${window}`)),
-  );
+  const mask = mask24(await hmac(key, utf8(`lexis-counter-mask-v1|${direction}|${window}`)));
   const masked = ((take(words[0]) & 0xfff) << 12) | (take(words[1]) & 0xfff);
   const counter = (masked ^ mask) & 0xffffff;
-
   const bodyWords = words.slice(2);
   const ks = await hkdfStream(
     key,
@@ -116,31 +124,37 @@ export async function open(input: OpenInput): Promise<Opened> {
     return (take(w) - ks12 + SPEC.lexiconSize) % SPEC.lexiconSize;
   });
   const raw = chunksToBytes(chunks);
-  const honey = input.honey === true;
-  const asHoney = async (): Promise<Opened> => ({
-    counter: lastSeen,
-    plaintext: utf8(await honeySentence(raw.length ? raw : utf8(prose))),
-    honey: true,
-  });
-  if (raw.length < 2 + SPEC.macBytes) {
-    if (honey) return asHoney();
-    throw new LexisError("正文长度不够");
+  const seed = raw.length ? raw : utf8(prose);
+
+  const coverOf = () => honeyPhrase(key, window, seed, input.program);
+  const release = async (takeReal: number, real: Uint8Array): Promise<Opened> => {
+    const cover = honey ? utf8(await coverOf()) : real;
+    const bit = honey ? takeReal & 1 : 1;
+    return {
+      counter: bit * counter + (1 - bit) * lastSeen,
+      plaintext: blendBytes(real, cover, bit),
+      honey: honey && bit === 0,
+    };
+  };
+
+  if (missing || raw.length < 2 + SPEC.macBytes) {
+    if (!honey) throw new LexisError(missing ? "有词不在本时间窗的词表里。密钥或时间窗不一致，或报文被改过。" : "正文长度不够");
+    return release(0, new Uint8Array());
   }
   const len = readU16(raw, 0);
   if (2 + len + SPEC.macBytes > raw.length) {
-    if (honey) return asHoney();
-    throw new LexisError("正文字段被截断");
+    if (!honey) throw new LexisError("正文字段被截断");
+    return release(0, new Uint8Array());
   }
   const plaintext = raw.slice(2, 2 + len);
   const tag = raw.slice(2 + len, 2 + len + SPEC.macBytes);
-  const expect = (
-    await hmac(key, concat(utf8(`lexis-mac-v1|${direction}|`), u32be(counter), plaintext))
-  ).subarray(0, SPEC.macBytes);
-  if (!timingSafeEqual(tag, expect)) {
-    if (honey) return asHoney();
+  const expect = (await hmac(key, concat(utf8(`lexis-mac-v1|${direction}|`), u32be(counter), plaintext))).subarray(0, SPEC.macBytes);
+  const ok = macBit(tag, expect);
+  if (ok === 1) {
+    if (counter < 1) throw new LexisError("计数器无效");
+    if (counter <= lastSeen) throw new LexisError("计数器没有前进，按回放丢弃");
+  } else if (!honey) {
     throw new LexisError("校验失败。密钥、计数器或词表对不上。");
   }
-  if (counter < 1) throw new LexisError("计数器无效");
-  if (counter <= lastSeen) throw new LexisError("计数器没有前进，按回放丢弃");
-  return { counter, plaintext, honey: false };
+  return release(ok, plaintext);
 }

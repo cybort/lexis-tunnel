@@ -1,6 +1,8 @@
 import { useEffect, useState, type ReactNode } from "react";
 import { b64 } from "@/lib/lexis/bytes";
 import { createIdentity } from "@/lib/lexis/crypto";
+import { compileBlocks, packIndices, programToStored } from "@/lib/lexis/honey";
+import { SPEC } from "@/lib/lexis/spec";
 import {
   ACTIONS,
   RULE_TYPES,
@@ -28,6 +30,20 @@ function rid(prefix: string) {
   return `${prefix}-${crypto.randomUUID().slice(0, 8)}`;
 }
 
+function parseKeyHex(text: string): Uint8Array | null {
+  const cleaned = text.trim().toLowerCase();
+  if (!/^[0-9a-f]{64}$/.test(cleaned)) return null;
+  const out = new Uint8Array(32);
+  for (let i = 0; i < 32; i += 1) out[i] = Number.parseInt(cleaned.slice(i * 2, i * 2 + 2), 16);
+  return out;
+}
+
+function parseIndices(text: string): [number, number, number, number] | null {
+  const parts = text.trim().split(/\s+/).map((item) => Number(item));
+  if (parts.length !== 4 || parts.some((n) => !Number.isInteger(n) || n < 0 || n >= SPEC.lexiconSize)) return null;
+  return [parts[0], parts[1], parts[2], parts[3]];
+}
+
 export function ConfigPanel() {
   const profile = useProfile((s) => s.profile);
   const patch = useProfile((s) => s.patch);
@@ -38,8 +54,45 @@ export function ConfigPanel() {
   const [ip, setIp] = useState("");
   const [proc, setProc] = useState("");
   const [minting, setMinting] = useState(false);
+  const [coverKey, setCoverKey] = useState("");
+  const [coverIdx, setCoverIdx] = useState("4 8 15 16");
+  const [coverKey2, setCoverKey2] = useState("");
+  const [coverIdx2, setCoverIdx2] = useState("");
+  const [coverError, setCoverError] = useState<string | null>(null);
+  const [covering, setCovering] = useState(false);
   const hit = matchRoute(profile, { host, ip, process: proc });
   const issues = profileIssues(profile);
+
+  async function sealCover() {
+    const first = parseKeyHex(coverKey);
+    const idx = parseIndices(coverIdx);
+    if (!first || !idx) {
+      setCoverError("第一把密钥要 64 位十六进制，词序要四个 0 到 4095 的整数");
+      return;
+    }
+    const entries = [{ key: first, block: packIndices(idx) }];
+    if (coverKey2.trim() || coverIdx2.trim()) {
+      const second = parseKeyHex(coverKey2);
+      const idx2 = parseIndices(coverIdx2);
+      if (!second || !idx2) {
+        setCoverError("第二把密钥或词序没写全");
+        return;
+      }
+      entries.push({ key: second, block: packIndices(idx2) });
+    }
+    setCovering(true);
+    setCoverError(null);
+    try {
+      const program = await compileBlocks(entries, 4);
+      patch({ honeyProgram: programToStored(program) });
+      setCoverKey("");
+      setCoverKey2("");
+    } catch (err) {
+      setCoverError(err instanceof Error ? err.message : "封存失败");
+    } finally {
+      setCovering(false);
+    }
+  }
 
   function setInbounds(inbounds: Inbound[]) {
     patch({ inbounds });
@@ -125,7 +178,7 @@ export function ConfigPanel() {
           压缩不靠这份配置在对端对齐。明文第一个字节是类型：0 是原文，1 是 zstd 帧。等级决定窗口，窗口写在帧头里，对端解开以后自己读。比原文更大时这一帧会改回类型 0。
         </p>
         <p className="mt-2 text-sm text-mist">
-          蜜文在握手时谈定。打开以后，校验对不上不报错，而按公开词表落成另一句话。线上没有「这是蜜文」的位。没有先验明文的人分不出猜对还是猜错。这个模式不再提示报文被改过。
+          蜜文在握手时谈定。打开以后，校验对不上不报错，而落成这把密钥和当前时间窗自己的词表里的一句话。换一把密钥，或换一个时间窗，词表格式不变、用词不同。备用明文写进同一条求值，不会为某一把密钥另开判断。线上没有「这是蜜文」的位。这个模式不再提示报文被改过。
         </p>
         <div className="mt-4 grid gap-3 sm:grid-cols-3">
           <Field label="Argon2 内存 KiB">
@@ -181,6 +234,39 @@ export function ConfigPanel() {
           <Btn kind={!profile.zstd.enabled ? "solid" : "ghost"} onClick={() => patch({ zstd: { ...profile.zstd, enabled: false } })}>
             不压缩
           </Btn>
+        </div>
+        <div className="mt-4 grid gap-3">
+          <p className="text-sm text-mist">
+            封面按会话密钥封进同一条求值。密钥写成 64 位十六进制，词序是四个 0 到 {SPEC.lexiconSize - 1} 的整数。封存之后只留系数。拆开时每一把密钥都走这一条，没有单独的判断。对得上的用你写的词序，对不上的仍是同一句式，词从那把密钥和当时的时间窗里取。
+          </p>
+          <Field label="密钥">
+            <input className={control} value={coverKey} autoComplete="off" spellCheck={false} placeholder="64 位十六进制" aria-label="封面密钥" onChange={(e) => setCoverKey(e.target.value)} />
+          </Field>
+          <Field label="词序">
+            <input className={control} value={coverIdx} autoComplete="off" aria-label="封面词序" onChange={(e) => setCoverIdx(e.target.value)} />
+          </Field>
+          <Field label="第二把密钥">
+            <input className={control} value={coverKey2} autoComplete="off" spellCheck={false} placeholder="可留空" aria-label="第二把封面密钥" onChange={(e) => setCoverKey2(e.target.value)} />
+          </Field>
+          <Field label="第二组词序">
+            <input className={control} value={coverIdx2} autoComplete="off" placeholder="可留空" aria-label="第二组封面词序" onChange={(e) => setCoverIdx2(e.target.value)} />
+          </Field>
+          <div className="flex flex-wrap gap-2">
+            <Btn kind="ghost" disabled={covering || !coverKey.trim()} onClick={() => void sealCover()}>
+              {covering ? "封存中" : "把封面写进同一条求值"}
+            </Btn>
+            {profile.honeyProgram ? (
+              <Btn kind="ghost" onClick={() => patch({ honeyProgram: null })}>
+                清掉封面系数
+              </Btn>
+            ) : null}
+          </div>
+          {profile.honeyProgram ? (
+            <p className="text-sm text-mist">已封存 {profile.honeyProgram.coeffsB64.length} 个系数。密钥没有留下。导出配置会带上这组系数。</p>
+          ) : (
+            <p className="text-sm text-mist">还没有封面系数。不封存时，蜜文句子仍从这把密钥和当前时间窗的词表里取，只是词序不由你指定。</p>
+          )}
+          {coverError ? <p className="text-sm text-ember">{coverError}</p> : null}
         </div>
         <div className="mt-4 max-w-xs">
           <Field label="zstd 等级">

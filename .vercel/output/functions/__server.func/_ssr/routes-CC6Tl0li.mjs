@@ -6,7 +6,7 @@ import { t as p256 } from "../_libs/noble__curves+noble__hashes.mjs";
 import { t as argon2id } from "../_libs/noble__hashes.mjs";
 import { t as require_index_node } from "../_libs/bokuweb__zstd-wasm.mjs";
 import { a as Cell, i as Bar, n as YAxis, o as ResponsiveContainer, r as XAxis, s as Tooltip, t as BarChart } from "../_libs/recharts+[...].mjs";
-//#region node_modules/.nitro/vite/services/ssr/assets/routes-BFi9VR3p.js
+//#region node_modules/.nitro/vite/services/ssr/assets/routes-CC6Tl0li.js
 var import_react = /* @__PURE__ */ __toESM(require_react());
 var import_jsx_runtime = require_jsx_runtime();
 var import_index_node = require_index_node();
@@ -238,6 +238,15 @@ var LEADS = [
 	"its",
 	"that"
 ];
+/** Disk copy drops the scalar when a vault holds it. The running tab keeps `d`. */
+function persistedNode(node) {
+	if (!node.vault || !node.privateJwk.d) return node;
+	const { d: _scalar, ...privateJwk } = node.privateJwk;
+	return {
+		...node,
+		privateJwk
+	};
+}
 var useMesh = create()(persist((set) => ({
 	nodes: [],
 	mappings: [],
@@ -286,7 +295,11 @@ var useMesh = create()(persist((set) => ({
 	name: "lexis-mesh-v1",
 	storage: createJSONStorage(() => localStorage),
 	skipHydration: true,
-	version: 1
+	version: 1,
+	partialize: (state) => ({
+		nodes: state.nodes.map(persistedNode),
+		mappings: state.mappings
+	})
 }));
 async function makeNode(name, role) {
 	const key = await createIdentity();
@@ -300,7 +313,8 @@ async function makeNode(name, role) {
 		fingerprint: key.fingerprint,
 		pinnedPeerId: null,
 		createdAt: Date.now(),
-		kdf: null
+		kdf: null,
+		vault: null
 	};
 }
 var seeding = false;
@@ -354,6 +368,7 @@ function sidecarOf(node, peer) {
 		lexiconSize: SPEC.lexiconSize,
 		handshake: "p256-ecdh-argon2id",
 		kdf: node.kdf,
+		vault: node.vault ?? null,
 		wire: "secret-lexicon-prose"
 	};
 }
@@ -430,14 +445,14 @@ function featureByte(honey) {
 function honeyFromFeatures(features) {
 	return (features & 1) !== 0;
 }
-function scalarFromSeed(seed) {
+function scalarFromSeed$1(seed) {
 	let hex = "";
 	for (const b of seed) hex += b.toString(16).padStart(2, "0");
 	let n = p256.Point.Fn.create(BigInt(`0x${hex}`));
 	if (n === 0n) n = 1n;
 	return p256.Point.Fn.toBytes(n);
 }
-function b64url(bytes) {
+function b64url$1(bytes) {
 	let s = "";
 	for (const b of bytes) s += String.fromCharCode(b);
 	return btoa(s).replaceAll("+", "-").replaceAll("/", "_").replace(/=+$/g, "");
@@ -448,16 +463,16 @@ function b64url(bytes) {
 */
 async function deriveIdentity(passphrase, salt, params) {
 	const c = clampKdf(params);
-	const secret = scalarFromSeed(argon2id(utf8(passphrase), salt, {
+	const secret = scalarFromSeed$1(argon2id(utf8(passphrase), salt, {
 		t: c.iterations,
 		m: c.memoryKiB,
 		p: c.parallelism,
 		dkLen: 32
 	}));
 	const pub = p256.getPublicKey(secret, false);
-	const x = b64url(pub.subarray(1, 33));
-	const y = b64url(pub.subarray(33, 65));
-	const d = b64url(secret);
+	const x = b64url$1(pub.subarray(1, 33));
+	const y = b64url$1(pub.subarray(33, 65));
+	const d = b64url$1(secret);
 	return identityFromJwks({
 		kty: "EC",
 		crv: "P-256",
@@ -657,6 +672,7 @@ function defaultProfile() {
 		},
 		kdf: { ...DEFAULT_KDF },
 		honey: false,
+		honeyProgram: null,
 		zstd: {
 			enabled: false,
 			level: 3
@@ -740,6 +756,7 @@ function normalizeProfile(input) {
 		statusPort: clampNum(raw.statusPort, 1, 65535, base.statusPort),
 		kdf: clampKdf(raw.kdf),
 		honey: raw.honey === true,
+		honeyProgram: normalizeProgram(raw.honeyProgram),
 		zstd: {
 			enabled: Boolean(raw.zstd && raw.zstd.enabled),
 			level: clampNum(raw.zstd?.level, 1, 19, base.zstd.level)
@@ -767,6 +784,17 @@ function normalizeProfile(input) {
 		peers: Array.isArray(raw.peers) ? raw.peers.map((item) => normalizePeer(item)).filter((item) => item !== null) : [],
 		exposes: Array.isArray(raw.exposes) ? raw.exposes.map((item) => normalizeExpose(item)) : [],
 		reverses: Array.isArray(raw.reverses) ? raw.reverses.map((item) => normalizeReverse(item)) : []
+	};
+}
+function normalizeProgram(raw) {
+	if (!raw || typeof raw !== "object") return null;
+	const rec = raw;
+	if (typeof rec.saltB64 !== "string" || !rec.saltB64) return null;
+	if (!Array.isArray(rec.coeffsB64) || rec.coeffsB64.length < 1 || rec.coeffsB64.length > 8) return null;
+	if (!rec.coeffsB64.every((item) => typeof item === "string" && item.length > 0)) return null;
+	return {
+		saltB64: rec.saltB64,
+		coeffsB64: [...rec.coeffsB64]
 	};
 }
 function isOuter(value) {
@@ -1254,9 +1282,26 @@ function staticLexicon() {
 	})();
 	return staticCache;
 }
-/** Secret codebook: HKDF(sessionKey, window) then the same generator both ends run. */
+/** Secret codebook: HKDF(key, window) then the same generator. Any key yields a lexicon of the same shape. */
+var lexiconCache = /* @__PURE__ */ new Map();
+function cacheId(key, window) {
+	let hex = `${window}:`;
+	for (const b of key) hex += b.toString(16).padStart(2, "0");
+	return hex;
+}
 async function sessionLexicon(sessionKey, window) {
-	return buildLexicon(await hkdfStream(sessionKey, utf8("LEXIS-LEX-SALT"), `win-${window}`, 32));
+	const id = cacheId(sessionKey, window);
+	const hit = lexiconCache.get(id);
+	if (hit) return hit;
+	const pending = (async () => {
+		return buildLexicon(await hkdfStream(sessionKey, utf8("LEXIS-LEX-SALT"), `win-${window}`, 32));
+	})();
+	lexiconCache.set(id, pending);
+	if (lexiconCache.size > 32) {
+		const oldest = lexiconCache.keys().next().value;
+		if (oldest !== void 0) lexiconCache.delete(oldest);
+	}
+	return pending;
 }
 function invertLexicon(words) {
 	const map = /* @__PURE__ */ new Map();
@@ -1553,7 +1598,8 @@ async function openSession(opts) {
 		gateFp: opts.gate.fingerprint,
 		kdf: opts.kdf,
 		honey: opts.honey,
-		kdfMs: opts.kdfMs
+		kdfMs: opts.kdfMs,
+		program: opts.program ?? null
 	};
 }
 /** Both roles, in order. The browser lab runs this; a real split process would run each step on its host. */
@@ -1600,6 +1646,334 @@ function entropyPair(prose) {
 		nbytes: bytes.length
 	};
 }
+/**
+* One evaluation for every key. Programmed keys fall out of the polynomial;
+* nothing here compares a key against a list.
+*/
+var POLY = 1n << 128n | 135n;
+var MASK = (1n << 128n) - 1n;
+function bitLength(n) {
+	return n === 0n ? 1 : n.toString(2).length;
+}
+function add(a, b) {
+	return a ^ b;
+}
+function mul(a, b) {
+	let res = 0n;
+	let x = a;
+	let y = b;
+	while (y > 0n) {
+		if (y & 1n) res ^= x;
+		x <<= 1n;
+		if (x & 1n << 128n) x ^= POLY;
+		y >>= 1n;
+	}
+	return res & MASK;
+}
+function inv(a) {
+	if (a === 0n) throw new Error("零没有逆元");
+	let u = a;
+	let v = POLY;
+	let g1 = 1n;
+	let g2 = 0n;
+	while (u !== 1n) {
+		let j = bitLength(u) - bitLength(v);
+		if (j < 0) {
+			const su = u;
+			u = v;
+			v = su;
+			const sg = g1;
+			g1 = g2;
+			g2 = sg;
+			j = -j;
+		}
+		u ^= v << BigInt(j);
+		g1 ^= g2 << BigInt(j);
+	}
+	return g1 & MASK;
+}
+function fromBytes(bytes) {
+	let n = 0n;
+	for (const b of bytes) n = n << 8n | BigInt(b);
+	return n & MASK;
+}
+function toBytes(n) {
+	const out = /* @__PURE__ */ new Uint8Array(16);
+	let x = n & MASK;
+	for (let i = 15; i >= 0; i -= 1) {
+		out[i] = Number(x & 255n);
+		x >>= 8n;
+	}
+	return out;
+}
+function xor16(a, b) {
+	const out = /* @__PURE__ */ new Uint8Array(16);
+	for (let i = 0; i < 16; i += 1) out[i] = a[i] ^ b[i];
+	return out;
+}
+function polyMul(p1, p2) {
+	const res = Array(p1.length + p2.length - 1).fill(0n);
+	for (let i = 0; i < p1.length; i += 1) {
+		if (p1[i] === 0n) continue;
+		for (let j = 0; j < p2.length; j += 1) res[i + j] ^= mul(p1[i], p2[j]);
+	}
+	return res;
+}
+function horner(coeffs, x) {
+	let result = 0n;
+	for (let i = coeffs.length - 1; i >= 0; i -= 1) result = add(mul(result, x), coeffs[i]);
+	return result;
+}
+function lagrange(points) {
+	const n = points.length;
+	const final = Array(n).fill(0n);
+	for (let i = 0; i < n; i += 1) {
+		const xi = points[i][0];
+		const yi = points[i][1];
+		let numerator = [1n];
+		let denominator = 1n;
+		for (let m = 0; m < n; m += 1) {
+			if (i === m) continue;
+			const xm = points[m][0];
+			numerator = polyMul(numerator, [xm, 1n]);
+			denominator = mul(denominator, xi ^ xm);
+		}
+		const scale = mul(yi, inv(denominator));
+		for (let deg = 0; deg < numerator.length; deg += 1) final[deg] ^= mul(numerator[deg], scale);
+	}
+	return final;
+}
+async function lane(key, salt, label) {
+	return (await hmac(key, concat(salt, utf8(label)))).subarray(0, 16);
+}
+function indicesFrom(block) {
+	const out = [
+		0,
+		0,
+		0,
+		0
+	];
+	for (let i = 0; i < 4; i += 1) {
+		const v = (block[i * 2] << 8 | block[i * 2 + 1]) & 65535;
+		out[i] = v % SPEC.lexiconSize;
+	}
+	return out;
+}
+function packIndices(indices) {
+	const out = /* @__PURE__ */ new Uint8Array(16);
+	for (let i = 0; i < 4; i += 1) {
+		const n = indices[i] & 65535;
+		out[i * 2] = n >> 8 & 255;
+		out[i * 2 + 1] = n & 255;
+	}
+	return out;
+}
+/** Coefficients only. The same Horner step serves every key. */
+async function compileBlocks(entries, slots = 4, salt = randomBytes(16)) {
+	if (entries.length < 1 || entries.length > slots) throw new Error("可编程槽位数量不对");
+	const points = [];
+	const seen = /* @__PURE__ */ new Set();
+	for (const entry of entries) {
+		if (entry.block.length !== 16) throw new Error("可编程明文要 16 字节");
+		const x = await lane(entry.key, salt, "x");
+		const r = await lane(entry.key, salt, "r");
+		const id = fromBytes(x).toString(16);
+		if (seen.has(id)) throw new Error("横坐标撞上了");
+		seen.add(id);
+		points.push([fromBytes(x), fromBytes(xor16(entry.block, r))]);
+	}
+	while (points.length < slots) {
+		const x = fromBytes(randomBytes(16));
+		const id = x.toString(16);
+		if (x === 0n || seen.has(id)) continue;
+		seen.add(id);
+		points.push([x, fromBytes(randomBytes(16))]);
+	}
+	return {
+		salt,
+		coeffs: lagrange(points).map(toBytes)
+	};
+}
+async function evalHoney(program, key) {
+	const x = await lane(key, program.salt, "x");
+	const r = await lane(key, program.salt, "r");
+	return xor16(toBytes(horner(program.coeffs.map(fromBytes), fromBytes(x))), r);
+}
+async function honeyPhrase(key, window, seed, program) {
+	const lex = await sessionLexicon(key, window);
+	const idx = indicesFrom(program ? await evalHoney(program, key) : await hkdf(key, u32be(window), seed.length ? seed : utf8("honey"), 16));
+	return `the ${lex[idx[0]]} and our ${lex[idx[1]]} that its ${lex[idx[2]]} and the ${lex[idx[3]]}`;
+}
+function scalarFromSeed(seed) {
+	let hex = "";
+	for (const b of seed) hex += b.toString(16).padStart(2, "0");
+	let n = p256.Point.Fn.create(BigInt(`0x${hex}`));
+	if (n === 0n) n = 1n;
+	return p256.Point.Fn.toBytes(n);
+}
+function b64url(bytes) {
+	let s = "";
+	for (const b of bytes) s += String.fromCharCode(b);
+	return btoa(s).replaceAll("+", "-").replaceAll("/", "_").replace(/=+$/g, "");
+}
+async function stretch(passphrase, salt, params) {
+	const c = clampKdf(params);
+	return argon2id(utf8(passphrase), salt, {
+		t: c.iterations,
+		m: c.memoryKiB,
+		p: c.parallelism,
+		dkLen: 32
+	});
+}
+/** Real passphrase and any programmed spare all sit in the same coefficients. */
+async function sealIdentityVault(entries, salt, params, slots = 4) {
+	const c = clampKdf(params);
+	const seenPass = /* @__PURE__ */ new Set();
+	for (const entry of entries) {
+		if (seenPass.has(entry.passphrase)) throw new Error("口令重复，封不进同一条求值");
+		seenPass.add(entry.passphrase);
+	}
+	for (;;) {
+		const pepper = randomBytes(16);
+		try {
+			const loEntries = [];
+			const hiEntries = [];
+			for (const entry of entries) {
+				if (entry.scalar.length !== 32) throw new Error("私钥标量要 32 字节");
+				const dk = await stretch(entry.passphrase, salt, c);
+				loEntries.push({
+					key: dk,
+					block: entry.scalar.subarray(0, 16)
+				});
+				hiEntries.push({
+					key: dk,
+					block: entry.scalar.subarray(16, 32)
+				});
+			}
+			return {
+				salt,
+				kdf: c,
+				lo: await compileBlocks(loEntries, slots, pepper),
+				hi: await compileBlocks(hiEntries, slots, pepper)
+			};
+		} catch (err) {
+			if (err instanceof Error && err.message === "横坐标撞上了") continue;
+			throw err;
+		}
+	}
+}
+/** Same steps for every passphrase. A spare one is not a separate branch. */
+async function openIdentityVault(vault, passphrase) {
+	const dk = await stretch(passphrase, vault.salt, vault.kdf);
+	const lo = await evalHoney(vault.lo, dk);
+	const hi = await evalHoney(vault.hi, dk);
+	const joined = /* @__PURE__ */ new Uint8Array(32);
+	joined.set(lo, 0);
+	joined.set(hi, 16);
+	const secret = scalarFromSeed(joined);
+	const pub = p256.getPublicKey(secret, false);
+	const x = b64url(pub.subarray(1, 33));
+	const y = b64url(pub.subarray(33, 65));
+	const d = b64url(secret);
+	return identityFromJwks({
+		kty: "EC",
+		crv: "P-256",
+		x,
+		y,
+		ext: true
+	}, {
+		kty: "EC",
+		crv: "P-256",
+		x,
+		y,
+		d,
+		ext: true
+	});
+}
+function unb64url(text) {
+	const pad = text.length % 4 === 0 ? "" : "=".repeat(4 - text.length % 4);
+	return unb64(text.replaceAll("-", "+").replaceAll("_", "/") + pad);
+}
+/** Scalar bytes of an unlocked key. Absent after a sealed key is reloaded. */
+function privateScalar(jwk) {
+	if (!jwk.d) throw new Error("私钥不在内存里");
+	const raw = unb64url(jwk.d);
+	if (raw.length !== 32) throw new Error("私钥标量长度不对");
+	return raw;
+}
+function programToStored(program) {
+	return {
+		saltB64: b64(program.salt),
+		coeffsB64: program.coeffs.map((item) => b64(item))
+	};
+}
+/** One shape for every stored program. Bad input is null, not a special key. */
+function programFromStored(raw) {
+	if (!raw || typeof raw !== "object") return null;
+	const rec = raw;
+	if (typeof rec.saltB64 !== "string" || !Array.isArray(rec.coeffsB64) || rec.coeffsB64.length < 1 || rec.coeffsB64.length > 8) return null;
+	try {
+		const salt = unb64(rec.saltB64);
+		if (salt.length !== 16) return null;
+		return {
+			salt,
+			coeffs: rec.coeffsB64.map((item) => {
+				if (typeof item !== "string") throw new Error("系数不对");
+				const bytes = unb64(item);
+				if (bytes.length !== 16) throw new Error("系数不对");
+				return bytes;
+			})
+		};
+	} catch {
+		return null;
+	}
+}
+function vaultToStored(vault) {
+	return {
+		saltB64: b64(vault.salt),
+		memoryKiB: vault.kdf.memoryKiB,
+		iterations: vault.kdf.iterations,
+		parallelism: vault.kdf.parallelism,
+		lo: programToStored(vault.lo),
+		hi: programToStored(vault.hi)
+	};
+}
+function vaultFromStored(raw) {
+	if (!raw || typeof raw !== "object") return null;
+	const rec = raw;
+	if (typeof rec.saltB64 !== "string") return null;
+	const lo = programFromStored(rec.lo);
+	const hi = programFromStored(rec.hi);
+	if (!lo || !hi) return null;
+	try {
+		const salt = unb64(rec.saltB64);
+		if (salt.length < 8) return null;
+		return {
+			salt,
+			kdf: clampKdf({
+				memoryKiB: rec.memoryKiB,
+				iterations: rec.iterations,
+				parallelism: rec.parallelism
+			}),
+			lo,
+			hi
+		};
+	} catch {
+		return null;
+	}
+}
+function blendBytes(real, cover, takeReal) {
+	const m = takeReal & 1;
+	const inv = 1 - m;
+	const n = m * real.length + inv * cover.length;
+	const out = new Uint8Array(n);
+	for (let i = 0; i < n; i += 1) {
+		const a = i < real.length ? real[i] : 0;
+		const b = i < cover.length ? cover[i] : 0;
+		out[i] = a * m + b * inv & 255;
+	}
+	return out;
+}
 var zstdReady = null;
 function ensureZstd() {
 	if (!zstdReady) zstdReady = (0, import_index_node.init)();
@@ -1638,7 +2012,7 @@ async function packPayload(data, pref) {
 /**
 * After a successful open, look at the first plaintext byte.
 * 0x00 is raw. 0x01 is a zstd frame; level and window are in that frame.
-* Honey mode maps a broken frame onto a public-lexicon sentence instead of throwing.
+* Honey mode maps a broken frame onto a sentence from this byte string's own lexicon.
 */
 async function unpackPayload(bytes, honey) {
 	if (bytes.length >= 1 && bytes[0] === 0) return {
@@ -1663,17 +2037,10 @@ async function unpackPayload(bytes, honey) {
 		honey: true
 	};
 }
-/** Distribution-transforming decoder: any seed becomes one sentence in the public lexicon. */
+/** Same sentence shape for every seed. Words come from that seed's lexicon, not the public list. */
 async function honeySentence(seed) {
-	const lex = await staticLexicon();
-	const words = [];
-	let material = seed.length ? seed : utf8("empty");
-	for (let i = 0; i < 4; i++) {
-		material = await sha256(concat(material, new Uint8Array([i])));
-		const idx = ((material[0] << 8 | material[1]) & 4095) % lex.length;
-		words.push(lex[idx]);
-	}
-	return `the ${words[0]} and our ${words[1]} that its ${words[2]} and the ${words[3]}`;
+	const material = seed.length ? seed : utf8("empty");
+	return honeyPhrase(material, 0, material);
 }
 var RECORD = {
 	heartbeat: 1,
@@ -1747,13 +2114,24 @@ async function seal(input) {
 		...body
 	], counter);
 }
+function macBit(a, b) {
+	const n = Math.max(a.length, b.length);
+	let diff = a.length === b.length ? 0 : 1;
+	for (let i = 0; i < n; i += 1) diff |= (a[i] ?? 0) ^ (b[i] ?? 0);
+	return Number(diff === 0);
+}
 async function open(input) {
 	const { key, inverse, window, direction, prose, lastSeen } = input;
+	const honey = input.honey === true;
 	const words = undress(prose);
 	if (words.length < 3) throw new LexisError("报文太短，不像一帧词隙");
+	let missing = false;
 	const take = (w) => {
 		const idx = inverse.get(w);
-		if (idx === void 0) throw new LexisError("有词不在本时间窗的词表里。密钥或时间窗不一致，或报文被改过。");
+		if (idx === void 0) {
+			missing = true;
+			return 0;
+		}
 		return idx;
 	};
 	const mask = mask24(await hmac(key, utf8(`lexis-counter-mask-v1|${direction}|${window}`)));
@@ -1764,33 +2142,33 @@ async function open(input) {
 		const ks12 = (ks[i * 2] << 8 | ks[i * 2 + 1]) & 4095;
 		return (take(w) - ks12 + SPEC.lexiconSize) % SPEC.lexiconSize;
 	}));
-	const honey = input.honey === true;
-	const asHoney = async () => ({
-		counter: lastSeen,
-		plaintext: utf8(await honeySentence(raw.length ? raw : utf8(prose))),
-		honey: true
-	});
-	if (raw.length < 2 + SPEC.macBytes) {
-		if (honey) return asHoney();
-		throw new LexisError("正文长度不够");
+	const seed = raw.length ? raw : utf8(prose);
+	const coverOf = () => honeyPhrase(key, window, seed, input.program);
+	const release = async (takeReal, real) => {
+		const cover = honey ? utf8(await coverOf()) : real;
+		const bit = honey ? takeReal & 1 : 1;
+		return {
+			counter: bit * counter + (1 - bit) * lastSeen,
+			plaintext: blendBytes(real, cover, bit),
+			honey: honey && bit === 0
+		};
+	};
+	if (missing || raw.length < 2 + SPEC.macBytes) {
+		if (!honey) throw new LexisError(missing ? "有词不在本时间窗的词表里。密钥或时间窗不一致，或报文被改过。" : "正文长度不够");
+		return release(0, /* @__PURE__ */ new Uint8Array());
 	}
 	const len = readU16(raw, 0);
 	if (2 + len + SPEC.macBytes > raw.length) {
-		if (honey) return asHoney();
-		throw new LexisError("正文字段被截断");
+		if (!honey) throw new LexisError("正文字段被截断");
+		return release(0, /* @__PURE__ */ new Uint8Array());
 	}
 	const plaintext = raw.slice(2, 2 + len);
-	if (!timingSafeEqual(raw.slice(2 + len, 2 + len + SPEC.macBytes), (await hmac(key, concat(utf8(`lexis-mac-v1|${direction}|`), u32be(counter), plaintext))).subarray(0, SPEC.macBytes))) {
-		if (honey) return asHoney();
-		throw new LexisError("校验失败。密钥、计数器或词表对不上。");
-	}
-	if (counter < 1) throw new LexisError("计数器无效");
-	if (counter <= lastSeen) throw new LexisError("计数器没有前进，按回放丢弃");
-	return {
-		counter,
-		plaintext,
-		honey: false
-	};
+	const ok = macBit(raw.slice(2 + len, 2 + len + SPEC.macBytes), (await hmac(key, concat(utf8(`lexis-mac-v1|${direction}|`), u32be(counter), plaintext))).subarray(0, SPEC.macBytes));
+	if (ok === 1) {
+		if (counter < 1) throw new LexisError("计数器无效");
+		if (counter <= lastSeen) throw new LexisError("计数器没有前进，按回放丢弃");
+	} else if (!honey) throw new LexisError("校验失败。密钥、计数器或词表对不上。");
+	return release(ok, plaintext);
 }
 function EntropyMeter({ wire, random }) {
 	const data = [{
@@ -2168,7 +2546,8 @@ function Bench({ session, onSession }) {
 				direction: lastFrame.direction,
 				prose: lastFrame.prose,
 				lastSeen: 0,
-				honey: session.honey
+				honey: session.honey,
+				program: programFromStored(profile.honeyProgram)
 			});
 			const text = isPrintableText(opened.plaintext) ? fromUtf8(opened.plaintext) : hex(opened.plaintext);
 			push({
@@ -2438,6 +2817,23 @@ function Bench({ session, onSession }) {
 function rid(prefix) {
 	return `${prefix}-${crypto.randomUUID().slice(0, 8)}`;
 }
+function parseKeyHex(text) {
+	const cleaned = text.trim().toLowerCase();
+	if (!/^[0-9a-f]{64}$/.test(cleaned)) return null;
+	const out = /* @__PURE__ */ new Uint8Array(32);
+	for (let i = 0; i < 32; i += 1) out[i] = Number.parseInt(cleaned.slice(i * 2, i * 2 + 2), 16);
+	return out;
+}
+function parseIndices(text) {
+	const parts = text.trim().split(/\s+/).map((item) => Number(item));
+	if (parts.length !== 4 || parts.some((n) => !Number.isInteger(n) || n < 0 || n >= SPEC.lexiconSize)) return null;
+	return [
+		parts[0],
+		parts[1],
+		parts[2],
+		parts[3]
+	];
+}
 function ConfigPanel() {
 	const profile = useProfile((s) => s.profile);
 	const patch = useProfile((s) => s.patch);
@@ -2448,12 +2844,54 @@ function ConfigPanel() {
 	const [ip, setIp] = (0, import_react.useState)("");
 	const [proc, setProc] = (0, import_react.useState)("");
 	const [minting, setMinting] = (0, import_react.useState)(false);
+	const [coverKey, setCoverKey] = (0, import_react.useState)("");
+	const [coverIdx, setCoverIdx] = (0, import_react.useState)("4 8 15 16");
+	const [coverKey2, setCoverKey2] = (0, import_react.useState)("");
+	const [coverIdx2, setCoverIdx2] = (0, import_react.useState)("");
+	const [coverError, setCoverError] = (0, import_react.useState)(null);
+	const [covering, setCovering] = (0, import_react.useState)(false);
 	const hit = matchRoute(profile, {
 		host,
 		ip,
 		process: proc
 	});
 	const issues = profileIssues(profile);
+	async function sealCover() {
+		const first = parseKeyHex(coverKey);
+		const idx = parseIndices(coverIdx);
+		if (!first || !idx) {
+			setCoverError("第一把密钥要 64 位十六进制，词序要四个 0 到 4095 的整数");
+			return;
+		}
+		const entries = [{
+			key: first,
+			block: packIndices(idx)
+		}];
+		if (coverKey2.trim() || coverIdx2.trim()) {
+			const second = parseKeyHex(coverKey2);
+			const idx2 = parseIndices(coverIdx2);
+			if (!second || !idx2) {
+				setCoverError("第二把密钥或词序没写全");
+				return;
+			}
+			entries.push({
+				key: second,
+				block: packIndices(idx2)
+			});
+		}
+		setCovering(true);
+		setCoverError(null);
+		try {
+			const program = await compileBlocks(entries, 4);
+			patch({ honeyProgram: programToStored(program) });
+			setCoverKey("");
+			setCoverKey2("");
+		} catch (err) {
+			setCoverError(err instanceof Error ? err.message : "封存失败");
+		} finally {
+			setCovering(false);
+		}
+	}
 	function setInbounds(inbounds) {
 		patch({ inbounds });
 	}
@@ -2586,7 +3024,7 @@ function ConfigPanel() {
 					}),
 					/* @__PURE__ */ (0, import_jsx_runtime.jsx)("p", {
 						className: "mt-2 text-sm text-mist",
-						children: "蜜文在握手时谈定。打开以后，校验对不上不报错，而按公开词表落成另一句话。线上没有「这是蜜文」的位。没有先验明文的人分不出猜对还是猜错。这个模式不再提示报文被改过。"
+						children: "蜜文在握手时谈定。打开以后，校验对不上不报错，而落成这把密钥和当前时间窗自己的词表里的一句话。换一把密钥，或换一个时间窗，词表格式不变、用词不同。备用明文写进同一条求值，不会为某一把密钥另开判断。线上没有「这是蜜文」的位。这个模式不再提示报文被改过。"
 					}),
 					/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", {
 						className: "mt-4 grid gap-3 sm:grid-cols-3",
@@ -2677,6 +3115,92 @@ function ConfigPanel() {
 								} }),
 								children: "不压缩"
 							})
+						]
+					}),
+					/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", {
+						className: "mt-4 grid gap-3",
+						children: [
+							/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("p", {
+								className: "text-sm text-mist",
+								children: [
+									"封面按会话密钥封进同一条求值。密钥写成 64 位十六进制，词序是四个 0 到 ",
+									SPEC.lexiconSize - 1,
+									" 的整数。封存之后只留系数。拆开时每一把密钥都走这一条，没有单独的判断。对得上的用你写的词序，对不上的仍是同一句式，词从那把密钥和当时的时间窗里取。"
+								]
+							}),
+							/* @__PURE__ */ (0, import_jsx_runtime.jsx)(Field, {
+								label: "密钥",
+								children: /* @__PURE__ */ (0, import_jsx_runtime.jsx)("input", {
+									className: control,
+									value: coverKey,
+									autoComplete: "off",
+									spellCheck: false,
+									placeholder: "64 位十六进制",
+									"aria-label": "封面密钥",
+									onChange: (e) => setCoverKey(e.target.value)
+								})
+							}),
+							/* @__PURE__ */ (0, import_jsx_runtime.jsx)(Field, {
+								label: "词序",
+								children: /* @__PURE__ */ (0, import_jsx_runtime.jsx)("input", {
+									className: control,
+									value: coverIdx,
+									autoComplete: "off",
+									"aria-label": "封面词序",
+									onChange: (e) => setCoverIdx(e.target.value)
+								})
+							}),
+							/* @__PURE__ */ (0, import_jsx_runtime.jsx)(Field, {
+								label: "第二把密钥",
+								children: /* @__PURE__ */ (0, import_jsx_runtime.jsx)("input", {
+									className: control,
+									value: coverKey2,
+									autoComplete: "off",
+									spellCheck: false,
+									placeholder: "可留空",
+									"aria-label": "第二把封面密钥",
+									onChange: (e) => setCoverKey2(e.target.value)
+								})
+							}),
+							/* @__PURE__ */ (0, import_jsx_runtime.jsx)(Field, {
+								label: "第二组词序",
+								children: /* @__PURE__ */ (0, import_jsx_runtime.jsx)("input", {
+									className: control,
+									value: coverIdx2,
+									autoComplete: "off",
+									placeholder: "可留空",
+									"aria-label": "第二组封面词序",
+									onChange: (e) => setCoverIdx2(e.target.value)
+								})
+							}),
+							/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", {
+								className: "flex flex-wrap gap-2",
+								children: [/* @__PURE__ */ (0, import_jsx_runtime.jsx)(Btn, {
+									kind: "ghost",
+									disabled: covering || !coverKey.trim(),
+									onClick: () => void sealCover(),
+									children: covering ? "封存中" : "把封面写进同一条求值"
+								}), profile.honeyProgram ? /* @__PURE__ */ (0, import_jsx_runtime.jsx)(Btn, {
+									kind: "ghost",
+									onClick: () => patch({ honeyProgram: null }),
+									children: "清掉封面系数"
+								}) : null]
+							}),
+							profile.honeyProgram ? /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("p", {
+								className: "text-sm text-mist",
+								children: [
+									"已封存 ",
+									profile.honeyProgram.coeffsB64.length,
+									" 个系数。密钥没有留下。导出配置会带上这组系数。"
+								]
+							}) : /* @__PURE__ */ (0, import_jsx_runtime.jsx)("p", {
+								className: "text-sm text-mist",
+								children: "还没有封面系数。不封存时，蜜文句子仍从这把密钥和当前时间窗的词表里取，只是词序不由你指定。"
+							}),
+							coverError ? /* @__PURE__ */ (0, import_jsx_runtime.jsx)("p", {
+								className: "text-sm text-ember",
+								children: coverError
+							}) : null
 						]
 					}),
 					/* @__PURE__ */ (0, import_jsx_runtime.jsx)("div", {
@@ -4124,6 +4648,10 @@ function readKdf(value) {
 		...clampKdf(raw)
 	};
 }
+function readVault(value) {
+	const vault = vaultFromStored(value);
+	return vault ? vaultToStored(vault) : null;
+}
 function NodesPanel() {
 	const nodes = useMesh((s) => s.nodes);
 	const addNode = useMesh((s) => s.addNode);
@@ -4167,7 +4695,8 @@ function NodesPanel() {
 				fingerprint: ident.fingerprint,
 				pinnedPeerId: null,
 				createdAt: Date.now(),
-				kdf: readKdf(data.kdf)
+				kdf: readKdf(data.kdf),
+				vault: readVault(data.vault)
 			};
 			addNode(node);
 			const peerFp = data.pinnedPeerFingerprint;
@@ -4179,10 +4708,15 @@ function NodesPanel() {
 			setError(err instanceof Error ? err.message : "侧车读不了");
 		}
 	}
-	async function deriveNode(id, passphrase) {
+	async function deriveNode(id, passphrase, spare) {
 		const trimmed = passphrase.trim();
+		const alt = spare.trim();
 		if (!trimmed) {
 			setError("先写口令");
+			return;
+		}
+		if (alt && alt === trimmed) {
+			setError("备用口令要和原口令不同");
 			return;
 		}
 		setBusy(true);
@@ -4190,20 +4724,63 @@ function NodesPanel() {
 		try {
 			const params = clampKdf(useProfile.getState().profile.kdf);
 			const salt = randomBytes(16);
-			const ident = await deriveIdentity(trimmed, salt, params);
+			const entries = [{
+				passphrase: trimmed,
+				scalar: privateScalar((await deriveIdentity(trimmed, salt, params)).privateJwk)
+			}];
+			if (alt) {
+				const other = await deriveIdentity(alt, salt, params);
+				entries.push({
+					passphrase: alt,
+					scalar: privateScalar(other.privateJwk)
+				});
+			}
+			const sealed = await sealIdentityVault(entries, salt, params, 4);
+			const opened = await openIdentityVault(sealed, trimmed);
 			const kdf = {
 				saltB64: b64(salt),
 				...params
 			};
 			setIdentity(id, {
-				publicJwk: ident.publicJwk,
-				privateJwk: ident.privateJwk,
-				publicRawB64: b64(ident.publicRaw),
-				fingerprint: ident.fingerprint,
-				kdf
+				publicJwk: opened.publicJwk,
+				privateJwk: opened.privateJwk,
+				publicRawB64: b64(opened.publicRaw),
+				fingerprint: opened.fingerprint,
+				kdf,
+				vault: vaultToStored(sealed)
 			});
 		} catch (err) {
 			setError(err instanceof Error ? err.message : "派生失败");
+		} finally {
+			setBusy(false);
+		}
+	}
+	async function unlockNode(id, passphrase) {
+		const trimmed = passphrase.trim();
+		if (!trimmed) {
+			setError("先写口令");
+			return;
+		}
+		const node = useMesh.getState().nodes.find((item) => item.id === id);
+		const sealed = node?.vault ? vaultFromStored(node.vault) : null;
+		if (!node || !sealed) {
+			setError("这把私钥还没有封存");
+			return;
+		}
+		setBusy(true);
+		setError(null);
+		try {
+			const opened = await openIdentityVault(sealed, trimmed);
+			setIdentity(id, {
+				publicJwk: opened.publicJwk,
+				privateJwk: opened.privateJwk,
+				publicRawB64: b64(opened.publicRaw),
+				fingerprint: opened.fingerprint,
+				kdf: node.kdf,
+				vault: node.vault
+			});
+		} catch (err) {
+			setError(err instanceof Error ? err.message : "解不开");
 		} finally {
 			setBusy(false);
 		}
@@ -4256,7 +4833,7 @@ function NodesPanel() {
 			}) : null,
 			/* @__PURE__ */ (0, import_jsx_runtime.jsx)("p", {
 				className: "text-sm text-mist",
-				children: "私钥只留在这台浏览器。口令派生不保存口令，也不存校验位：换一个口令只会得到另一把合法私钥，不会提示口令错误。"
+				children: "初始私钥按口令派生后，封成同一条求值的系数，口令本身不留下。任意一句口令都会解开一把合法私钥，再叠上当前时间窗，得到一份同样格式的词表。口令不同，或时间窗不同，词就不同，两句错误口令之间也不会撞成同一份。不会提示哪一句是当初那句。刷新之后标量不在浏览器里，要再解一次。"
 			}),
 			/* @__PURE__ */ (0, import_jsx_runtime.jsx)("div", {
 				className: "grid gap-3 lg:grid-cols-2",
@@ -4267,17 +4844,31 @@ function NodesPanel() {
 					onName: (name) => updateNode(node.id, { name }),
 					onBind: (peerId) => bindPair(node.id, peerId),
 					onRemove: () => removeNode(node.id),
-					onDerive: (passphrase) => deriveNode(node.id, passphrase),
+					onExport: () => {
+						if (node.vault && !node.privateJwk.d) {
+							setError("先解开，导出的侧车才带得走常驻进程要的私钥");
+							return;
+						}
+						downloadJson(`${node.role}-${node.fingerprint}.json`, sidecarOf(node, nodes.find((n) => n.id === node.pinnedPeerId)));
+					},
+					onDerive: (passphrase, spare) => deriveNode(node.id, passphrase, spare),
+					onUnlock: (passphrase) => unlockNode(node.id, passphrase),
 					resident: profile.identity?.id === node.id,
 					joined: profile.peers.some((peer) => peer.id === node.id),
-					onResident: () => patch({ identity: {
-						id: node.id,
-						name: node.name,
-						publicJwk: node.publicJwk,
-						privateJwk: node.privateJwk,
-						publicRawB64: node.publicRawB64,
-						fingerprint: node.fingerprint
-					} }),
+					onResident: () => {
+						if (node.vault && !node.privateJwk.d) {
+							setError("先解开，常驻身份才拿得到私钥");
+							return;
+						}
+						patch({ identity: {
+							id: node.id,
+							name: node.name,
+							publicJwk: node.publicJwk,
+							privateJwk: node.privateJwk,
+							publicRawB64: node.publicRawB64,
+							fingerprint: node.fingerprint
+						} });
+					},
 					onJoin: () => {
 						const next = {
 							id: node.id,
@@ -4298,10 +4889,29 @@ function NodesPanel() {
 		]
 	});
 }
-function NodeCard({ node, peers, peer, onName, onBind, onRemove, onDerive, resident, joined, onResident, onJoin }) {
+function NodeCard({ node, peers, peer, onName, onBind, onRemove, onExport, onDerive, onUnlock, resident, joined, onResident, onJoin }) {
 	const [peerId, setPeerId] = (0, import_react.useState)(node.pinnedPeerId ?? "");
 	const [passphrase, setPassphrase] = (0, import_react.useState)("");
+	const [spare, setSpare] = (0, import_react.useState)("");
 	const [deriving, setDeriving] = (0, import_react.useState)(false);
+	const [words, setWords] = (0, import_react.useState)("");
+	const sealed = Boolean(node.vault);
+	const unlocked = Boolean(node.privateJwk.d);
+	(0, import_react.useEffect)(() => {
+		let cancel = false;
+		if (!node.privateJwk.d) {
+			setWords("");
+			return;
+		}
+		sessionLexicon(privateScalar(node.privateJwk), currentWindow()).then((lex) => {
+			if (!cancel) setWords(`${lex[0]} · ${lex[1]} · ${lex[2]} · ${lex[3]}`);
+		}).catch(() => {
+			if (!cancel) setWords("");
+		});
+		return () => {
+			cancel = true;
+		};
+	}, [node.privateJwk.d, node.fingerprint]);
 	return /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("article", {
 		className: "rounded-md border border-line bg-panel p-4",
 		children: [
@@ -4338,12 +4948,21 @@ function NodeCard({ node, peers, peer, onName, onBind, onRemove, onDerive, resid
 					" KiB · 迭代 ",
 					node.kdf.iterations,
 					" · 并行 ",
-					node.kdf.parallelism
+					node.kdf.parallelism,
+					sealed ? " · 私钥以系数封存" : ""
 				]
 			}) : /* @__PURE__ */ (0, import_jsx_runtime.jsx)("p", {
 				className: "mt-2 text-sm text-mist",
 				children: "这把私钥是随机生成的，还没有用口令派生。"
 			}),
+			sealed && !unlocked ? /* @__PURE__ */ (0, import_jsx_runtime.jsx)("p", {
+				className: "mt-2 text-sm text-mist",
+				children: "标量不在这台浏览器里。输入任意口令都会解开一把合法私钥。"
+			}) : null,
+			words ? /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("p", {
+				className: "mt-2 text-sm text-mist",
+				children: ["本窗词表开头：", words]
+			}) : null,
 			/* @__PURE__ */ (0, import_jsx_runtime.jsx)("div", {
 				className: "mt-3 flex flex-col gap-2 sm:flex-row",
 				children: /* @__PURE__ */ (0, import_jsx_runtime.jsx)(Field, {
@@ -4383,7 +5002,7 @@ function NodeCard({ node, peers, peer, onName, onBind, onRemove, onDerive, resid
 					}),
 					/* @__PURE__ */ (0, import_jsx_runtime.jsxs)(Btn, {
 						kind: "ghost",
-						onClick: () => downloadJson(`${node.role}-${node.fingerprint}.json`, sidecarOf(node, peer)),
+						onClick: onExport,
 						children: [/* @__PURE__ */ (0, import_jsx_runtime.jsx)(Download, {
 							className: "size-4",
 							"aria-hidden": "true"
@@ -4405,21 +5024,48 @@ function NodeCard({ node, peers, peer, onName, onBind, onRemove, onDerive, resid
 							onChange: (e) => setPassphrase(e.target.value)
 						})
 					}),
-					/* @__PURE__ */ (0, import_jsx_runtime.jsx)(Btn, {
-						kind: "ghost",
-						disabled: deriving || !passphrase.trim(),
-						onClick: () => {
-							setDeriving(true);
-							onDerive(passphrase).finally(() => {
-								setPassphrase("");
-								setDeriving(false);
-							});
-						},
-						children: deriving ? "派生中" : "用 Argon2id 派生私钥"
+					/* @__PURE__ */ (0, import_jsx_runtime.jsx)(Field, {
+						label: "备用口令",
+						children: /* @__PURE__ */ (0, import_jsx_runtime.jsx)("input", {
+							className: control,
+							type: "password",
+							autoComplete: "off",
+							value: spare,
+							placeholder: "只在封存时写入，可留空",
+							"aria-label": `${node.name}的备用口令`,
+							onChange: (e) => setSpare(e.target.value)
+						})
+					}),
+					/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", {
+						className: "flex flex-wrap gap-2",
+						children: [/* @__PURE__ */ (0, import_jsx_runtime.jsx)(Btn, {
+							kind: "ghost",
+							disabled: deriving || !passphrase.trim(),
+							onClick: () => {
+								setDeriving(true);
+								onDerive(passphrase, spare).finally(() => {
+									setPassphrase("");
+									setSpare("");
+									setDeriving(false);
+								});
+							},
+							children: deriving ? "封存中" : "派生并封存"
+						}), sealed ? /* @__PURE__ */ (0, import_jsx_runtime.jsx)(Btn, {
+							kind: "ghost",
+							disabled: deriving || !passphrase.trim(),
+							onClick: () => {
+								setDeriving(true);
+								onUnlock(passphrase).finally(() => {
+									setPassphrase("");
+									setDeriving(false);
+								});
+							},
+							children: "用这句口令解开"
+						}) : null]
 					}),
 					/* @__PURE__ */ (0, import_jsx_runtime.jsx)("p", {
 						className: "text-sm text-mist",
-						children: "参数用配置页里的内存和迭代。派生会换掉指纹，绑定仍按节点编号。"
+						children: "参数用配置页里的内存和迭代。封存会换掉指纹，绑定仍按节点编号。解开不区分原口令和备用口令。"
 					})
 				]
 			}),
@@ -4452,7 +5098,7 @@ var STEPS = [
 	{
 		n: "04",
 		title: "密钥、计数器、词表一起封装",
-		body: "计数器先被密钥掩住，正文每 12 比特加上密钥流，再写成词。HMAC 还在。蜜文打开时，校验失败不报错，而落成公开词表里的另一句话。压不压缩看明文第一个字节，zstd 的等级在帧头里，对端不用另配一份开关。"
+		body: "计数器先被密钥掩住，正文每 12 比特加上密钥流，再写成词。HMAC 还在。蜜文打开时，校验失败不报错，而落成这把密钥和当前时间窗自己的词表里的一句话。换钥匙或换窗，词表仍是同样的格式，词不一样。压不压缩看明文第一个字节，zstd 的等级在帧头里，对端不用另配一份开关。"
 	}
 ];
 function Overview({ onOpen }) {

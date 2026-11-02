@@ -22,6 +22,7 @@ import { open, seal } from "../lib/lexis/seal";
 import type { MeshNode } from "../lib/lexis/types";
 
 export { createIdentity };
+export { programFromStored } from "../lib/lexis/honey";
 
 export type ZstdPref = { enabled: boolean; level: number };
 export type OuterName = "tcp" | "tls" | "ws" | "wss";
@@ -761,6 +762,7 @@ export class LexSession {
       prose,
       lastSeen: live.seen[dir],
       honey,
+      program: live.program ?? null,
     });
     if (!opened.honey) live.seen[dir] = opened.counter;
     return opened;
@@ -902,6 +904,7 @@ export async function connectSession(opts: {
   handshakeMs?: number;
   rekeyAt?: number;
   peerId?: string;
+  program?: LiveSession["program"];
   onReady?: (session: LexSession) => void;
   onStream?: (stream: MuxStream) => void;
 }) {
@@ -924,6 +927,7 @@ export async function connectSession(opts: {
     kdf: finished.kdf,
     honey: finished.honey,
     kdfMs: finished.kdfMs,
+    program: opts.program ?? null,
   });
   return sessionFrom(
     opts.pipe,
@@ -951,6 +955,7 @@ export async function acceptSession(opts: {
   handshakeMs?: number;
   rekeyAt?: number;
   sourceIp?: string;
+  program?: LiveSession["program"];
   onReady?: (session: LexSession) => void;
   onStream?: (stream: MuxStream) => void;
 }) {
@@ -993,6 +998,7 @@ export async function acceptSession(opts: {
     kdf: pending.kdf,
     honey,
     kdfMs: 0,
+    program: opts.program ?? null,
   });
   return sessionFrom(
     opts.pipe,

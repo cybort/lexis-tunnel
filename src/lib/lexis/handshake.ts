@@ -25,6 +25,7 @@ import {
 import { invertLexicon, sessionLexicon } from "./lexicon";
 import { SPEC } from "./spec";
 import type { MeshNode } from "./types";
+import type { HoneyProgram } from "./honey";
 
 export type Direction = "e2g" | "g2e";
 
@@ -46,6 +47,8 @@ export type LiveSession = {
   kdf: ArgonParams;
   honey: boolean;
   kdfMs: number;
+  /** Cover coefficients. Evaluated for every key; omitted when unset. */
+  program?: HoneyProgram | null;
 };
 
 export type EdgePending = {
@@ -390,6 +393,7 @@ export async function openSession(opts: {
   kdf: ArgonParams;
   honey: boolean;
   kdfMs: number;
+  program?: HoneyProgram | null;
 }): Promise<LiveSession> {
   const lexicon = await sessionLexicon(opts.sk, opts.window);
   const inverse = invertLexicon(lexicon);
@@ -412,6 +416,7 @@ export async function openSession(opts: {
     kdf: opts.kdf,
     honey: opts.honey,
     kdfMs: opts.kdfMs,
+    program: opts.program ?? null,
   };
 }
 

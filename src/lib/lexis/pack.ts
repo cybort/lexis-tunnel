@@ -1,7 +1,7 @@
 import { init, compress, decompress } from "@bokuweb/zstd-wasm";
 import { concat, utf8 } from "./bytes";
-import { LexisError, sha256 } from "./crypto";
-import { staticLexicon } from "./lexicon";
+import { LexisError } from "./crypto";
+import { honeyPhrase } from "./honey";
 
 /** Inside the encrypted plaintext. Not a cleartext header and not a shared switch. */
 export const PLAIN_TAG = 0x00;
@@ -48,7 +48,7 @@ export type Unpacked = { data: Uint8Array; compressed: boolean; honey: boolean }
 /**
  * After a successful open, look at the first plaintext byte.
  * 0x00 is raw. 0x01 is a zstd frame; level and window are in that frame.
- * Honey mode maps a broken frame onto a public-lexicon sentence instead of throwing.
+ * Honey mode maps a broken frame onto a sentence from this byte string's own lexicon.
  */
 export async function unpackPayload(bytes: Uint8Array, honey: boolean): Promise<Unpacked> {
   if (bytes.length >= 1 && bytes[0] === PLAIN_TAG) {
@@ -68,15 +68,8 @@ export async function unpackPayload(bytes: Uint8Array, honey: boolean): Promise<
   return { data: utf8(await honeySentence(bytes)), compressed: false, honey: true };
 }
 
-/** Distribution-transforming decoder: any seed becomes one sentence in the public lexicon. */
+/** Same sentence shape for every seed. Words come from that seed's lexicon, not the public list. */
 export async function honeySentence(seed: Uint8Array): Promise<string> {
-  const lex = await staticLexicon();
-  const words: string[] = [];
-  let material = seed.length ? seed : utf8("empty");
-  for (let i = 0; i < 4; i++) {
-    material = await sha256(concat(material, new Uint8Array([i])));
-    const idx = (((material[0] << 8) | material[1]) & 0xfff) % lex.length;
-    words.push(lex[idx]);
-  }
-  return `the ${words[0]} and our ${words[1]} that its ${words[2]} and the ${words[3]}`;
+  const material = seed.length ? seed : utf8("empty");
+  return honeyPhrase(material, 0, material);
 }

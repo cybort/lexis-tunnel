@@ -3,7 +3,14 @@ import { persist, createJSONStorage } from "zustand/middleware";
 import { b64 } from "./bytes";
 import { createIdentity } from "./crypto";
 import { SPEC } from "./spec";
-import type { MeshNode, PortMap } from "./types";
+import type { MeshNode, PortMap, StoredVault } from "./types";
+
+/** Disk copy drops the scalar when a vault holds it. The running tab keeps `d`. */
+function persistedNode(node: MeshNode): MeshNode {
+  if (!node.vault || !node.privateJwk.d) return node;
+  const { d: _scalar, ...privateJwk } = node.privateJwk;
+  return { ...node, privateJwk };
+}
 
 type MeshState = {
   nodes: MeshNode[];
@@ -18,7 +25,7 @@ type MeshState = {
   seed: (nodes: MeshNode[], mappings: PortMap[]) => void;
   setIdentity: (
     id: string,
-    next: Pick<MeshNode, "publicJwk" | "privateJwk" | "publicRawB64" | "fingerprint" | "kdf">,
+    next: Pick<MeshNode, "publicJwk" | "privateJwk" | "publicRawB64" | "fingerprint" | "kdf"> & { vault?: StoredVault | null },
   ) => void;
   reset: () => void;
 };
@@ -66,6 +73,10 @@ export const useMesh = create<MeshState>()(
       storage: createJSONStorage(() => localStorage),
       skipHydration: true,
       version: 1,
+      partialize: (state) => ({
+        nodes: state.nodes.map(persistedNode),
+        mappings: state.mappings,
+      }),
     },
   ),
 );
@@ -83,6 +94,7 @@ export async function makeNode(name: string, role: MeshNode["role"]): Promise<Me
     pinnedPeerId: null,
     createdAt: Date.now(),
     kdf: null,
+    vault: null,
   };
 }
 
@@ -144,6 +156,7 @@ export function sidecarOf(node: MeshNode, peer: MeshNode | undefined) {
     lexiconSize: SPEC.lexiconSize,
     handshake: "p256-ecdh-argon2id",
     kdf: node.kdf,
+    vault: node.vault ?? null,
     wire: "secret-lexicon-prose",
   };
 }

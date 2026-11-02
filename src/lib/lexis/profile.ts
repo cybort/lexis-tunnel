@@ -1,4 +1,5 @@
 import { clampKdf, DEFAULT_KDF, type ArgonParams } from "./kdf";
+import type { StoredProgram } from "./types";
 
 export const PROFILE_VERSION = 1 as const;
 
@@ -105,6 +106,8 @@ export type LexisProfile = {
   android: { method: "vpn"; mtu: number; address: string; dns: string };
   kdf: ArgonParams;
   honey: boolean;
+  /** Cover coefficients. Keys used to compile it are not stored. */
+  honeyProgram: StoredProgram | null;
   zstd: { enabled: boolean; level: number };
   link: {
     token: string;
@@ -211,6 +214,7 @@ export function defaultProfile(): LexisProfile {
     android: { method: "vpn", mtu: 1500, address: "10.7.0.2/32", dns: "1.1.1.1" },
     kdf: { ...DEFAULT_KDF },
     honey: false,
+    honeyProgram: null,
     zstd: { enabled: false, level: 3 },
     link: { token: "", idleMs: 120000, maxConns: 128, headerBytes: 8192, allowLan: false, handshakeMs: 10000, dialMs: 10000, maxHandshakes: 2 },
     egress: { blockPrivate: true, allow: [] },
@@ -274,6 +278,7 @@ export function normalizeProfile(input: unknown): LexisProfile {
     statusPort: clampNum(raw.statusPort, 1, 65535, base.statusPort),
     kdf: clampKdf(raw.kdf),
     honey: raw.honey === true,
+    honeyProgram: normalizeProgram(raw.honeyProgram),
     zstd: {
       enabled: Boolean(raw.zstd && raw.zstd.enabled),
       level: clampNum(raw.zstd?.level, 1, 19, base.zstd.level),
@@ -302,6 +307,15 @@ export function normalizeProfile(input: unknown): LexisProfile {
     exposes: Array.isArray(raw.exposes) ? raw.exposes.map((item) => normalizeExpose(item)) : [],
     reverses: Array.isArray(raw.reverses) ? raw.reverses.map((item) => normalizeReverse(item)) : [],
   };
+}
+
+function normalizeProgram(raw: unknown): StoredProgram | null {
+  if (!raw || typeof raw !== "object") return null;
+  const rec = raw as { saltB64?: unknown; coeffsB64?: unknown };
+  if (typeof rec.saltB64 !== "string" || !rec.saltB64) return null;
+  if (!Array.isArray(rec.coeffsB64) || rec.coeffsB64.length < 1 || rec.coeffsB64.length > 8) return null;
+  if (!rec.coeffsB64.every((item) => typeof item === "string" && item.length > 0)) return null;
+  return { saltB64: rec.saltB64, coeffsB64: [...rec.coeffsB64] };
 }
 
 function isOuter(value: unknown): value is OuterTransport {
