@@ -22,7 +22,7 @@ import { open, seal } from "../lib/lexis/seal";
 import type { MeshNode } from "../lib/lexis/types";
 
 export { createIdentity };
-export { programFromStored } from "../lib/lexis/honey";
+export { openIdentityVault, programFromStored, vaultFromStored } from "../lib/lexis/honey";
 
 export type ZstdPref = { enabled: boolean; level: number };
 export type OuterName = "tcp" | "tls" | "ws" | "wss";
@@ -433,6 +433,8 @@ export function dialOuter(opts: {
   wsHost?: string;
   tlsVerify?: boolean;
   timeoutMs?: number;
+  /** When set, this socket is already marked. TLS and WebSocket wrap it. Node connects; C does not. */
+  openTcp?: (host: string, port: number) => Socket;
 }): Promise<ProsePipe> {
   const transport = opts.transport || "tcp";
   const tls = transport === "tls" || transport === "wss";
@@ -440,15 +442,16 @@ export function dialOuter(opts: {
   const name = sniName(opts.wsHost || opts.host);
   if (tls && opts.tlsVerify === false) warnUnverifiedTls();
   return new Promise((resolve, reject) => {
+    const raw = opts.openTcp ? opts.openTcp(opts.host, opts.port) : connectTcp({ host: opts.host, port: opts.port });
     const socket = tls
       ? connectTls({
-          host: opts.host,
-          port: opts.port,
+          socket: raw,
           ...(name ? { servername: name } : {}),
           rejectUnauthorized: opts.tlsVerify !== false,
         })
-      : connectTcp({ host: opts.host, port: opts.port });
+      : raw;
     const fail = (err: Error) => {
+      raw.destroy();
       socket.destroy();
       reject(err);
     };
@@ -859,8 +862,13 @@ export class LexSession {
         }
         if (opened.honey) continue;
         this.lastRx = Date.now();
-        const raw = await unpackRecord(opened.plaintext);
-        const rec = decodeRecord(raw);
+        let rec;
+        try {
+          const raw = await unpackRecord(opened.plaintext);
+          rec = decodeRecord(raw);
+        } catch {
+          continue;
+        }
         await this.onRecord(rec.type, rec.conn, rec.payload);
       }
     } catch (err) {

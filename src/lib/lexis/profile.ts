@@ -1,5 +1,6 @@
-import { clampKdf, DEFAULT_KDF, type ArgonParams } from "./kdf";
-import type { StoredProgram } from "./types";
+import { clampKdf, clampVaultKdf, DEFAULT_KDF, type ArgonParams } from "./kdf";
+import { vaultFromStored, vaultToStored } from "./honey";
+import type { StoredProgram, StoredVault } from "./types";
 
 export const PROFILE_VERSION = 1 as const;
 
@@ -87,7 +88,7 @@ export type ReverseDoor = {
 export type LexisProfile = {
   version: typeof PROFILE_VERSION;
   name: string;
-  role: ClientRole;
+  role: ClientRole | "";
   mode: RunMode;
   logLevel: "info" | "debug";
   peerEndpoint: string;
@@ -100,6 +101,8 @@ export type LexisProfile = {
   geoipUrl: string;
   statusHost: string;
   statusPort: number;
+  /** Required before /metrics or the status page leaves loopback. /health stays open. */
+  statusToken: string;
   heartbeatSec: number;
   linux: { method: "tproxy" | "redirect" | "tun"; mark: number; table: number; dnsRedirect: boolean };
   windows: { method: "windivert" | "portproxy"; gateway: string };
@@ -108,6 +111,8 @@ export type LexisProfile = {
   honey: boolean;
   /** Cover coefficients. Keys used to compile it are not stored. */
   honeyProgram: StoredProgram | null;
+  /** Long-term key coefficients. Exported config drops this and the scalar. */
+  seal: StoredVault | null;
   zstd: { enabled: boolean; level: number };
   link: {
     token: string;
@@ -208,6 +213,7 @@ export function defaultProfile(): LexisProfile {
     geoipUrl: "",
     statusHost: "127.0.0.1",
     statusPort: 17890,
+    statusToken: "",
     heartbeatSec: 15,
     linux: { method: "redirect", mark: 255, table: 100, dnsRedirect: true },
     windows: { method: "portproxy", gateway: "10.7.0.1" },
@@ -215,6 +221,7 @@ export function defaultProfile(): LexisProfile {
     kdf: { ...DEFAULT_KDF },
     honey: false,
     honeyProgram: null,
+    seal: null,
     zstd: { enabled: false, level: 3 },
     link: { token: "", idleMs: 120000, maxConns: 128, headerBytes: 8192, allowLan: false, handshakeMs: 10000, dialMs: 10000, maxHandshakes: 2 },
     egress: { blockPrivate: true, allow: [] },
@@ -264,7 +271,7 @@ export function normalizeProfile(input: unknown): LexisProfile {
     ...base,
     ...raw,
     version: PROFILE_VERSION,
-    role: raw.role === "gate" ? "gate" : "edge",
+    role: raw.role === "gate" ? "gate" : raw.role === "edge" ? "edge" : "",
     mode: raw.mode === "system-forward" ? "system-forward" : "fixed-port",
     logLevel: raw.logLevel === "debug" ? "debug" : "info",
     processDefault: isAction(raw.processDefault) ? raw.processDefault : base.processDefault,
@@ -275,10 +282,13 @@ export function normalizeProfile(input: unknown): LexisProfile {
     windows: { ...base.windows, ...(raw.windows ?? {}) },
     android: { ...base.android, ...(raw.android ?? {}) },
     heartbeatSec: clampNum(raw.heartbeatSec, 5, 120, base.heartbeatSec),
+    statusHost: typeof raw.statusHost === "string" && raw.statusHost.trim() ? raw.statusHost.trim() : base.statusHost,
     statusPort: clampNum(raw.statusPort, 1, 65535, base.statusPort),
+    statusToken: typeof raw.statusToken === "string" ? raw.statusToken : "",
     kdf: clampKdf(raw.kdf),
     honey: raw.honey === true,
     honeyProgram: normalizeProgram(raw.honeyProgram),
+    seal: normalizeSeal(raw.seal),
     zstd: {
       enabled: Boolean(raw.zstd && raw.zstd.enabled),
       level: clampNum(raw.zstd?.level, 1, 19, base.zstd.level),
@@ -316,6 +326,29 @@ function normalizeProgram(raw: unknown): StoredProgram | null {
   if (!Array.isArray(rec.coeffsB64) || rec.coeffsB64.length < 1 || rec.coeffsB64.length > 8) return null;
   if (!rec.coeffsB64.every((item) => typeof item === "string" && item.length > 0)) return null;
   return { saltB64: rec.saltB64, coeffsB64: [...rec.coeffsB64] };
+}
+
+function normalizeSeal(raw: unknown): StoredVault | null {
+  const vault = vaultFromStored(raw);
+  if (!vault) return null;
+  const stored = vaultToStored(vault);
+  const kdf = clampVaultKdf(stored);
+  return { ...stored, memoryKiB: kdf.memoryKiB, iterations: kdf.iterations, parallelism: kdf.parallelism };
+}
+
+function withoutScalar(jwk: JsonWebKey): JsonWebKey {
+  if (!jwk.d) return jwk;
+  const { d: _scalar, ...rest } = jwk;
+  return rest;
+}
+
+/** Public config. A seal stays in lexis.seal.json, never beside the public key. */
+export function exportedConfig(profile: LexisProfile): LexisProfile {
+  if (!profile.seal) return profile;
+  const identity = profile.identity
+    ? { ...profile.identity, privateJwk: withoutScalar(profile.identity.privateJwk) }
+    : profile.identity;
+  return { ...profile, identity, seal: null };
 }
 
 function isOuter(value: unknown): value is OuterTransport {
@@ -602,6 +635,14 @@ function mapAction(value: string): RuleAction {
 
 export function profileIssues(profile: LexisProfile): string[] {
   const issues: string[] = [];
+  if (profile.role !== "edge" && profile.role !== "gate") {
+    issues.push("常驻进程不接受缺省角色。写成 edge 或 gate");
+  }
+  const statusHost = profile.statusHost.trim().toLowerCase();
+  const statusLoopback = statusHost === "127.0.0.1" || statusHost === "::1" || statusHost === "localhost";
+  if (!statusLoopback && !profile.statusToken.trim()) {
+    issues.push("状态页不在回环上，要填状态口令，否则指标和页面会拒绝");
+  }
   const seen = new Set<string>();
   for (const inbound of profile.inbounds) {
     const key = `${inbound.listen}:${inbound.port}`;

@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { cidrContains, defaultProfile, importClashRules, importSingBox, matchRoute, normalizeProfile, profileIssues } from "./profile.ts";
+import { cidrContains, defaultProfile, exportedConfig, importClashRules, importSingBox, matchRoute, normalizeProfile, profileIssues } from "./profile.ts";
 
 const profile = defaultProfile();
 
@@ -48,6 +48,43 @@ assert.equal(upgraded.egress.blockPrivate, true);
 assert.equal(upgraded.outer.transport, "tcp");
 assert.equal(upgraded.outer.wsPath, "/lexis");
 assert.equal(upgraded.identity, null);
+assert.equal(upgraded.seal, null);
+assert.equal(normalizeProfile({ kdf: { memoryKiB: 65536, iterations: 3, parallelism: 1 } }).kdf.memoryKiB, 16384);
+const coeff = "AAAAAAAAAAAAAAAAAAAAAA==";
+const sealed = normalizeProfile({
+  seal: {
+    saltB64: coeff,
+    memoryKiB: 65536,
+    iterations: 3,
+    parallelism: 1,
+    lo: { saltB64: coeff, coeffsB64: [coeff] },
+    hi: { saltB64: coeff, coeffsB64: [coeff] },
+  },
+});
+assert.equal(sealed.seal?.memoryKiB, 65536);
+assert.equal(normalizeProfile({ seal: { saltB64: "aa" } }).seal, null);
+const identity = {
+  id: "i",
+  name: "本机",
+  publicJwk: { kty: "EC", crv: "P-256", x: "aa", y: "bb" },
+  privateJwk: { kty: "EC", crv: "P-256", x: "aa", y: "bb", d: "secret" },
+  publicRawB64: "aa",
+  fingerprint: "fp",
+};
+const published = exportedConfig({ ...defaultProfile(), seal: sealed.seal, identity });
+assert.equal(published.seal, null);
+assert.equal(published.identity?.privateJwk.d, undefined);
+assert.equal(published.identity?.publicJwk.x, "aa");
+assert.equal(exportedConfig({ ...defaultProfile(), identity }).identity?.privateJwk.d, "secret");
 assert.equal(profileIssues(upgraded).some((item) => item.includes("身份")), true);
+assert.equal(defaultProfile().role, "edge");
+assert.equal(normalizeProfile({}).role, "");
+assert.equal(normalizeProfile({ role: "nope" }).role, "");
+assert.equal(normalizeProfile({ role: "edge" }).role, "edge");
+assert.equal(profileIssues(normalizeProfile({})).some((item) => item.includes("角色")), true);
+assert.equal(normalizeProfile({ statusToken: "abc" }).statusToken, "abc");
+const wide = normalizeProfile({ role: "edge", statusHost: "0.0.0.0" });
+assert.equal(profileIssues(wide).some((item) => item.includes("状态口令")), true);
+assert.equal(profileIssues(normalizeProfile({ role: "edge", statusHost: "0.0.0.0", statusToken: "x" })).some((item) => item.includes("状态口令")), false);
 
 console.log("profile ok");

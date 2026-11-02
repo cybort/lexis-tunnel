@@ -10,6 +10,16 @@ fi
 if [ -f "$HERE/lexis-tls.crt" ] && [ -f "$HERE/lexis-tls.key" ]; then
   cp "$HERE/lexis-tls.crt" "$HERE/lexis-tls.key" "$DEST/"
 fi
+for name in lexis.seal.json lexis.passphrase; do
+  if [ -f "$HERE/$name" ]; then
+    cp "$HERE/$name" "$DEST/"
+  fi
+done
+for name in lexis.config.json lexis.seal.json lexis.passphrase lexis-tls.key; do
+  if [ -f "$DEST/$name" ]; then
+    chmod 600 "$DEST/$name"
+  fi
+done
 if ! command -v node >/dev/null 2>&1; then
   echo "在 Termux 里先安装 Node.js 22：pkg install nodejs"
   exit 1

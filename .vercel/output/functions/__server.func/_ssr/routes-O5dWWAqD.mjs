@@ -6,7 +6,7 @@ import { t as p256 } from "../_libs/noble__curves+noble__hashes.mjs";
 import { t as argon2id } from "../_libs/noble__hashes.mjs";
 import { t as require_index_node } from "../_libs/bokuweb__zstd-wasm.mjs";
 import { a as Cell, i as Bar, n as YAxis, o as ResponsiveContainer, r as XAxis, s as Tooltip, t as BarChart } from "../_libs/recharts+[...].mjs";
-//#region node_modules/.nitro/vite/services/ssr/assets/routes-CC6Tl0li.js
+//#region node_modules/.nitro/vite/services/ssr/assets/routes-O5dWWAqD.js
 var import_react = /* @__PURE__ */ __toESM(require_react());
 var import_jsx_runtime = require_jsx_runtime();
 var import_index_node = require_index_node();
@@ -354,21 +354,31 @@ async function ensureSeed() {
 		seeding = false;
 	}
 }
+function sealFileOf(vault) {
+	return {
+		saltB64: vault.saltB64,
+		memoryKiB: vault.memoryKiB,
+		iterations: vault.iterations,
+		parallelism: vault.parallelism,
+		lo: vault.lo,
+		hi: vault.hi
+	};
+}
 function sidecarOf(node, peer) {
+	const secret = node.vault ? void 0 : node.privateJwk;
 	return {
 		cipher: SPEC.name,
 		role: node.role,
 		name: node.name,
 		fingerprint: node.fingerprint,
 		publicJwk: node.publicJwk,
-		privateJwk: node.privateJwk,
+		privateJwk: secret,
 		pinnedPeerFingerprint: peer?.fingerprint ?? null,
 		pinnedPeerPublicJwk: peer?.publicJwk ?? null,
 		windowSeconds: SPEC.windowSec,
 		lexiconSize: SPEC.lexiconSize,
 		handshake: "p256-ecdh-argon2id",
 		kdf: node.kdf,
-		vault: node.vault ?? null,
 		wire: "secret-lexicon-prose"
 	};
 }
@@ -384,6 +394,12 @@ function downloadJson(filename, data) {
 var DEFAULT_KDF = {
 	memoryKiB: 4096,
 	iterations: 2,
+	parallelism: 1
+};
+/** At-rest private key. Not the handshake cap. A guess costs this much even if the public key is known. */
+var VAULT_KDF = {
+	memoryKiB: 65536,
+	iterations: 3,
 	parallelism: 1
 };
 var LIMITS = {
@@ -423,6 +439,15 @@ function clampOffer(input) {
 		honey: input?.honey === true
 	};
 }
+/** Vault cost. Explicit small values stay, so tests can use a tiny memory. Missing values become VAULT_KDF.
+*  This does not use the handshake ceiling of 16384 KiB. */
+function clampVaultKdf(input) {
+	return {
+		memoryKiB: clampInt(input?.memoryKiB, 8, 262144, VAULT_KDF.memoryKiB),
+		iterations: clampInt(input?.iterations, 1, 8, VAULT_KDF.iterations),
+		parallelism: clampInt(input?.parallelism, 1, 1, VAULT_KDF.parallelism)
+	};
+}
 function encodeKdf(params) {
 	const c = clampKdf(params);
 	return new Uint8Array([
@@ -445,49 +470,6 @@ function featureByte(honey) {
 function honeyFromFeatures(features) {
 	return (features & 1) !== 0;
 }
-function scalarFromSeed$1(seed) {
-	let hex = "";
-	for (const b of seed) hex += b.toString(16).padStart(2, "0");
-	let n = p256.Point.Fn.create(BigInt(`0x${hex}`));
-	if (n === 0n) n = 1n;
-	return p256.Point.Fn.toBytes(n);
-}
-function b64url$1(bytes) {
-	let s = "";
-	for (const b of bytes) s += String.fromCharCode(b);
-	return btoa(s).replaceAll("+", "-").replaceAll("/", "_").replace(/=+$/g, "");
-}
-/**
-* Long-term private key = hash-to-scalar(Argon2id(passphrase, salt)).
-* There is no password verifier. A different passphrase is a different valid key.
-*/
-async function deriveIdentity(passphrase, salt, params) {
-	const c = clampKdf(params);
-	const secret = scalarFromSeed$1(argon2id(utf8(passphrase), salt, {
-		t: c.iterations,
-		m: c.memoryKiB,
-		p: c.parallelism,
-		dkLen: 32
-	}));
-	const pub = p256.getPublicKey(secret, false);
-	const x = b64url$1(pub.subarray(1, 33));
-	const y = b64url$1(pub.subarray(33, 65));
-	const d = b64url$1(secret);
-	return identityFromJwks({
-		kty: "EC",
-		crv: "P-256",
-		x,
-		y,
-		ext: true
-	}, {
-		kty: "EC",
-		crv: "P-256",
-		x,
-		y,
-		d,
-		ext: true
-	});
-}
 /** Session key from the two ECDH shares. Salt is the handshake nonces, not a config file. */
 function deriveSessionKey(ssE, ssS, nonceC, nonceS, window, features, params) {
 	const c = clampKdf(params);
@@ -505,6 +487,507 @@ function deriveSessionKey(ssE, ssS, nonceC, nonceS, window, features, params) {
 var sessionDeriver = async (ssE, ssS, nonceC, nonceS, window, features, params) => deriveSessionKey(ssE, ssS, nonceC, nonceS, window, features, params);
 function deriveSessionKeyAsync(ssE, ssS, nonceC, nonceS, window, features, params) {
 	return sessionDeriver(ssE, ssS, nonceC, nonceS, window, features, params);
+}
+/**
+* Pronounceable triples. Empty onset/coda are omitted so every word is at least 3 letters
+* and the letter distribution stays inside a small alphabet (low byte entropy on the wire).
+*/
+var ONSETS = [
+	"b",
+	"c",
+	"d",
+	"f",
+	"g",
+	"h",
+	"j",
+	"k",
+	"l",
+	"m",
+	"n",
+	"p",
+	"r",
+	"s",
+	"t",
+	"v",
+	"w",
+	"z",
+	"bl",
+	"br",
+	"ch",
+	"cl",
+	"cr",
+	"dr",
+	"fl",
+	"fr",
+	"gl",
+	"gr",
+	"pl",
+	"pr",
+	"sc",
+	"sh",
+	"sk",
+	"sl",
+	"sm",
+	"sn",
+	"sp",
+	"st",
+	"sw",
+	"th",
+	"tr",
+	"tw",
+	"wh",
+	"qu"
+];
+var NUCLEI = [
+	"a",
+	"e",
+	"i",
+	"o",
+	"u",
+	"ae",
+	"ai",
+	"au",
+	"ea",
+	"ee",
+	"ia",
+	"ie",
+	"io",
+	"oa",
+	"oe",
+	"oo",
+	"ou"
+];
+var CODAS = [
+	"d",
+	"k",
+	"l",
+	"m",
+	"n",
+	"p",
+	"r",
+	"s",
+	"t",
+	"x",
+	"ld",
+	"ll",
+	"nd",
+	"nt",
+	"rd",
+	"rn",
+	"sh",
+	"st",
+	"th"
+];
+var SPACE = ONSETS.length * NUCLEI.length * CODAS.length;
+function wordFromIndex(n) {
+	const coda = n % CODAS.length;
+	const nucleus = Math.floor(n / CODAS.length) % NUCLEI.length;
+	return ONSETS[Math.floor(n / (CODAS.length * NUCLEI.length))] + NUCLEI[nucleus] + CODAS[coda];
+}
+async function buildLexicon(seed) {
+	if (SPACE < SPEC.lexiconSize || SPACE >= 65536) throw new Error("音节空间尺寸不对");
+	const used = new Uint8Array(SPACE);
+	const seen = /* @__PURE__ */ new Set();
+	const words = [];
+	const limit = Math.floor(65536 / SPACE) * SPACE;
+	let round = 0;
+	let pool = /* @__PURE__ */ new Uint8Array(0);
+	let pos = 0;
+	const pull = async () => {
+		pool = await hkdfStream(seed, utf8(`LEXIS-LEX-STREAM-${round}`), "idx", 16e3);
+		round += 1;
+		pos = 0;
+	};
+	const next16 = async () => {
+		if (pos + 2 > pool.length) await pull();
+		const v = pool[pos] << 8 | pool[pos + 1];
+		pos += 2;
+		return v;
+	};
+	let guard = 0;
+	while (words.length < SPEC.lexiconSize) {
+		if (guard++ > SPACE * 4) throw new Error("词表生成失败");
+		let draw = await next16();
+		while (draw >= limit) draw = await next16();
+		const n = draw % SPACE;
+		if (used[n]) continue;
+		used[n] = 1;
+		const w = wordFromIndex(n);
+		if (w.length < 3 || GLUE_SET.has(w) || seen.has(w)) continue;
+		seen.add(w);
+		words.push(w);
+	}
+	return words;
+}
+var staticCache = null;
+/** Public codebook used only before a session key exists. Not a secret. */
+function staticLexicon() {
+	if (!staticCache) staticCache = (async () => {
+		return buildLexicon(await sha256(utf8("LEXIS-STATIC-ALPHABET-v1")));
+	})();
+	return staticCache;
+}
+/** Secret codebook: HKDF(key, window) then the same generator. Any key yields a lexicon of the same shape. */
+var lexiconCache = /* @__PURE__ */ new Map();
+function cacheId(key, window) {
+	let hex = `${window}:`;
+	for (const b of key) hex += b.toString(16).padStart(2, "0");
+	return hex;
+}
+async function sessionLexicon(sessionKey, window) {
+	const id = cacheId(sessionKey, window);
+	const hit = lexiconCache.get(id);
+	if (hit) return hit;
+	const pending = (async () => {
+		return buildLexicon(await hkdfStream(sessionKey, utf8("LEXIS-LEX-SALT"), `win-${window}`, 32));
+	})();
+	lexiconCache.set(id, pending);
+	if (lexiconCache.size > 32) {
+		const oldest = lexiconCache.keys().next().value;
+		if (oldest !== void 0) lexiconCache.delete(oldest);
+	}
+	return pending;
+}
+function invertLexicon(words) {
+	const map = /* @__PURE__ */ new Map();
+	for (let i = 0; i < words.length; i++) {
+		const w = words[i];
+		if (map.has(w)) throw new Error(`词表有重复词 ${w}`);
+		map.set(w, i);
+	}
+	if (map.size !== SPEC.lexiconSize) throw new Error("词表长度不对");
+	return map;
+}
+/**
+* One evaluation for every key. Programmed keys fall out of the polynomial;
+* nothing here compares a key against a list.
+*/
+var POLY = 1n << 128n | 135n;
+var MASK = (1n << 128n) - 1n;
+function bitLength(n) {
+	return n === 0n ? 1 : n.toString(2).length;
+}
+function add(a, b) {
+	return a ^ b;
+}
+function mul(a, b) {
+	let res = 0n;
+	let x = a;
+	let y = b;
+	while (y > 0n) {
+		if (y & 1n) res ^= x;
+		x <<= 1n;
+		if (x & 1n << 128n) x ^= POLY;
+		y >>= 1n;
+	}
+	return res & MASK;
+}
+function inv(a) {
+	if (a === 0n) throw new Error("零没有逆元");
+	let u = a;
+	let v = POLY;
+	let g1 = 1n;
+	let g2 = 0n;
+	while (u !== 1n) {
+		let j = bitLength(u) - bitLength(v);
+		if (j < 0) {
+			const su = u;
+			u = v;
+			v = su;
+			const sg = g1;
+			g1 = g2;
+			g2 = sg;
+			j = -j;
+		}
+		u ^= v << BigInt(j);
+		g1 ^= g2 << BigInt(j);
+	}
+	return g1 & MASK;
+}
+function fromBytes(bytes) {
+	let n = 0n;
+	for (const b of bytes) n = n << 8n | BigInt(b);
+	return n & MASK;
+}
+function toBytes(n) {
+	const out = /* @__PURE__ */ new Uint8Array(16);
+	let x = n & MASK;
+	for (let i = 15; i >= 0; i -= 1) {
+		out[i] = Number(x & 255n);
+		x >>= 8n;
+	}
+	return out;
+}
+function xor16(a, b) {
+	const out = /* @__PURE__ */ new Uint8Array(16);
+	for (let i = 0; i < 16; i += 1) out[i] = a[i] ^ b[i];
+	return out;
+}
+function polyMul(p1, p2) {
+	const res = Array(p1.length + p2.length - 1).fill(0n);
+	for (let i = 0; i < p1.length; i += 1) {
+		if (p1[i] === 0n) continue;
+		for (let j = 0; j < p2.length; j += 1) res[i + j] ^= mul(p1[i], p2[j]);
+	}
+	return res;
+}
+function horner(coeffs, x) {
+	let result = 0n;
+	for (let i = coeffs.length - 1; i >= 0; i -= 1) result = add(mul(result, x), coeffs[i]);
+	return result;
+}
+function lagrange(points) {
+	const n = points.length;
+	const final = Array(n).fill(0n);
+	for (let i = 0; i < n; i += 1) {
+		const xi = points[i][0];
+		const yi = points[i][1];
+		let numerator = [1n];
+		let denominator = 1n;
+		for (let m = 0; m < n; m += 1) {
+			if (i === m) continue;
+			const xm = points[m][0];
+			numerator = polyMul(numerator, [xm, 1n]);
+			denominator = mul(denominator, xi ^ xm);
+		}
+		const scale = mul(yi, inv(denominator));
+		for (let deg = 0; deg < numerator.length; deg += 1) final[deg] ^= mul(numerator[deg], scale);
+	}
+	return final;
+}
+async function lane(key, salt, label) {
+	return (await hmac(key, concat(salt, utf8(label)))).subarray(0, 16);
+}
+function indicesFrom(block) {
+	const out = [
+		0,
+		0,
+		0,
+		0
+	];
+	for (let i = 0; i < 4; i += 1) {
+		const v = (block[i * 2] << 8 | block[i * 2 + 1]) & 65535;
+		out[i] = v % SPEC.lexiconSize;
+	}
+	return out;
+}
+function packIndices(indices) {
+	const out = /* @__PURE__ */ new Uint8Array(16);
+	for (let i = 0; i < 4; i += 1) {
+		const n = indices[i] & 65535;
+		out[i * 2] = n >> 8 & 255;
+		out[i * 2 + 1] = n & 255;
+	}
+	return out;
+}
+/** Coefficients only. The same Horner step serves every key. */
+async function compileBlocks(entries, slots = 4, salt = randomBytes(16)) {
+	if (entries.length < 1 || entries.length > slots) throw new Error("可编程槽位数量不对");
+	const points = [];
+	const seen = /* @__PURE__ */ new Set();
+	for (const entry of entries) {
+		if (entry.block.length !== 16) throw new Error("可编程明文要 16 字节");
+		const x = await lane(entry.key, salt, "x");
+		const r = await lane(entry.key, salt, "r");
+		const id = fromBytes(x).toString(16);
+		if (seen.has(id)) throw new Error("横坐标撞上了");
+		seen.add(id);
+		points.push([fromBytes(x), fromBytes(xor16(entry.block, r))]);
+	}
+	while (points.length < slots) {
+		const x = fromBytes(randomBytes(16));
+		const id = x.toString(16);
+		if (x === 0n || seen.has(id)) continue;
+		seen.add(id);
+		points.push([x, fromBytes(randomBytes(16))]);
+	}
+	return {
+		salt,
+		coeffs: lagrange(points).map(toBytes)
+	};
+}
+async function evalHoney(program, key) {
+	const x = await lane(key, program.salt, "x");
+	const r = await lane(key, program.salt, "r");
+	return xor16(toBytes(horner(program.coeffs.map(fromBytes), fromBytes(x))), r);
+}
+async function honeyPhrase(key, window, seed, program) {
+	const lex = await sessionLexicon(key, window);
+	const idx = indicesFrom(program ? await evalHoney(program, key) : await hkdf(key, u32be(window), seed.length ? seed : utf8("honey"), 16));
+	return `the ${lex[idx[0]]} and our ${lex[idx[1]]} that its ${lex[idx[2]]} and the ${lex[idx[3]]}`;
+}
+function scalarFromSeed(seed) {
+	let hex = "";
+	for (const b of seed) hex += b.toString(16).padStart(2, "0");
+	let n = p256.Point.Fn.create(BigInt(`0x${hex}`));
+	if (n === 0n) n = 1n;
+	return p256.Point.Fn.toBytes(n);
+}
+function b64url(bytes) {
+	let s = "";
+	for (const b of bytes) s += String.fromCharCode(b);
+	return btoa(s).replaceAll("+", "-").replaceAll("/", "_").replace(/=+$/g, "");
+}
+async function stretch(passphrase, salt, params) {
+	const c = clampVaultKdf(params);
+	return argon2id(utf8(passphrase), salt, {
+		t: c.iterations,
+		m: c.memoryKiB,
+		p: c.parallelism,
+		dkLen: 32
+	});
+}
+/** Real passphrase and any programmed spare all sit in the same coefficients. */
+async function sealIdentityVault(entries, salt, params, slots = 4) {
+	const c = clampVaultKdf(params);
+	const seenPass = /* @__PURE__ */ new Set();
+	for (const entry of entries) {
+		if (seenPass.has(entry.passphrase)) throw new Error("口令重复，封不进同一条求值");
+		seenPass.add(entry.passphrase);
+	}
+	for (;;) {
+		const pepper = randomBytes(16);
+		try {
+			const loEntries = [];
+			const hiEntries = [];
+			for (const entry of entries) {
+				if (entry.scalar.length !== 32) throw new Error("私钥标量要 32 字节");
+				const dk = await stretch(entry.passphrase, salt, c);
+				loEntries.push({
+					key: dk,
+					block: entry.scalar.subarray(0, 16)
+				});
+				hiEntries.push({
+					key: dk,
+					block: entry.scalar.subarray(16, 32)
+				});
+			}
+			return {
+				salt,
+				kdf: c,
+				lo: await compileBlocks(loEntries, slots, pepper),
+				hi: await compileBlocks(hiEntries, slots, pepper)
+			};
+		} catch (err) {
+			if (err instanceof Error && err.message === "横坐标撞上了") continue;
+			throw err;
+		}
+	}
+}
+/** Same steps for every passphrase. A spare one is not a separate branch. */
+async function openIdentityVault(vault, passphrase) {
+	const dk = await stretch(passphrase, vault.salt, vault.kdf);
+	const lo = await evalHoney(vault.lo, dk);
+	const hi = await evalHoney(vault.hi, dk);
+	const joined = /* @__PURE__ */ new Uint8Array(32);
+	joined.set(lo, 0);
+	joined.set(hi, 16);
+	const secret = scalarFromSeed(joined);
+	const pub = p256.getPublicKey(secret, false);
+	const x = b64url(pub.subarray(1, 33));
+	const y = b64url(pub.subarray(33, 65));
+	const d = b64url(secret);
+	return identityFromJwks({
+		kty: "EC",
+		crv: "P-256",
+		x,
+		y,
+		ext: true
+	}, {
+		kty: "EC",
+		crv: "P-256",
+		x,
+		y,
+		d,
+		ext: true
+	});
+}
+function unb64url(text) {
+	const pad = text.length % 4 === 0 ? "" : "=".repeat(4 - text.length % 4);
+	return unb64(text.replaceAll("-", "+").replaceAll("_", "/") + pad);
+}
+/** Scalar bytes of an unlocked key. Absent after a sealed key is reloaded. */
+function freshScalar() {
+	return p256.utils.randomSecretKey();
+}
+function privateScalar(jwk) {
+	if (!jwk.d) throw new Error("私钥不在内存里");
+	const raw = unb64url(jwk.d);
+	if (raw.length !== 32) throw new Error("私钥标量长度不对");
+	return raw;
+}
+function programToStored(program) {
+	return {
+		saltB64: b64(program.salt),
+		coeffsB64: program.coeffs.map((item) => b64(item))
+	};
+}
+/** One shape for every stored program. Bad input is null, not a special key. */
+function programFromStored(raw) {
+	if (!raw || typeof raw !== "object") return null;
+	const rec = raw;
+	if (typeof rec.saltB64 !== "string" || !Array.isArray(rec.coeffsB64) || rec.coeffsB64.length < 1 || rec.coeffsB64.length > 8) return null;
+	try {
+		const salt = unb64(rec.saltB64);
+		if (salt.length !== 16) return null;
+		return {
+			salt,
+			coeffs: rec.coeffsB64.map((item) => {
+				if (typeof item !== "string") throw new Error("系数不对");
+				const bytes = unb64(item);
+				if (bytes.length !== 16) throw new Error("系数不对");
+				return bytes;
+			})
+		};
+	} catch {
+		return null;
+	}
+}
+function vaultToStored(vault) {
+	return {
+		saltB64: b64(vault.salt),
+		memoryKiB: vault.kdf.memoryKiB,
+		iterations: vault.kdf.iterations,
+		parallelism: vault.kdf.parallelism,
+		lo: programToStored(vault.lo),
+		hi: programToStored(vault.hi)
+	};
+}
+function vaultFromStored(raw) {
+	if (!raw || typeof raw !== "object") return null;
+	const rec = raw;
+	if (typeof rec.saltB64 !== "string") return null;
+	const lo = programFromStored(rec.lo);
+	const hi = programFromStored(rec.hi);
+	if (!lo || !hi) return null;
+	try {
+		const salt = unb64(rec.saltB64);
+		if (salt.length < 8) return null;
+		return {
+			salt,
+			kdf: clampVaultKdf({
+				memoryKiB: rec.memoryKiB,
+				iterations: rec.iterations,
+				parallelism: rec.parallelism
+			}),
+			lo,
+			hi
+		};
+	} catch {
+		return null;
+	}
+}
+function blendBytes(real, cover, takeReal) {
+	const m = takeReal & 1;
+	const inv = 1 - m;
+	const n = m * real.length + inv * cover.length;
+	const out = new Uint8Array(n);
+	for (let i = 0; i < n; i += 1) {
+		const a = i < real.length ? real[i] : 0;
+		const b = i < cover.length ? cover[i] : 0;
+		out[i] = a * m + b * inv & 255;
+	}
+	return out;
 }
 var RULE_TYPES = [
 	"DOMAIN",
@@ -653,6 +1136,7 @@ function defaultProfile() {
 		geoipUrl: "",
 		statusHost: "127.0.0.1",
 		statusPort: 17890,
+		statusToken: "",
 		heartbeatSec: 15,
 		linux: {
 			method: "redirect",
@@ -673,6 +1157,7 @@ function defaultProfile() {
 		kdf: { ...DEFAULT_KDF },
 		honey: false,
 		honeyProgram: null,
+		seal: null,
 		zstd: {
 			enabled: false,
 			level: 3
@@ -736,7 +1221,7 @@ function normalizeProfile(input) {
 		...base,
 		...raw,
 		version: 1,
-		role: raw.role === "gate" ? "gate" : "edge",
+		role: raw.role === "gate" ? "gate" : raw.role === "edge" ? "edge" : "",
 		mode: raw.mode === "system-forward" ? "system-forward" : "fixed-port",
 		logLevel: raw.logLevel === "debug" ? "debug" : "info",
 		processDefault: isAction(raw.processDefault) ? raw.processDefault : base.processDefault,
@@ -753,10 +1238,13 @@ function normalizeProfile(input) {
 			...raw.android ?? {}
 		},
 		heartbeatSec: clampNum(raw.heartbeatSec, 5, 120, base.heartbeatSec),
+		statusHost: typeof raw.statusHost === "string" && raw.statusHost.trim() ? raw.statusHost.trim() : base.statusHost,
 		statusPort: clampNum(raw.statusPort, 1, 65535, base.statusPort),
+		statusToken: typeof raw.statusToken === "string" ? raw.statusToken : "",
 		kdf: clampKdf(raw.kdf),
 		honey: raw.honey === true,
 		honeyProgram: normalizeProgram(raw.honeyProgram),
+		seal: normalizeSeal(raw.seal),
 		zstd: {
 			enabled: Boolean(raw.zstd && raw.zstd.enabled),
 			level: clampNum(raw.zstd?.level, 1, 19, base.zstd.level)
@@ -795,6 +1283,36 @@ function normalizeProgram(raw) {
 	return {
 		saltB64: rec.saltB64,
 		coeffsB64: [...rec.coeffsB64]
+	};
+}
+function normalizeSeal(raw) {
+	const vault = vaultFromStored(raw);
+	if (!vault) return null;
+	const stored = vaultToStored(vault);
+	const kdf = clampVaultKdf(stored);
+	return {
+		...stored,
+		memoryKiB: kdf.memoryKiB,
+		iterations: kdf.iterations,
+		parallelism: kdf.parallelism
+	};
+}
+function withoutScalar(jwk) {
+	if (!jwk.d) return jwk;
+	const { d: _scalar, ...rest } = jwk;
+	return rest;
+}
+/** Public config. A seal stays in lexis.seal.json, never beside the public key. */
+function exportedConfig(profile) {
+	if (!profile.seal) return profile;
+	const identity = profile.identity ? {
+		...profile.identity,
+		privateJwk: withoutScalar(profile.identity.privateJwk)
+	} : profile.identity;
+	return {
+		...profile,
+		identity,
+		seal: null
 	};
 }
 function isOuter(value) {
@@ -1074,6 +1592,9 @@ function mapAction(value) {
 }
 function profileIssues(profile) {
 	const issues = [];
+	if (profile.role !== "edge" && profile.role !== "gate") issues.push("常驻进程不接受缺省角色。写成 edge 或 gate");
+	const statusHost = profile.statusHost.trim().toLowerCase();
+	if (!(statusHost === "127.0.0.1" || statusHost === "::1" || statusHost === "localhost") && !profile.statusToken.trim()) issues.push("状态页不在回环上，要填状态口令，否则指标和页面会拒绝");
 	const seen = /* @__PURE__ */ new Set();
 	for (const inbound of profile.inbounds) {
 		const key = `${inbound.listen}:${inbound.port}`;
@@ -1123,6 +1644,17 @@ function edgePreset() {
 		inbounds: defaultProfile().inbounds
 	};
 }
+function persistedProfile(profile) {
+	if (!profile.seal || !profile.identity?.privateJwk.d) return profile;
+	const { d: _scalar, ...privateJwk } = profile.identity.privateJwk;
+	return {
+		...profile,
+		identity: {
+			...profile.identity,
+			privateJwk
+		}
+	};
+}
 var useProfile = create()(persist((set) => ({
 	profile: defaultProfile(),
 	setProfile: (profile) => set({ profile: normalizeProfile(profile) }),
@@ -1135,6 +1667,7 @@ var useProfile = create()(persist((set) => ({
 	storage: createJSONStorage(() => localStorage),
 	skipHydration: true,
 	version: 1,
+	partialize: (state) => ({ profile: persistedProfile(state.profile) }),
 	merge: (persisted, current) => {
 		const saved = persisted;
 		return {
@@ -1143,176 +1676,6 @@ var useProfile = create()(persist((set) => ({
 		};
 	}
 }));
-/**
-* Pronounceable triples. Empty onset/coda are omitted so every word is at least 3 letters
-* and the letter distribution stays inside a small alphabet (low byte entropy on the wire).
-*/
-var ONSETS = [
-	"b",
-	"c",
-	"d",
-	"f",
-	"g",
-	"h",
-	"j",
-	"k",
-	"l",
-	"m",
-	"n",
-	"p",
-	"r",
-	"s",
-	"t",
-	"v",
-	"w",
-	"z",
-	"bl",
-	"br",
-	"ch",
-	"cl",
-	"cr",
-	"dr",
-	"fl",
-	"fr",
-	"gl",
-	"gr",
-	"pl",
-	"pr",
-	"sc",
-	"sh",
-	"sk",
-	"sl",
-	"sm",
-	"sn",
-	"sp",
-	"st",
-	"sw",
-	"th",
-	"tr",
-	"tw",
-	"wh",
-	"qu"
-];
-var NUCLEI = [
-	"a",
-	"e",
-	"i",
-	"o",
-	"u",
-	"ae",
-	"ai",
-	"au",
-	"ea",
-	"ee",
-	"ia",
-	"ie",
-	"io",
-	"oa",
-	"oe",
-	"oo",
-	"ou"
-];
-var CODAS = [
-	"d",
-	"k",
-	"l",
-	"m",
-	"n",
-	"p",
-	"r",
-	"s",
-	"t",
-	"x",
-	"ld",
-	"ll",
-	"nd",
-	"nt",
-	"rd",
-	"rn",
-	"sh",
-	"st",
-	"th"
-];
-var SPACE = ONSETS.length * NUCLEI.length * CODAS.length;
-function wordFromIndex(n) {
-	const coda = n % CODAS.length;
-	const nucleus = Math.floor(n / CODAS.length) % NUCLEI.length;
-	return ONSETS[Math.floor(n / (CODAS.length * NUCLEI.length))] + NUCLEI[nucleus] + CODAS[coda];
-}
-async function buildLexicon(seed) {
-	if (SPACE < SPEC.lexiconSize || SPACE >= 65536) throw new Error("音节空间尺寸不对");
-	const used = new Uint8Array(SPACE);
-	const seen = /* @__PURE__ */ new Set();
-	const words = [];
-	const limit = Math.floor(65536 / SPACE) * SPACE;
-	let round = 0;
-	let pool = /* @__PURE__ */ new Uint8Array(0);
-	let pos = 0;
-	const pull = async () => {
-		pool = await hkdfStream(seed, utf8(`LEXIS-LEX-STREAM-${round}`), "idx", 16e3);
-		round += 1;
-		pos = 0;
-	};
-	const next16 = async () => {
-		if (pos + 2 > pool.length) await pull();
-		const v = pool[pos] << 8 | pool[pos + 1];
-		pos += 2;
-		return v;
-	};
-	let guard = 0;
-	while (words.length < SPEC.lexiconSize) {
-		if (guard++ > SPACE * 4) throw new Error("词表生成失败");
-		let draw = await next16();
-		while (draw >= limit) draw = await next16();
-		const n = draw % SPACE;
-		if (used[n]) continue;
-		used[n] = 1;
-		const w = wordFromIndex(n);
-		if (w.length < 3 || GLUE_SET.has(w) || seen.has(w)) continue;
-		seen.add(w);
-		words.push(w);
-	}
-	return words;
-}
-var staticCache = null;
-/** Public codebook used only before a session key exists. Not a secret. */
-function staticLexicon() {
-	if (!staticCache) staticCache = (async () => {
-		return buildLexicon(await sha256(utf8("LEXIS-STATIC-ALPHABET-v1")));
-	})();
-	return staticCache;
-}
-/** Secret codebook: HKDF(key, window) then the same generator. Any key yields a lexicon of the same shape. */
-var lexiconCache = /* @__PURE__ */ new Map();
-function cacheId(key, window) {
-	let hex = `${window}:`;
-	for (const b of key) hex += b.toString(16).padStart(2, "0");
-	return hex;
-}
-async function sessionLexicon(sessionKey, window) {
-	const id = cacheId(sessionKey, window);
-	const hit = lexiconCache.get(id);
-	if (hit) return hit;
-	const pending = (async () => {
-		return buildLexicon(await hkdfStream(sessionKey, utf8("LEXIS-LEX-SALT"), `win-${window}`, 32));
-	})();
-	lexiconCache.set(id, pending);
-	if (lexiconCache.size > 32) {
-		const oldest = lexiconCache.keys().next().value;
-		if (oldest !== void 0) lexiconCache.delete(oldest);
-	}
-	return pending;
-}
-function invertLexicon(words) {
-	const map = /* @__PURE__ */ new Map();
-	for (let i = 0; i < words.length; i++) {
-		const w = words[i];
-		if (map.has(w)) throw new Error(`词表有重复词 ${w}`);
-		map.set(w, i);
-	}
-	if (map.size !== SPEC.lexiconSize) throw new Error("词表长度不对");
-	return map;
-}
 function dress(words, counter) {
 	const parts = [];
 	for (let i = 0; i < words.length; i += 4) {
@@ -1409,6 +1772,15 @@ function bumpHelloScope(map, key, window, cap, message) {
 }
 async function tokenMac(token, body) {
 	return (await hmac(utf8(token), concat(utf8("lexis-admit-v1"), body))).subarray(0, 16);
+}
+/**
+* Tag over the public transcript. The HMAC key is a constant, not the session key.
+* A recorded handshake plus a guessed long-term key must not be confirmed by this tag.
+* Anyone who can see the public handshake can recompute it, so it does not prove the
+* peer derived the same session key. A mismatch shows up when a data frame does not unpack.
+*/
+async function publicConfirm(label, tr) {
+	return (await hmac(utf8("lexis-pub-confirm-v1"), concat(utf8(label), tr))).subarray(0, 16);
 }
 function transcript(parts) {
 	return concat(utf8("LEXIS2"), parts.ephC, parts.ephS, parts.ltC, parts.ltS, u32be(parts.window), parts.nonceC, parts.nonceS, parts.kdf, new Uint8Array([parts.features & 255]));
@@ -1510,8 +1882,8 @@ async function gateRespond(gate, peerRawB64, helloWire, opts = {}) {
 		kdf: kdfBytes,
 		features
 	});
-	const confirmS = (await hmac(sk, concat(utf8("lexis-srv-v1"), tr))).subarray(0, 16);
-	const expectFinish = (await hmac(sk, concat(utf8("lexis-cli-v1"), tr))).subarray(0, 16);
+	const confirmS = await publicConfirm("lexis-srv-pub-v1", tr);
+	const expectFinish = await publicConfirm("lexis-cli-pub-v1", tr);
 	let blob = concat(new Uint8Array([1, 2]), ephS.publicRaw, ltS, nonceS, confirmS, kdfBytes, new Uint8Array([features]));
 	if (token) blob = concat(blob, await tokenMac(token, blob));
 	const serverWire = await encodeStatic(blob);
@@ -1555,8 +1927,8 @@ async function edgeFinish(edge, pending, gateRawB64, serverWire, token = "") {
 		kdf: encodeKdf(server.kdf),
 		features
 	});
-	if (!timingSafeEqual((await hmac(sk, concat(utf8("lexis-srv-v1"), tr))).subarray(0, 16), server.confirm)) throw new LexisError("闸门确认标记对不上，会话密钥没有对齐");
-	const confirmC = (await hmac(sk, concat(utf8("lexis-cli-v1"), tr))).subarray(0, 16);
+	if (!timingSafeEqual(await publicConfirm("lexis-srv-pub-v1", tr), server.confirm)) throw new LexisError("闸门确认标记对不上");
+	const confirmC = await publicConfirm("lexis-cli-pub-v1", tr);
 	return {
 		sk,
 		finishWire: await encodeStatic(concat(new Uint8Array([1, 3]), confirmC)),
@@ -1645,334 +2017,6 @@ function entropyPair(prose) {
 		random: shannonEntropy(rnd.subarray(0, bytes.length)),
 		nbytes: bytes.length
 	};
-}
-/**
-* One evaluation for every key. Programmed keys fall out of the polynomial;
-* nothing here compares a key against a list.
-*/
-var POLY = 1n << 128n | 135n;
-var MASK = (1n << 128n) - 1n;
-function bitLength(n) {
-	return n === 0n ? 1 : n.toString(2).length;
-}
-function add(a, b) {
-	return a ^ b;
-}
-function mul(a, b) {
-	let res = 0n;
-	let x = a;
-	let y = b;
-	while (y > 0n) {
-		if (y & 1n) res ^= x;
-		x <<= 1n;
-		if (x & 1n << 128n) x ^= POLY;
-		y >>= 1n;
-	}
-	return res & MASK;
-}
-function inv(a) {
-	if (a === 0n) throw new Error("零没有逆元");
-	let u = a;
-	let v = POLY;
-	let g1 = 1n;
-	let g2 = 0n;
-	while (u !== 1n) {
-		let j = bitLength(u) - bitLength(v);
-		if (j < 0) {
-			const su = u;
-			u = v;
-			v = su;
-			const sg = g1;
-			g1 = g2;
-			g2 = sg;
-			j = -j;
-		}
-		u ^= v << BigInt(j);
-		g1 ^= g2 << BigInt(j);
-	}
-	return g1 & MASK;
-}
-function fromBytes(bytes) {
-	let n = 0n;
-	for (const b of bytes) n = n << 8n | BigInt(b);
-	return n & MASK;
-}
-function toBytes(n) {
-	const out = /* @__PURE__ */ new Uint8Array(16);
-	let x = n & MASK;
-	for (let i = 15; i >= 0; i -= 1) {
-		out[i] = Number(x & 255n);
-		x >>= 8n;
-	}
-	return out;
-}
-function xor16(a, b) {
-	const out = /* @__PURE__ */ new Uint8Array(16);
-	for (let i = 0; i < 16; i += 1) out[i] = a[i] ^ b[i];
-	return out;
-}
-function polyMul(p1, p2) {
-	const res = Array(p1.length + p2.length - 1).fill(0n);
-	for (let i = 0; i < p1.length; i += 1) {
-		if (p1[i] === 0n) continue;
-		for (let j = 0; j < p2.length; j += 1) res[i + j] ^= mul(p1[i], p2[j]);
-	}
-	return res;
-}
-function horner(coeffs, x) {
-	let result = 0n;
-	for (let i = coeffs.length - 1; i >= 0; i -= 1) result = add(mul(result, x), coeffs[i]);
-	return result;
-}
-function lagrange(points) {
-	const n = points.length;
-	const final = Array(n).fill(0n);
-	for (let i = 0; i < n; i += 1) {
-		const xi = points[i][0];
-		const yi = points[i][1];
-		let numerator = [1n];
-		let denominator = 1n;
-		for (let m = 0; m < n; m += 1) {
-			if (i === m) continue;
-			const xm = points[m][0];
-			numerator = polyMul(numerator, [xm, 1n]);
-			denominator = mul(denominator, xi ^ xm);
-		}
-		const scale = mul(yi, inv(denominator));
-		for (let deg = 0; deg < numerator.length; deg += 1) final[deg] ^= mul(numerator[deg], scale);
-	}
-	return final;
-}
-async function lane(key, salt, label) {
-	return (await hmac(key, concat(salt, utf8(label)))).subarray(0, 16);
-}
-function indicesFrom(block) {
-	const out = [
-		0,
-		0,
-		0,
-		0
-	];
-	for (let i = 0; i < 4; i += 1) {
-		const v = (block[i * 2] << 8 | block[i * 2 + 1]) & 65535;
-		out[i] = v % SPEC.lexiconSize;
-	}
-	return out;
-}
-function packIndices(indices) {
-	const out = /* @__PURE__ */ new Uint8Array(16);
-	for (let i = 0; i < 4; i += 1) {
-		const n = indices[i] & 65535;
-		out[i * 2] = n >> 8 & 255;
-		out[i * 2 + 1] = n & 255;
-	}
-	return out;
-}
-/** Coefficients only. The same Horner step serves every key. */
-async function compileBlocks(entries, slots = 4, salt = randomBytes(16)) {
-	if (entries.length < 1 || entries.length > slots) throw new Error("可编程槽位数量不对");
-	const points = [];
-	const seen = /* @__PURE__ */ new Set();
-	for (const entry of entries) {
-		if (entry.block.length !== 16) throw new Error("可编程明文要 16 字节");
-		const x = await lane(entry.key, salt, "x");
-		const r = await lane(entry.key, salt, "r");
-		const id = fromBytes(x).toString(16);
-		if (seen.has(id)) throw new Error("横坐标撞上了");
-		seen.add(id);
-		points.push([fromBytes(x), fromBytes(xor16(entry.block, r))]);
-	}
-	while (points.length < slots) {
-		const x = fromBytes(randomBytes(16));
-		const id = x.toString(16);
-		if (x === 0n || seen.has(id)) continue;
-		seen.add(id);
-		points.push([x, fromBytes(randomBytes(16))]);
-	}
-	return {
-		salt,
-		coeffs: lagrange(points).map(toBytes)
-	};
-}
-async function evalHoney(program, key) {
-	const x = await lane(key, program.salt, "x");
-	const r = await lane(key, program.salt, "r");
-	return xor16(toBytes(horner(program.coeffs.map(fromBytes), fromBytes(x))), r);
-}
-async function honeyPhrase(key, window, seed, program) {
-	const lex = await sessionLexicon(key, window);
-	const idx = indicesFrom(program ? await evalHoney(program, key) : await hkdf(key, u32be(window), seed.length ? seed : utf8("honey"), 16));
-	return `the ${lex[idx[0]]} and our ${lex[idx[1]]} that its ${lex[idx[2]]} and the ${lex[idx[3]]}`;
-}
-function scalarFromSeed(seed) {
-	let hex = "";
-	for (const b of seed) hex += b.toString(16).padStart(2, "0");
-	let n = p256.Point.Fn.create(BigInt(`0x${hex}`));
-	if (n === 0n) n = 1n;
-	return p256.Point.Fn.toBytes(n);
-}
-function b64url(bytes) {
-	let s = "";
-	for (const b of bytes) s += String.fromCharCode(b);
-	return btoa(s).replaceAll("+", "-").replaceAll("/", "_").replace(/=+$/g, "");
-}
-async function stretch(passphrase, salt, params) {
-	const c = clampKdf(params);
-	return argon2id(utf8(passphrase), salt, {
-		t: c.iterations,
-		m: c.memoryKiB,
-		p: c.parallelism,
-		dkLen: 32
-	});
-}
-/** Real passphrase and any programmed spare all sit in the same coefficients. */
-async function sealIdentityVault(entries, salt, params, slots = 4) {
-	const c = clampKdf(params);
-	const seenPass = /* @__PURE__ */ new Set();
-	for (const entry of entries) {
-		if (seenPass.has(entry.passphrase)) throw new Error("口令重复，封不进同一条求值");
-		seenPass.add(entry.passphrase);
-	}
-	for (;;) {
-		const pepper = randomBytes(16);
-		try {
-			const loEntries = [];
-			const hiEntries = [];
-			for (const entry of entries) {
-				if (entry.scalar.length !== 32) throw new Error("私钥标量要 32 字节");
-				const dk = await stretch(entry.passphrase, salt, c);
-				loEntries.push({
-					key: dk,
-					block: entry.scalar.subarray(0, 16)
-				});
-				hiEntries.push({
-					key: dk,
-					block: entry.scalar.subarray(16, 32)
-				});
-			}
-			return {
-				salt,
-				kdf: c,
-				lo: await compileBlocks(loEntries, slots, pepper),
-				hi: await compileBlocks(hiEntries, slots, pepper)
-			};
-		} catch (err) {
-			if (err instanceof Error && err.message === "横坐标撞上了") continue;
-			throw err;
-		}
-	}
-}
-/** Same steps for every passphrase. A spare one is not a separate branch. */
-async function openIdentityVault(vault, passphrase) {
-	const dk = await stretch(passphrase, vault.salt, vault.kdf);
-	const lo = await evalHoney(vault.lo, dk);
-	const hi = await evalHoney(vault.hi, dk);
-	const joined = /* @__PURE__ */ new Uint8Array(32);
-	joined.set(lo, 0);
-	joined.set(hi, 16);
-	const secret = scalarFromSeed(joined);
-	const pub = p256.getPublicKey(secret, false);
-	const x = b64url(pub.subarray(1, 33));
-	const y = b64url(pub.subarray(33, 65));
-	const d = b64url(secret);
-	return identityFromJwks({
-		kty: "EC",
-		crv: "P-256",
-		x,
-		y,
-		ext: true
-	}, {
-		kty: "EC",
-		crv: "P-256",
-		x,
-		y,
-		d,
-		ext: true
-	});
-}
-function unb64url(text) {
-	const pad = text.length % 4 === 0 ? "" : "=".repeat(4 - text.length % 4);
-	return unb64(text.replaceAll("-", "+").replaceAll("_", "/") + pad);
-}
-/** Scalar bytes of an unlocked key. Absent after a sealed key is reloaded. */
-function privateScalar(jwk) {
-	if (!jwk.d) throw new Error("私钥不在内存里");
-	const raw = unb64url(jwk.d);
-	if (raw.length !== 32) throw new Error("私钥标量长度不对");
-	return raw;
-}
-function programToStored(program) {
-	return {
-		saltB64: b64(program.salt),
-		coeffsB64: program.coeffs.map((item) => b64(item))
-	};
-}
-/** One shape for every stored program. Bad input is null, not a special key. */
-function programFromStored(raw) {
-	if (!raw || typeof raw !== "object") return null;
-	const rec = raw;
-	if (typeof rec.saltB64 !== "string" || !Array.isArray(rec.coeffsB64) || rec.coeffsB64.length < 1 || rec.coeffsB64.length > 8) return null;
-	try {
-		const salt = unb64(rec.saltB64);
-		if (salt.length !== 16) return null;
-		return {
-			salt,
-			coeffs: rec.coeffsB64.map((item) => {
-				if (typeof item !== "string") throw new Error("系数不对");
-				const bytes = unb64(item);
-				if (bytes.length !== 16) throw new Error("系数不对");
-				return bytes;
-			})
-		};
-	} catch {
-		return null;
-	}
-}
-function vaultToStored(vault) {
-	return {
-		saltB64: b64(vault.salt),
-		memoryKiB: vault.kdf.memoryKiB,
-		iterations: vault.kdf.iterations,
-		parallelism: vault.kdf.parallelism,
-		lo: programToStored(vault.lo),
-		hi: programToStored(vault.hi)
-	};
-}
-function vaultFromStored(raw) {
-	if (!raw || typeof raw !== "object") return null;
-	const rec = raw;
-	if (typeof rec.saltB64 !== "string") return null;
-	const lo = programFromStored(rec.lo);
-	const hi = programFromStored(rec.hi);
-	if (!lo || !hi) return null;
-	try {
-		const salt = unb64(rec.saltB64);
-		if (salt.length < 8) return null;
-		return {
-			salt,
-			kdf: clampKdf({
-				memoryKiB: rec.memoryKiB,
-				iterations: rec.iterations,
-				parallelism: rec.parallelism
-			}),
-			lo,
-			hi
-		};
-	} catch {
-		return null;
-	}
-}
-function blendBytes(real, cover, takeReal) {
-	const m = takeReal & 1;
-	const inv = 1 - m;
-	const n = m * real.length + inv * cover.length;
-	const out = new Uint8Array(n);
-	for (let i = 0; i < n; i += 1) {
-		const a = i < real.length ? real[i] : 0;
-		const b = i < cover.length ? cover[i] : 0;
-		out[i] = a * m + b * inv & 255;
-	}
-	return out;
 }
 var zstdReady = null;
 function ensureZstd() {
@@ -2092,13 +2136,15 @@ function mask24(mac) {
 * Codebook stream seal.
 * Counter is hidden by a window mask, then each 12-bit plaintext digit is
 * added (mod 4096) to a keystream digit and emitted as lexicon[sum].
-* HMAC covers direction, counter, and plaintext.
+* HMAC covers direction, counter, and plaintext only for the counter mask.
+* The 16-byte tail is random. It is not HMAC(sessionKey, plaintext): a guessed
+* session key must not be able to confirm itself by recomputing that tag.
 */
 async function seal(input) {
 	const { key, lexicon, counter, window, direction, plaintext } = input;
 	if (counter < 1 || counter > 16777215) throw new LexisError("计数器超出 24 位范围");
 	if (lexicon.length !== SPEC.lexiconSize) throw new LexisError("词表长度不对");
-	const tag = (await hmac(key, concat(utf8(`lexis-mac-v1|${direction}|`), u32be(counter), plaintext))).subarray(0, SPEC.macBytes);
+	const tag = randomBytes(SPEC.macBytes);
 	const chunks = bytesToChunks(concat(u16be(plaintext.length), plaintext, tag));
 	const ks = await hkdfStream(key, concat(utf8(`lexis-body-v1|${direction}|${window}|`), u32be(counter)), "LEXIS-KS-v1", chunks.length * 2);
 	const body = chunks.map((c, i) => {
@@ -2114,15 +2160,8 @@ async function seal(input) {
 		...body
 	], counter);
 }
-function macBit(a, b) {
-	const n = Math.max(a.length, b.length);
-	let diff = a.length === b.length ? 0 : 1;
-	for (let i = 0; i < n; i += 1) diff |= (a[i] ?? 0) ^ (b[i] ?? 0);
-	return Number(diff === 0);
-}
-async function open(input) {
-	const { key, inverse, window, direction, prose, lastSeen } = input;
-	const honey = input.honey === true;
+async function recover(input) {
+	const { key, inverse, window, direction, prose } = input;
 	const words = undress(prose);
 	if (words.length < 3) throw new LexisError("报文太短，不像一帧词隙");
 	let missing = false;
@@ -2138,10 +2177,20 @@ async function open(input) {
 	const counter = (((take(words[0]) & 4095) << 12 | take(words[1]) & 4095) ^ mask) & 16777215;
 	const bodyWords = words.slice(2);
 	const ks = await hkdfStream(key, concat(utf8(`lexis-body-v1|${direction}|${window}|`), u32be(counter)), "LEXIS-KS-v1", bodyWords.length * 2);
-	const raw = chunksToBytes(bodyWords.map((w, i) => {
+	const chunks = bodyWords.map((w, i) => {
 		const ks12 = (ks[i * 2] << 8 | ks[i * 2 + 1]) & 4095;
 		return (take(w) - ks12 + SPEC.lexiconSize) % SPEC.lexiconSize;
-	}));
+	});
+	return {
+		missing,
+		counter,
+		raw: chunksToBytes(chunks)
+	};
+}
+async function open(input) {
+	const { key, window, prose, lastSeen } = input;
+	const honey = input.honey === true;
+	const { missing, counter, raw } = await recover(input);
 	const seed = raw.length ? raw : utf8(prose);
 	const coverOf = () => honeyPhrase(key, window, seed, input.program);
 	const release = async (takeReal, real) => {
@@ -2163,12 +2212,11 @@ async function open(input) {
 		return release(0, /* @__PURE__ */ new Uint8Array());
 	}
 	const plaintext = raw.slice(2, 2 + len);
-	const ok = macBit(raw.slice(2 + len, 2 + len + SPEC.macBytes), (await hmac(key, concat(utf8(`lexis-mac-v1|${direction}|`), u32be(counter), plaintext))).subarray(0, SPEC.macBytes));
-	if (ok === 1) {
-		if (counter < 1) throw new LexisError("计数器无效");
-		if (counter <= lastSeen) throw new LexisError("计数器没有前进，按回放丢弃");
-	} else if (!honey) throw new LexisError("校验失败。密钥、计数器或词表对不上。");
-	return release(ok, plaintext);
+	if (counter < 1 || counter <= lastSeen) {
+		if (!honey) throw new LexisError(counter < 1 ? "计数器无效" : "计数器没有前进，按回放丢弃");
+		return release(0, plaintext);
+	}
+	return release(1, plaintext);
 }
 function EntropyMeter({ wire, random }) {
 	const data = [{
@@ -2674,7 +2722,7 @@ function Bench({ session, onSession }) {
 										session.kdfMs,
 										" ms ·",
 										" ",
-										session.honey ? "蜜文" : "校验失败即拒绝"
+										session.honey ? "蜜文" : "结构或回放即拒绝"
 									]
 								})] }),
 								/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", { children: [/* @__PURE__ */ (0, import_jsx_runtime.jsx)("dt", {
@@ -2899,14 +2947,17 @@ function ConfigPanel() {
 		setMinting(true);
 		try {
 			const ident = await createIdentity();
-			patch({ identity: {
-				id: crypto.randomUUID(),
-				name: profile.name || "本机",
-				publicJwk: ident.publicJwk,
-				privateJwk: ident.privateJwk,
-				publicRawB64: b64(ident.publicRaw),
-				fingerprint: ident.fingerprint
-			} });
+			patch({
+				identity: {
+					id: crypto.randomUUID(),
+					name: profile.name || "本机",
+					publicJwk: ident.publicJwk,
+					privateJwk: ident.privateJwk,
+					publicRawB64: b64(ident.publicRaw),
+					fingerprint: ident.fingerprint
+				},
+				seal: null
+			});
 		} finally {
 			setMinting(false);
 		}
@@ -2973,13 +3024,20 @@ function ConfigPanel() {
 									className: control,
 									value: profile.role,
 									onChange: (e) => patch({ role: e.target.value }),
-									children: [/* @__PURE__ */ (0, import_jsx_runtime.jsx)("option", {
-										value: "edge",
-										children: "边缘客户端"
-									}), /* @__PURE__ */ (0, import_jsx_runtime.jsx)("option", {
-										value: "gate",
-										children: "公网闸门"
-									})]
+									children: [
+										profile.role === "" ? /* @__PURE__ */ (0, import_jsx_runtime.jsx)("option", {
+											value: "",
+											children: "要指定"
+										}) : null,
+										/* @__PURE__ */ (0, import_jsx_runtime.jsx)("option", {
+											value: "edge",
+											children: "边缘客户端"
+										}),
+										/* @__PURE__ */ (0, import_jsx_runtime.jsx)("option", {
+											value: "gate",
+											children: "公网闸门"
+										})
+									]
 								})
 							}),
 							/* @__PURE__ */ (0, import_jsx_runtime.jsx)(Field, {
@@ -3004,6 +3062,10 @@ function ConfigPanel() {
 								})
 							})
 						]
+					}),
+					/* @__PURE__ */ (0, import_jsx_runtime.jsx)("p", {
+						className: "mt-2 text-sm text-mist",
+						children: "常驻进程不接受缺省角色，要写成边缘或闸门。控制台里新建一份时仍默认是边缘。"
 					})
 				]
 			}),
@@ -3016,7 +3078,7 @@ function ConfigPanel() {
 					}),
 					/* @__PURE__ */ (0, import_jsx_runtime.jsx)("p", {
 						className: "mt-2 text-sm text-mist",
-						children: "会话密钥的 Argon2id 由常驻进程自己的参数决定，不听客户端把内存抬高。上限 16384 KiB。口令不对的问候在派生之前就被丢掉。长期私钥的口令派生仍在节点页。"
+						children: "会话密钥的 Argon2id 由常驻进程自己的参数决定，不听客户端把内存抬高。上限 16384 KiB。口令不对的问候在派生之前就被丢掉。长期私钥的封存在节点页，用另一档 65536 KiB、3 次迭代。系数不写进这份配置。"
 					}),
 					/* @__PURE__ */ (0, import_jsx_runtime.jsx)("p", {
 						className: "mt-2 text-sm text-mist",
@@ -3024,7 +3086,7 @@ function ConfigPanel() {
 					}),
 					/* @__PURE__ */ (0, import_jsx_runtime.jsx)("p", {
 						className: "mt-2 text-sm text-mist",
-						children: "蜜文在握手时谈定。打开以后，校验对不上不报错，而落成这把密钥和当前时间窗自己的词表里的一句话。换一把密钥，或换一个时间窗，词表格式不变、用词不同。备用明文写进同一条求值，不会为某一把密钥另开判断。线上没有「这是蜜文」的位。这个模式不再提示报文被改过。"
+						children: "蜜文在握手时谈定。打开以后，词不在词表里、正文结构不对、或者计数器回放，都不报错，落成这把密钥和当前时间窗自己的词表里的一句话。关掉时，回放仍会拆掉这条会话。帧尾是随机字节，不是会话密钥的校验：猜中会话密钥的人和猜错的人，比对这段尾部都对不上。握手确认也不再拿会话密钥来算。词表仍由会话密钥导出，对得上词表本身仍说明这把密钥是对的。换一把密钥，或换一个时间窗，词表格式不变、用词不同。备用明文写进同一条求值，不会为某一把密钥另开判断。线上没有「这是蜜文」的位。这一版和 1.7 及更早的对端对不上。"
 					}),
 					/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", {
 						className: "mt-4 grid gap-3 sm:grid-cols-3",
@@ -3532,6 +3594,23 @@ function ConfigPanel() {
 					/* @__PURE__ */ (0, import_jsx_runtime.jsx)("p", {
 						className: "mt-2 text-sm text-mist",
 						children: profile.link.allowLan ? "SOCKS 和固定转发会按填写的地址监听，可能暴露到局域网。" : "SOCKS 和固定转发强制绑在回环。隧道入口仍按填写的地址监听，方便以后做端口映射。"
+					}),
+					/* @__PURE__ */ (0, import_jsx_runtime.jsx)("div", {
+						className: "mt-4 max-w-md",
+						children: /* @__PURE__ */ (0, import_jsx_runtime.jsx)(Field, {
+							label: "状态口令",
+							children: /* @__PURE__ */ (0, import_jsx_runtime.jsx)("input", {
+								className: control,
+								value: profile.statusToken,
+								autoComplete: "off",
+								placeholder: "回环上可留空",
+								onChange: (e) => patch({ statusToken: e.target.value })
+							})
+						})
+					}),
+					/* @__PURE__ */ (0, import_jsx_runtime.jsx)("p", {
+						className: "mt-2 text-sm text-mist",
+						children: "状态页离开回环时，指标和页面要带这句口令。健康检查不带。没有口令又没有允许局域网时，状态页改绑回环。"
 					})
 				]
 			}),
@@ -4150,16 +4229,20 @@ function ConfigPanel() {
 				className: "text-sm text-ember",
 				children: issues.map((issue) => /* @__PURE__ */ (0, import_jsx_runtime.jsx)("li", { children: issue }, issue))
 			}) : null,
-			/* @__PURE__ */ (0, import_jsx_runtime.jsx)("div", {
+			/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", {
 				className: "flex flex-wrap gap-2",
-				children: /* @__PURE__ */ (0, import_jsx_runtime.jsx)(Btn, {
-					onClick: () => downloadJson("lexis.config.json", profile),
+				children: [/* @__PURE__ */ (0, import_jsx_runtime.jsx)(Btn, {
+					onClick: () => downloadJson("lexis.config.json", exportedConfig(profile)),
 					children: "导出配置"
-				})
+				}), profile.seal ? /* @__PURE__ */ (0, import_jsx_runtime.jsx)(Btn, {
+					kind: "ghost",
+					onClick: () => downloadJson("lexis.seal.json", sealFileOf(profile.seal)),
+					children: "导出封存"
+				}) : null]
 			}),
 			/* @__PURE__ */ (0, import_jsx_runtime.jsx)("p", {
 				className: "text-sm text-mist",
-				children: "导出的 JSON 含本机私钥。覆盖常驻进程目录里的 lexis.config.json 再重启。"
+				children: "没有封存时，配置里带着本机私钥。封存之后，导出的配置去掉标量，系数在另一个文件 lexis.seal.json。两个文件不要合成一个：公钥写在对端名单里，和系数放在一起就能离线试口令。放到常驻目录后，权限应收成仅本人可读。口令用环境变量 LEXIS_PASSPHRASE，或同目录的 lexis.passphrase。常驻进程不会拿解开的公钥去对配置里的公钥。"
 			})
 		]
 	});
@@ -4645,7 +4728,36 @@ function readKdf(value) {
 	if (typeof raw.saltB64 !== "string" || !raw.saltB64) return null;
 	return {
 		saltB64: raw.saltB64,
-		...clampKdf(raw)
+		...clampVaultKdf(raw)
+	};
+}
+function omitScalar(jwk) {
+	if (!jwk.d) return jwk;
+	const { d: _scalar, ...rest } = jwk;
+	return rest;
+}
+async function materialFromSidecar(data) {
+	const publicJwk = data.publicJwk;
+	const privateJwk = data.privateJwk;
+	if (privateJwk?.d) return identityFromJwks(publicJwk, privateJwk);
+	if (!publicJwk || publicJwk.kty !== "EC" || publicJwk.crv !== "P-256" || !publicJwk.x || !publicJwk.y) throw new LexisError("侧车里没有 P-256 公钥");
+	const pub = await crypto.subtle.importKey("jwk", publicJwk, {
+		name: "ECDH",
+		namedCurve: "P-256"
+	}, true, []);
+	const publicRaw = new Uint8Array(await crypto.subtle.exportKey("raw", pub));
+	const fingerprint = typeof data.fingerprint === "string" && data.fingerprint ? data.fingerprint : await fingerprintOf(publicRaw);
+	return {
+		publicJwk,
+		privateJwk: {
+			kty: "EC",
+			crv: "P-256",
+			x: publicJwk.x,
+			y: publicJwk.y,
+			ext: true
+		},
+		publicRaw,
+		fingerprint
 	};
 }
 function readVault(value) {
@@ -4680,11 +4792,10 @@ function NodesPanel() {
 		setError(null);
 		try {
 			const data = JSON.parse(await file.text());
+			if (data.lo && data.hi && typeof data.saltB64 === "string" && data.cipher !== SPEC.name) throw new LexisError("这是封存文件，不是侧车。放到常驻目录，命名为 lexis.seal.json，不要和公钥写在一起。");
 			if (data.cipher !== SPEC.name) throw new LexisError("这不是词隙侧车");
 			if (data.role !== "gate" && data.role !== "edge") throw new LexisError("角色不对");
-			const publicJwk = data.publicJwk;
-			const privateJwk = data.privateJwk;
-			const ident = await identityFromJwks(publicJwk, privateJwk);
+			const ident = await materialFromSidecar(data);
 			const node = {
 				id: crypto.randomUUID(),
 				name: typeof data.name === "string" && data.name ? data.name : "导入节点",
@@ -4722,19 +4833,16 @@ function NodesPanel() {
 		setBusy(true);
 		setError(null);
 		try {
-			const params = clampKdf(useProfile.getState().profile.kdf);
+			const params = VAULT_KDF;
 			const salt = randomBytes(16);
 			const entries = [{
 				passphrase: trimmed,
-				scalar: privateScalar((await deriveIdentity(trimmed, salt, params)).privateJwk)
+				scalar: freshScalar()
 			}];
-			if (alt) {
-				const other = await deriveIdentity(alt, salt, params);
-				entries.push({
-					passphrase: alt,
-					scalar: privateScalar(other.privateJwk)
-				});
-			}
+			if (alt) entries.push({
+				passphrase: alt,
+				scalar: freshScalar()
+			});
 			const sealed = await sealIdentityVault(entries, salt, params, 4);
 			const opened = await openIdentityVault(sealed, trimmed);
 			const kdf = {
@@ -4833,7 +4941,7 @@ function NodesPanel() {
 			}) : null,
 			/* @__PURE__ */ (0, import_jsx_runtime.jsx)("p", {
 				className: "text-sm text-mist",
-				children: "初始私钥按口令派生后，封成同一条求值的系数，口令本身不留下。任意一句口令都会解开一把合法私钥，再叠上当前时间窗，得到一份同样格式的词表。口令不同，或时间窗不同，词就不同，两句错误口令之间也不会撞成同一份。不会提示哪一句是当初那句。刷新之后标量不在浏览器里，要再解一次。"
+				children: "封存用自己的 Argon2id：65536 KiB、3 次迭代，不跟握手那一档的 16 MiB 上限。点下去这页会卡几秒，那是在算。每次封存换一把随机私钥，口令只负责打开它。任意一句口令都会解开一把合法私钥，不会提示哪一句是当初那句。解开之后，卡片上的指纹换成这句口令对应的那把。对端对不上时说绑定不一致，不说口令错误。侧车和配置不写标量，也不写系数。系数单独是 lexis.seal.json。两边都拿到的人仍可以离线试口令，只是更慢。"
 			}),
 			/* @__PURE__ */ (0, import_jsx_runtime.jsx)("div", {
 				className: "grid gap-3 lg:grid-cols-2",
@@ -4845,29 +4953,36 @@ function NodesPanel() {
 					onBind: (peerId) => bindPair(node.id, peerId),
 					onRemove: () => removeNode(node.id),
 					onExport: () => {
-						if (node.vault && !node.privateJwk.d) {
-							setError("先解开，导出的侧车才带得走常驻进程要的私钥");
+						if (!node.vault && !node.privateJwk.d) {
+							setError("这把私钥不在浏览器里，侧车带不走标量");
 							return;
 						}
 						downloadJson(`${node.role}-${node.fingerprint}.json`, sidecarOf(node, nodes.find((n) => n.id === node.pinnedPeerId)));
+					},
+					onExportSeal: () => {
+						if (!node.vault) return;
+						downloadJson("lexis.seal.json", sealFileOf(node.vault));
 					},
 					onDerive: (passphrase, spare) => deriveNode(node.id, passphrase, spare),
 					onUnlock: (passphrase) => unlockNode(node.id, passphrase),
 					resident: profile.identity?.id === node.id,
 					joined: profile.peers.some((peer) => peer.id === node.id),
 					onResident: () => {
-						if (node.vault && !node.privateJwk.d) {
+						if (!node.vault && !node.privateJwk.d) {
 							setError("先解开，常驻身份才拿得到私钥");
 							return;
 						}
-						patch({ identity: {
-							id: node.id,
-							name: node.name,
-							publicJwk: node.publicJwk,
-							privateJwk: node.privateJwk,
-							publicRawB64: node.publicRawB64,
-							fingerprint: node.fingerprint
-						} });
+						patch({
+							identity: {
+								id: node.id,
+								name: node.name,
+								publicJwk: node.publicJwk,
+								privateJwk: node.vault ? omitScalar(node.privateJwk) : node.privateJwk,
+								publicRawB64: node.publicRawB64,
+								fingerprint: node.fingerprint
+							},
+							seal: node.vault ?? null
+						});
 					},
 					onJoin: () => {
 						const next = {
@@ -4889,7 +5004,7 @@ function NodesPanel() {
 		]
 	});
 }
-function NodeCard({ node, peers, peer, onName, onBind, onRemove, onExport, onDerive, onUnlock, resident, joined, onResident, onJoin }) {
+function NodeCard({ node, peers, peer, onName, onBind, onRemove, onExport, onExportSeal, onDerive, onUnlock, resident, joined, onResident, onJoin }) {
 	const [peerId, setPeerId] = (0, import_react.useState)(node.pinnedPeerId ?? "");
 	const [passphrase, setPassphrase] = (0, import_react.useState)("");
 	const [spare, setSpare] = (0, import_react.useState)("");
@@ -5007,7 +5122,12 @@ function NodeCard({ node, peers, peer, onName, onBind, onRemove, onExport, onDer
 							className: "size-4",
 							"aria-hidden": "true"
 						}), "导出侧车"]
-					})
+					}),
+					sealed ? /* @__PURE__ */ (0, import_jsx_runtime.jsx)(Btn, {
+						kind: "ghost",
+						onClick: onExportSeal,
+						children: "导出封存"
+					}) : null
 				]
 			}),
 			/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", {
@@ -5065,7 +5185,7 @@ function NodeCard({ node, peers, peer, onName, onBind, onRemove, onExport, onDer
 					}),
 					/* @__PURE__ */ (0, import_jsx_runtime.jsx)("p", {
 						className: "text-sm text-mist",
-						children: "参数用配置页里的内存和迭代。封存会换掉指纹，绑定仍按节点编号。解开不区分原口令和备用口令。"
+						children: "封存不读配置页里的握手参数。刷新之后标量不在浏览器里。导出封存不需要先解开。解开不比较公钥。"
 					})
 				]
 			}),
@@ -5098,7 +5218,7 @@ var STEPS = [
 	{
 		n: "04",
 		title: "密钥、计数器、词表一起封装",
-		body: "计数器先被密钥掩住，正文每 12 比特加上密钥流，再写成词。HMAC 还在。蜜文打开时，校验失败不报错，而落成这把密钥和当前时间窗自己的词表里的一句话。换钥匙或换窗，词表仍是同样的格式，词不一样。压不压缩看明文第一个字节，zstd 的等级在帧头里，对端不用另配一份开关。"
+		body: "计数器先被密钥掩住，正文每 12 比特加上密钥流，再写成词。帧尾是随机字节，不是会话密钥的校验，猜对和猜错比对这段都对不上。握手确认也不再拿会话密钥来算。词表仍由会话密钥导出，词能对上词表，本身仍说明密钥是对的。蜜文打开时，词对不上或计数器回放不报错，落成这把密钥和当前时间窗自己的一句话。换钥匙或换窗，词表仍是同样的格式，词不一样。压不压缩看明文第一个字节，zstd 的等级在帧头里，对端不用另配一份开关。"
 	}
 ];
 function Overview({ onOpen }) {
@@ -5161,7 +5281,7 @@ function Overview({ onOpen }) {
 					}, title))
 				}), /* @__PURE__ */ (0, import_jsx_runtime.jsx)("p", {
 					className: "mt-4 text-sm text-mist",
-					children: "浏览器里不能守一个真正的 TCP 端口。这条控制台把握手、词表和封装真实跑完。下载的常驻进程走同一套词表。TLS 和 WebSocket 只包在外面，方便过 CDN。安装包不再附带 TLS 私钥。时钟对不齐时，时间窗两边各留 120 秒。HTTP 代理按每个请求重写，去掉代理认证，并拒绝长度和分块写在一起。状态页还有 /health 和 /metrics。Linux 在有 root 时，redirect 和 tproxy 会读原始目的地址，虚拟网卡走用户态 TCP/UDP。Windows 的 WinDivert 只有源码，驱动不在包里。Android 只带 VpnService 源码和本机包通道，没有装好的系统 VPN。中继默认关闭。"
+					children: "浏览器里不能守一个真正的 TCP 端口。这条控制台把握手、词表和封装真实跑完。下载的常驻进程走同一套词表，两端都要是这一版。TLS 和 WebSocket 只包在外面，方便过 CDN。安装包不再附带 TLS 私钥。时钟对不齐时，时间窗两边各留 120 秒。HTTP 代理按每个请求重写，去掉代理认证，并拒绝长度和分块写在一起。状态页在回环上可以看指标；离开回环要状态口令，健康检查仍然公开。Linux 上的用户态栈会切段、重传、暂存一段乱序，并按对端窗口停发。系统接管时，53 端口的查询答成 198.18.0.0/15 里的假地址，再映射回域名，假地址本身不会被拨出去。这不是 gVisor，也没有在这台机器上证明虚拟网卡或透明代理已经接住流量。Windows 的 WinDivert 只有源码，驱动不在包里。Android 只带 VpnService 源码和本机包通道，没有装好的系统 VPN。中继默认关闭。缺了角色的配置不会被当成边缘。"
 				})]
 			}),
 			/* @__PURE__ */ (0, import_jsx_runtime.jsx)("div", {

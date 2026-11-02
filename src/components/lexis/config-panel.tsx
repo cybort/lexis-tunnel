@@ -13,6 +13,7 @@ import {
   importSingBox,
   matchRoute,
   profileIssues,
+  exportedConfig,
   type Inbound,
   type LexisProfile,
   type NetPeer,
@@ -23,7 +24,7 @@ import {
 } from "@/lib/lexis/profile";
 import { clampKdf } from "@/lib/lexis/kdf";
 import { useProfile } from "@/lib/lexis/profile-store";
-import { downloadJson } from "@/lib/lexis/store";
+import { downloadJson, sealFileOf } from "@/lib/lexis/store";
 import { Btn, control, Field } from "./ui";
 
 function rid(prefix: string) {
@@ -111,6 +112,7 @@ export function ConfigPanel() {
           publicRawB64: b64(ident.publicRaw),
           fingerprint: ident.fingerprint,
         },
+        seal: null,
       });
     } finally {
       setMinting(false);
@@ -150,6 +152,7 @@ export function ConfigPanel() {
           </Field>
           <Field label="角色">
             <select className={control} value={profile.role} onChange={(e) => patch({ role: e.target.value as LexisProfile["role"] })}>
+              {profile.role === "" ? <option value="">要指定</option> : null}
               <option value="edge">边缘客户端</option>
               <option value="gate">公网闸门</option>
             </select>
@@ -167,18 +170,19 @@ export function ConfigPanel() {
             </select>
           </Field>
         </div>
+        <p className="mt-2 text-sm text-mist">常驻进程不接受缺省角色，要写成边缘或闸门。控制台里新建一份时仍默认是边缘。</p>
       </section>
 
       <section className="rounded-md border border-line bg-panel p-4">
         <h2 className="text-base font-medium">密钥与压缩</h2>
         <p className="mt-2 text-sm text-mist">
-          会话密钥的 Argon2id 由常驻进程自己的参数决定，不听客户端把内存抬高。上限 16384 KiB。口令不对的问候在派生之前就被丢掉。长期私钥的口令派生仍在节点页。
+          会话密钥的 Argon2id 由常驻进程自己的参数决定，不听客户端把内存抬高。上限 16384 KiB。口令不对的问候在派生之前就被丢掉。长期私钥的封存在节点页，用另一档 65536 KiB、3 次迭代。系数不写进这份配置。
         </p>
         <p className="mt-2 text-sm text-mist">
           压缩不靠这份配置在对端对齐。明文第一个字节是类型：0 是原文，1 是 zstd 帧。等级决定窗口，窗口写在帧头里，对端解开以后自己读。比原文更大时这一帧会改回类型 0。
         </p>
         <p className="mt-2 text-sm text-mist">
-          蜜文在握手时谈定。打开以后，校验对不上不报错，而落成这把密钥和当前时间窗自己的词表里的一句话。换一把密钥，或换一个时间窗，词表格式不变、用词不同。备用明文写进同一条求值，不会为某一把密钥另开判断。线上没有「这是蜜文」的位。这个模式不再提示报文被改过。
+          蜜文在握手时谈定。打开以后，词不在词表里、正文结构不对、或者计数器回放，都不报错，落成这把密钥和当前时间窗自己的词表里的一句话。关掉时，回放仍会拆掉这条会话。帧尾是随机字节，不是会话密钥的校验：猜中会话密钥的人和猜错的人，比对这段尾部都对不上。握手确认也不再拿会话密钥来算。词表仍由会话密钥导出，对得上词表本身仍说明这把密钥是对的。换一把密钥，或换一个时间窗，词表格式不变、用词不同。备用明文写进同一条求值，不会为某一把密钥另开判断。线上没有「这是蜜文」的位。这一版和 1.7 及更早的对端对不上。
         </p>
         <div className="mt-4 grid gap-3 sm:grid-cols-3">
           <Field label="Argon2 内存 KiB">
@@ -461,6 +465,18 @@ export function ConfigPanel() {
             ? "SOCKS 和固定转发会按填写的地址监听，可能暴露到局域网。"
             : "SOCKS 和固定转发强制绑在回环。隧道入口仍按填写的地址监听，方便以后做端口映射。"}
         </p>
+        <div className="mt-4 max-w-md">
+          <Field label="状态口令">
+            <input
+              className={control}
+              value={profile.statusToken}
+              autoComplete="off"
+              placeholder="回环上可留空"
+              onChange={(e) => patch({ statusToken: e.target.value })}
+            />
+          </Field>
+        </div>
+        <p className="mt-2 text-sm text-mist">状态页离开回环时，指标和页面要带这句口令。健康检查不带。没有口令又没有允许局域网时，状态页改绑回环。</p>
       </section>
 
       <section className="rounded-md border border-line bg-panel p-4">
@@ -732,9 +748,16 @@ export function ConfigPanel() {
       ) : null}
 
       <div className="flex flex-wrap gap-2">
-        <Btn onClick={() => downloadJson("lexis.config.json", profile)}>导出配置</Btn>
+        <Btn onClick={() => downloadJson("lexis.config.json", exportedConfig(profile))}>导出配置</Btn>
+        {profile.seal ? (
+          <Btn kind="ghost" onClick={() => downloadJson("lexis.seal.json", sealFileOf(profile.seal!))}>
+            导出封存
+          </Btn>
+        ) : null}
       </div>
-      <p className="text-sm text-mist">导出的 JSON 含本机私钥。覆盖常驻进程目录里的 lexis.config.json 再重启。</p>
+      <p className="text-sm text-mist">
+        没有封存时，配置里带着本机私钥。封存之后，导出的配置去掉标量，系数在另一个文件 lexis.seal.json。两个文件不要合成一个：公钥写在对端名单里，和系数放在一起就能离线试口令。放到常驻目录后，权限应收成仅本人可读。口令用环境变量 LEXIS_PASSPHRASE，或同目录的 lexis.passphrase。常驻进程不会拿解开的公钥去对配置里的公钥。
+      </p>
     </div>
   );
 }

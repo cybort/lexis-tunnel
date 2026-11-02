@@ -2,6 +2,7 @@ import {
   chunksToBytes,
   bytesToChunks,
   concat,
+  randomBytes,
   readU16,
   u16be,
   u32be,
@@ -30,7 +31,7 @@ export type OpenInput = {
   direction: Direction;
   prose: string;
   lastSeen: number;
-  /** When set, a bad MAC becomes a sentence from this key's own lexicon. Negotiated in the handshake. */
+  /** When set, a broken frame or a replay becomes a sentence from this key's lexicon. The 16-byte tail is not a check. */
   honey?: boolean;
   /** Optional programmed cover. Evaluated for every key; no per-key branch. */
   program?: HoneyProgram | null;
@@ -50,19 +51,16 @@ function mask24(mac: Uint8Array): number {
  * Codebook stream seal.
  * Counter is hidden by a window mask, then each 12-bit plaintext digit is
  * added (mod 4096) to a keystream digit and emitted as lexicon[sum].
- * HMAC covers direction, counter, and plaintext.
+ * HMAC covers direction, counter, and plaintext only for the counter mask.
+ * The 16-byte tail is random. It is not HMAC(sessionKey, plaintext): a guessed
+ * session key must not be able to confirm itself by recomputing that tag.
  */
 export async function seal(input: SealInput): Promise<string> {
   const { key, lexicon, counter, window, direction, plaintext } = input;
   if (counter < 1 || counter > 0xffffff) throw new LexisError("计数器超出 24 位范围");
   if (lexicon.length !== SPEC.lexiconSize) throw new LexisError("词表长度不对");
 
-  const tag = (
-    await hmac(
-      key,
-      concat(utf8(`lexis-mac-v1|${direction}|`), u32be(counter), plaintext),
-    )
-  ).subarray(0, SPEC.macBytes);
+  const tag = randomBytes(SPEC.macBytes);
 
   const framed = concat(u16be(plaintext.length), plaintext, tag);
   const chunks = bytesToChunks(framed);
@@ -86,16 +84,21 @@ export async function seal(input: SealInput): Promise<string> {
   return dress([c0, c1, ...body], counter);
 }
 
-function macBit(a: Uint8Array, b: Uint8Array): number {
-  const n = Math.max(a.length, b.length);
-  let diff = a.length === b.length ? 0 : 1;
-  for (let i = 0; i < n; i += 1) diff |= (a[i] ?? 0) ^ (b[i] ?? 0);
-  return Number(diff === 0);
+/** What an older peer would have accepted. The bytes on the wire are not this value. */
+export async function legacyKeyTag(key: Uint8Array, direction: Direction, counter: number, plaintext: Uint8Array): Promise<Uint8Array> {
+  return (await hmac(key, concat(utf8(`lexis-mac-v1|${direction}|`), u32be(counter), plaintext))).subarray(0, SPEC.macBytes);
 }
 
-export async function open(input: OpenInput): Promise<Opened> {
-  const { key, inverse, window, direction, prose, lastSeen } = input;
-  const honey = input.honey === true;
+type Recovered = { missing: boolean; counter: number; raw: Uint8Array };
+
+async function recover(input: {
+  key: Uint8Array;
+  inverse: Map<string, number>;
+  window: number;
+  direction: Direction;
+  prose: string;
+}): Promise<Recovered> {
+  const { key, inverse, window, direction, prose } = input;
   const words = undress(prose);
   if (words.length < 3) throw new LexisError("报文太短，不像一帧词隙");
 
@@ -123,7 +126,28 @@ export async function open(input: OpenInput): Promise<Opened> {
     const ks12 = ((ks[i * 2] << 8) | ks[i * 2 + 1]) & 0xfff;
     return (take(w) - ks12 + SPEC.lexiconSize) % SPEC.lexiconSize;
   });
-  const raw = chunksToBytes(chunks);
+  return { missing, counter, raw: chunksToBytes(chunks) };
+}
+
+/** The 16 bytes after the length prefix. They are random, so this is not a key check. */
+export async function peelTail(input: {
+  key: Uint8Array;
+  inverse: Map<string, number>;
+  window: number;
+  direction: Direction;
+  prose: string;
+}): Promise<Uint8Array | null> {
+  const { missing, raw } = await recover(input);
+  if (missing || raw.length < 2 + SPEC.macBytes) return null;
+  const len = readU16(raw, 0);
+  if (2 + len + SPEC.macBytes > raw.length) return null;
+  return raw.slice(2 + len, 2 + len + SPEC.macBytes);
+}
+
+export async function open(input: OpenInput): Promise<Opened> {
+  const { key, window, prose, lastSeen } = input;
+  const honey = input.honey === true;
+  const { missing, counter, raw } = await recover(input);
   const seed = raw.length ? raw : utf8(prose);
 
   const coverOf = () => honeyPhrase(key, window, seed, input.program);
@@ -147,14 +171,9 @@ export async function open(input: OpenInput): Promise<Opened> {
     return release(0, new Uint8Array());
   }
   const plaintext = raw.slice(2, 2 + len);
-  const tag = raw.slice(2 + len, 2 + len + SPEC.macBytes);
-  const expect = (await hmac(key, concat(utf8(`lexis-mac-v1|${direction}|`), u32be(counter), plaintext))).subarray(0, SPEC.macBytes);
-  const ok = macBit(tag, expect);
-  if (ok === 1) {
-    if (counter < 1) throw new LexisError("计数器无效");
-    if (counter <= lastSeen) throw new LexisError("计数器没有前进，按回放丢弃");
-  } else if (!honey) {
-    throw new LexisError("校验失败。密钥、计数器或词表对不上。");
+  if (counter < 1 || counter <= lastSeen) {
+    if (!honey) throw new LexisError(counter < 1 ? "计数器无效" : "计数器没有前进，按回放丢弃");
+    return release(0, plaintext);
   }
-  return release(ok, plaintext);
+  return release(1, plaintext);
 }

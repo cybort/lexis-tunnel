@@ -127,6 +127,22 @@ function createReader(socket, hardCap = 8 * 1024 * 1024) {
         waiter.resolve(out);
         continue;
       }
+      if (waiter.type === "some") {
+        if (buf.length > 0) {
+          const n = Math.min(buf.length, waiter.n);
+          const out = buf.subarray(0, n);
+          buf = buf.subarray(n);
+          waiters.shift();
+          waiter.resolve(out);
+          continue;
+        }
+        if (dead) {
+          waiters.shift();
+          waiter.resolve(Buffer.alloc(0));
+          continue;
+        }
+        return;
+      }
       if (buf.length < waiter.n) {
         if (dead) {
           waiters.shift();
@@ -166,6 +182,12 @@ function createReader(socket, hardCap = 8 * 1024 * 1024) {
     readUntil(sep, cap) {
       return new Promise((resolve, reject) => {
         waiters.push({ type: "until", sep, cap, resolve, reject });
+        pump();
+      });
+    },
+    readSome(n) {
+      return new Promise((resolve, reject) => {
+        waiters.push({ type: "some", n, resolve, reject });
         pump();
       });
     },
@@ -249,6 +271,13 @@ function splice(left, right) {
   right.pipe(left);
 }
 
+function carriesBody(method, status) {
+  if (method === "HEAD") return false;
+  if (status >= 100 && status < 200) return false;
+  if (status === 204 || status === 304) return false;
+  return true;
+}
+
 export async function serveHttpProxy(socket, options) {
   const cap = options.headerCap || 8192;
   const count = options.count || (() => undefined);
@@ -306,37 +335,68 @@ export async function serveHttpProxy(socket, options) {
       await writeAll(upstream, Buffer.from(preface));
       if (framing.mode === "length") await pipeExact(reader, upstream, framing.length);
       else if (framing.mode === "chunked") await pipeChunked(reader, upstream);
-      const respBuf = await upstreamReader.readUntil(Buffer.from("\r\n\r\n"), cap);
-      if (!respBuf) {
-        upstream.destroy();
-        return fail(502, "Bad Gateway");
+      let respLines = null;
+      let respFrame = null;
+      let statusCode = 0;
+      for (;;) {
+        const respBuf = await upstreamReader.readUntil(Buffer.from("\r\n\r\n"), cap);
+        if (!respBuf) {
+          upstream.destroy();
+          return fail(502, "Bad Gateway");
+        }
+        const respHead = respBuf.toString("latin1");
+        if (hasBareLf(respHead)) {
+          upstream.destroy();
+          return fail(502, "Bad Gateway");
+        }
+        respLines = respHead.split("\r\n");
+        const statusMatch = (respLines[0] || "").match(/^HTTP\/1\.[01]\s+(\d{3})/i);
+        if (!statusMatch) {
+          upstream.destroy();
+          return fail(502, "Bad Gateway");
+        }
+        statusCode = Number(statusMatch[1]);
+        if (statusCode >= 100 && statusCode < 200) {
+          await writeAll(socket, Buffer.from(`${respHead}\r\n\r\n`));
+          continue;
+        }
+        respFrame = classifyFraming(respLines);
+        break;
       }
-      const respHead = respBuf.toString("latin1");
-      if (hasBareLf(respHead)) {
-        upstream.destroy();
-        return fail(502, "Bad Gateway");
-      }
-      const respLines = respHead.split("\r\n");
-      if (!/^HTTP\/1\.[01]\s+\d{3}/i.test(respLines[0] || "")) {
-        upstream.destroy();
-        return fail(502, "Bad Gateway");
-      }
-      const respFrame = classifyFraming(respLines);
       if (!respFrame.ok) {
         upstream.destroy();
         count("smuggle");
         return fail(502, "Bad Gateway", "smuggle");
       }
-      const respKept = sanitizeHeaders(respLines.slice(1));
-      const respExtra = respFrame.mode === "chunked" ? "Transfer-Encoding: chunked\r\n" : respFrame.mode === "length" ? `Content-Length: ${respFrame.length}\r\n` : "";
-      const keep = respFrame.mode === "none" ? "close" : "keep-alive";
+      const respKept = sanitizeHeaders(respLines.slice(1)).filter((line) => {
+        if (carriesBody(method, statusCode)) return true;
+        const name = headerName(line);
+        return name !== "content-length" && name !== "transfer-encoding";
+      });
+      const respExtra = !carriesBody(method, statusCode)
+        ? ""
+        : respFrame.mode === "chunked"
+          ? "Transfer-Encoding: chunked\r\n"
+          : respFrame.mode === "length"
+            ? `Content-Length: ${respFrame.length}\r\n`
+            : "";
+      const keep = carriesBody(method, statusCode) && respFrame.mode !== "none" ? "keep-alive" : "close";
       await writeAll(socket, Buffer.from(`${respLines[0]}\r\n${respKept.length ? `${respKept.join("\r\n")}\r\n` : ""}${respExtra}Connection: ${keep}\r\n\r\n`));
+      if (!carriesBody(method, statusCode)) {
+        upstream.destroy();
+        count("httpOk");
+        if (keep === "close") {
+          socket.end();
+          return;
+        }
+        continue;
+      }
       if (respFrame.mode === "length") await pipeExact(upstreamReader, socket, respFrame.length);
       else if (respFrame.mode === "chunked") await pipeChunked(upstreamReader, socket);
       else {
         for (;;) {
-          const chunk = await upstreamReader.readExactly(16 * 1024).catch(() => null);
-          if (!chunk || !chunk.length) break;
+          const chunk = await upstreamReader.readSome(16 * 1024);
+          if (!chunk.length) break;
           await writeAll(socket, chunk);
         }
         upstream.destroy();

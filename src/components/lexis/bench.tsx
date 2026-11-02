@@ -387,7 +387,7 @@ export function Bench({
                 <dt className="text-mist">派生</dt>
                 <dd className="font-mono text-xs">
                   {session.kdf.memoryKiB} KiB · t{session.kdf.iterations} · p{session.kdf.parallelism} · {session.kdfMs} ms ·{" "}
-                  {session.honey ? "蜜文" : "校验失败即拒绝"}
+                  {session.honey ? "蜜文" : "结构或回放即拒绝"}
                 </dd>
               </div>
               <div>

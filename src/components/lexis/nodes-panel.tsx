@@ -1,15 +1,15 @@
 import { useEffect, useRef, useState } from "react";
 import { Download, Trash2 } from "lucide-react";
 import { b64, randomBytes } from "@/lib/lexis/bytes";
-import { identityFromJwks, LexisError } from "@/lib/lexis/crypto";
+import { identityFromJwks, fingerprintOf, LexisError } from "@/lib/lexis/crypto";
 import { currentWindow } from "@/lib/lexis/handshake";
-import { openIdentityVault, privateScalar, sealIdentityVault, vaultFromStored, vaultToStored } from "@/lib/lexis/honey";
-import { clampKdf, deriveIdentity } from "@/lib/lexis/kdf";
+import { freshScalar, openIdentityVault, privateScalar, sealIdentityVault, vaultFromStored, vaultToStored } from "@/lib/lexis/honey";
+import { clampVaultKdf, VAULT_KDF } from "@/lib/lexis/kdf";
 import { sessionLexicon } from "@/lib/lexis/lexicon";
 import { useProfile } from "@/lib/lexis/profile-store";
 import type { NetPeer } from "@/lib/lexis/profile";
 import { SPEC } from "@/lib/lexis/spec";
-import { downloadJson, makeNode, sidecarOf, useMesh } from "@/lib/lexis/store";
+import { downloadJson, makeNode, sealFileOf, sidecarOf, useMesh } from "@/lib/lexis/store";
 import type { MeshNode, NodeKdf, NodeRole, StoredVault } from "@/lib/lexis/types";
 import { Btn, control, Field } from "./ui";
 
@@ -21,7 +21,31 @@ function readKdf(value: unknown): NodeKdf | null {
   if (!value || typeof value !== "object") return null;
   const raw = value as Partial<NodeKdf>;
   if (typeof raw.saltB64 !== "string" || !raw.saltB64) return null;
-  return { saltB64: raw.saltB64, ...clampKdf(raw) };
+  return { saltB64: raw.saltB64, ...clampVaultKdf(raw) };
+}
+
+function omitScalar(jwk: JsonWebKey): JsonWebKey {
+  if (!jwk.d) return jwk;
+  const { d: _scalar, ...rest } = jwk;
+  return rest;
+}
+
+async function materialFromSidecar(data: Record<string, unknown>) {
+  const publicJwk = data.publicJwk as JsonWebKey;
+  const privateJwk = data.privateJwk as JsonWebKey | undefined;
+  if (privateJwk?.d) return identityFromJwks(publicJwk, privateJwk);
+  if (!publicJwk || publicJwk.kty !== "EC" || publicJwk.crv !== "P-256" || !publicJwk.x || !publicJwk.y) {
+    throw new LexisError("侧车里没有 P-256 公钥");
+  }
+  const pub = await crypto.subtle.importKey("jwk", publicJwk, { name: "ECDH", namedCurve: "P-256" }, true, []);
+  const publicRaw = new Uint8Array(await crypto.subtle.exportKey("raw", pub));
+  const fingerprint = typeof data.fingerprint === "string" && data.fingerprint ? data.fingerprint : await fingerprintOf(publicRaw);
+  return {
+    publicJwk,
+    privateJwk: { kty: "EC", crv: "P-256", x: publicJwk.x, y: publicJwk.y, ext: true } as JsonWebKey,
+    publicRaw,
+    fingerprint,
+  };
 }
 
 function readVault(value: unknown): StoredVault | null {
@@ -60,11 +84,12 @@ export function NodesPanel() {
     setError(null);
     try {
       const data = JSON.parse(await file.text()) as Record<string, unknown>;
+      if (data.lo && data.hi && typeof data.saltB64 === "string" && data.cipher !== SPEC.name) {
+        throw new LexisError("这是封存文件，不是侧车。放到常驻目录，命名为 lexis.seal.json，不要和公钥写在一起。");
+      }
       if (data.cipher !== SPEC.name) throw new LexisError("这不是词隙侧车");
       if (data.role !== "gate" && data.role !== "edge") throw new LexisError("角色不对");
-      const publicJwk = data.publicJwk as JsonWebKey;
-      const privateJwk = data.privateJwk as JsonWebKey;
-      const ident = await identityFromJwks(publicJwk, privateJwk);
+      const ident = await materialFromSidecar(data);
       const node: MeshNode = {
         id: crypto.randomUUID(),
         name: typeof data.name === "string" && data.name ? data.name : "导入节点",
@@ -103,14 +128,10 @@ export function NodesPanel() {
     setBusy(true);
     setError(null);
     try {
-      const params = clampKdf(useProfile.getState().profile.kdf);
+      const params = VAULT_KDF;
       const salt = randomBytes(16);
-      const primary = await deriveIdentity(trimmed, salt, params);
-      const entries = [{ passphrase: trimmed, scalar: privateScalar(primary.privateJwk) }];
-      if (alt) {
-        const other = await deriveIdentity(alt, salt, params);
-        entries.push({ passphrase: alt, scalar: privateScalar(other.privateJwk) });
-      }
+      const entries = [{ passphrase: trimmed, scalar: freshScalar() }];
+      if (alt) entries.push({ passphrase: alt, scalar: freshScalar() });
       const sealed = await sealIdentityVault(entries, salt, params, 4);
       const opened = await openIdentityVault(sealed, trimmed);
       const kdf: NodeKdf = { saltB64: b64(salt), ...params };
@@ -194,7 +215,7 @@ export function NodesPanel() {
       </div>
       {error ? <p className="text-sm text-ember">{error}</p> : null}
       <p className="text-sm text-mist">
-        初始私钥按口令派生后，封成同一条求值的系数，口令本身不留下。任意一句口令都会解开一把合法私钥，再叠上当前时间窗，得到一份同样格式的词表。口令不同，或时间窗不同，词就不同，两句错误口令之间也不会撞成同一份。不会提示哪一句是当初那句。刷新之后标量不在浏览器里，要再解一次。
+        封存用自己的 Argon2id：65536 KiB、3 次迭代，不跟握手那一档的 16 MiB 上限。点下去这页会卡几秒，那是在算。每次封存换一把随机私钥，口令只负责打开它。任意一句口令都会解开一把合法私钥，不会提示哪一句是当初那句。解开之后，卡片上的指纹换成这句口令对应的那把。对端对不上时说绑定不一致，不说口令错误。侧车和配置不写标量，也不写系数。系数单独是 lexis.seal.json。两边都拿到的人仍可以离线试口令，只是更慢。
       </p>
       <div className="grid gap-3 lg:grid-cols-2">
         {nodes.map((node) => (
@@ -207,18 +228,22 @@ export function NodesPanel() {
             onBind={(peerId) => bindPair(node.id, peerId)}
             onRemove={() => removeNode(node.id)}
             onExport={() => {
-              if (node.vault && !node.privateJwk.d) {
-                setError("先解开，导出的侧车才带得走常驻进程要的私钥");
+              if (!node.vault && !node.privateJwk.d) {
+                setError("这把私钥不在浏览器里，侧车带不走标量");
                 return;
               }
               downloadJson(`${node.role}-${node.fingerprint}.json`, sidecarOf(node, nodes.find((n) => n.id === node.pinnedPeerId)));
+            }}
+            onExportSeal={() => {
+              if (!node.vault) return;
+              downloadJson("lexis.seal.json", sealFileOf(node.vault));
             }}
             onDerive={(passphrase, spare) => deriveNode(node.id, passphrase, spare)}
             onUnlock={(passphrase) => unlockNode(node.id, passphrase)}
             resident={profile.identity?.id === node.id}
             joined={profile.peers.some((peer) => peer.id === node.id)}
             onResident={() => {
-              if (node.vault && !node.privateJwk.d) {
+              if (!node.vault && !node.privateJwk.d) {
                 setError("先解开，常驻身份才拿得到私钥");
                 return;
               }
@@ -227,10 +252,11 @@ export function NodesPanel() {
                   id: node.id,
                   name: node.name,
                   publicJwk: node.publicJwk,
-                  privateJwk: node.privateJwk,
+                  privateJwk: node.vault ? omitScalar(node.privateJwk) : node.privateJwk,
                   publicRawB64: node.publicRawB64,
                   fingerprint: node.fingerprint,
                 },
+                seal: node.vault ?? null,
               });
             }}
             onJoin={() => {
@@ -263,6 +289,7 @@ function NodeCard({
   onBind,
   onRemove,
   onExport,
+  onExportSeal,
   onDerive,
   onUnlock,
   resident,
@@ -277,6 +304,7 @@ function NodeCard({
   onBind: (peerId: string) => void;
   onRemove: () => void;
   onExport: () => void;
+  onExportSeal: () => void;
   onDerive: (passphrase: string, spare: string) => Promise<void>;
   onUnlock: (passphrase: string) => Promise<void>;
   resident: boolean;
@@ -372,6 +400,11 @@ function NodeCard({
           <Download className="size-4" aria-hidden="true" />
           导出侧车
         </Btn>
+        {sealed ? (
+          <Btn kind="ghost" onClick={onExportSeal}>
+            导出封存
+          </Btn>
+        ) : null}
       </div>
       <div className="mt-3 grid gap-2">
         <Field label="口令">
@@ -426,7 +459,9 @@ function NodeCard({
             </Btn>
           ) : null}
         </div>
-        <p className="text-sm text-mist">参数用配置页里的内存和迭代。封存会换掉指纹，绑定仍按节点编号。解开不区分原口令和备用口令。</p>
+        <p className="text-sm text-mist">
+          封存不读配置页里的握手参数。刷新之后标量不在浏览器里。导出封存不需要先解开。解开不比较公钥。
+        </p>
       </div>
       {node.pinnedPeerId ? (
         <p className="mt-3 text-sm text-mist">已指向 {peer?.name ?? "一个已经删掉的节点"}</p>

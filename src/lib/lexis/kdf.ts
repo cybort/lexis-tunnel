@@ -18,6 +18,13 @@ export const DEFAULT_KDF: ArgonParams = {
   parallelism: 1,
 };
 
+/** At-rest private key. Not the handshake cap. A guess costs this much even if the public key is known. */
+export const VAULT_KDF: ArgonParams = {
+  memoryKiB: 65536,
+  iterations: 3,
+  parallelism: 1,
+};
+
 const LIMITS = {
   memoryKiB: { min: 8, max: 16384 },
   iterations: { min: 1, max: 4 },
@@ -46,6 +53,16 @@ export function clampKdf(input?: Partial<ArgonParams> | null): ArgonParams {
 
 export function clampOffer(input?: Partial<SessionOffer> | null): SessionOffer {
   return { ...clampKdf(input), honey: input?.honey === true };
+}
+
+/** Vault cost. Explicit small values stay, so tests can use a tiny memory. Missing values become VAULT_KDF.
+ *  This does not use the handshake ceiling of 16384 KiB. */
+export function clampVaultKdf(input?: Partial<ArgonParams> | null): ArgonParams {
+  return {
+    memoryKiB: clampInt(input?.memoryKiB, 8, 262144, VAULT_KDF.memoryKiB),
+    iterations: clampInt(input?.iterations, 1, 8, VAULT_KDF.iterations),
+    parallelism: clampInt(input?.parallelism, 1, 1, VAULT_KDF.parallelism),
+  };
 }
 
 export function encodeKdf(params: ArgonParams): Uint8Array {

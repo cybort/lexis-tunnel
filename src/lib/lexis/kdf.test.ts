@@ -2,9 +2,9 @@ import assert from "node:assert/strict";
 import { fromUtf8, randomBytes, utf8 } from "./bytes.ts";
 import { createIdentity } from "./crypto.ts";
 import { establish } from "./handshake.ts";
-import { clampKdf, deriveIdentity } from "./kdf.ts";
+import { clampKdf, clampVaultKdf, deriveIdentity, VAULT_KDF } from "./kdf.ts";
 import { packPayload, unpackPayload, ZSTD_TAG } from "./pack.ts";
-import { open, seal } from "./seal.ts";
+import { legacyKeyTag, open, peelTail, seal } from "./seal.ts";
 import { b64 } from "./bytes.ts";
 import type { MeshNode } from "./types.ts";
 
@@ -31,6 +31,9 @@ async function main() {
   assert.equal(clamped.memoryKiB, 16384);
   assert.equal(clamped.iterations, 4);
   assert.equal(clamped.parallelism, 2);
+  assert.equal(clampVaultKdf({ memoryKiB: 65536, iterations: 3, parallelism: 1 }).memoryKiB, 65536);
+  assert.equal(clampVaultKdf(undefined).memoryKiB, VAULT_KDF.memoryKiB);
+  assert.equal(clampKdf({ memoryKiB: 65536 }).memoryKiB, 16384);
 
   const salt = randomBytes(16);
   const a = await deriveIdentity("口令", salt, FAST);
@@ -90,10 +93,26 @@ async function main() {
   assert.equal(opened.honey, false);
   const unpacked = await unpackPayload(opened.plaintext, false);
   assert.equal(fromUtf8(unpacked.data), fromUtf8(raw));
+  const tail = await peelTail({
+    key: session.sk,
+    inverse: session.inverse,
+    window: session.window,
+    direction: "g2e",
+    prose,
+  });
+  const realLegacy = await legacyKeyTag(session.sk, "g2e", 1, packed.bytes);
+  const wrongLegacy = await legacyKeyTag(randomBytes(32), "g2e", 1, packed.bytes);
+  assert.ok(tail);
+  assert.equal(tail.length, 16);
+  const realMiss = Buffer.compare(tail, realLegacy) !== 0;
+  const wrongMiss = Buffer.compare(tail, wrongLegacy) !== 0;
+  assert.equal(realMiss, true);
+  assert.equal(wrongMiss, true);
+  assert.equal(realMiss, wrongMiss);
 
   const decoy = await open({
     key: randomBytes(32),
-    inverse: session.inverse,
+    inverse: new Map(),
     window: session.window,
     direction: "g2e",
     prose,
@@ -106,8 +125,8 @@ async function main() {
 
   await assert.rejects(() =>
     open({
-      key: randomBytes(32),
-      inverse: session.inverse,
+      key: session.sk,
+      inverse: new Map(),
       window: session.window,
       direction: "g2e",
       prose,
@@ -115,6 +134,18 @@ async function main() {
       honey: false,
     }),
   );
+
+  const replay = await open({
+    key: session.sk,
+    inverse: session.inverse,
+    window: session.window,
+    direction: "g2e",
+    prose,
+    lastSeen: opened.counter,
+    honey: true,
+  });
+  assert.equal(replay.honey, true);
+  assert.match(fromUtf8(replay.plaintext), /^the /);
 
   await assert.rejects(
     () =>
@@ -125,7 +156,7 @@ async function main() {
         direction: "g2e",
         prose,
         lastSeen: opened.counter,
-        honey: true,
+        honey: false,
       }),
     (err: unknown) => err instanceof Error && /回放/.test(err.message),
   );

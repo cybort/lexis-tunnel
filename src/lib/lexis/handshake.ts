@@ -158,6 +158,16 @@ async function tokenMac(token: string, body: Uint8Array): Promise<Uint8Array> {
   return (await hmac(utf8(token), concat(utf8("lexis-admit-v1"), body))).subarray(0, 16);
 }
 
+/**
+ * Tag over the public transcript. The HMAC key is a constant, not the session key.
+ * A recorded handshake plus a guessed long-term key must not be confirmed by this tag.
+ * Anyone who can see the public handshake can recompute it, so it does not prove the
+ * peer derived the same session key. A mismatch shows up when a data frame does not unpack.
+ */
+async function publicConfirm(label: string, tr: Uint8Array): Promise<Uint8Array> {
+  return (await hmac(utf8("lexis-pub-confirm-v1"), concat(utf8(label), tr))).subarray(0, 16);
+}
+
 export type AdmitOpts = {
   token?: string;
   /** Gate's own Argon2 parameters. The client's offer cannot raise this cost. */
@@ -294,8 +304,8 @@ export async function gateRespond(
     kdf: kdfBytes,
     features,
   });
-  const confirmS = (await hmac(sk, concat(utf8("lexis-srv-v1"), tr))).subarray(0, 16);
-  const expectFinish = (await hmac(sk, concat(utf8("lexis-cli-v1"), tr))).subarray(0, 16);
+  const confirmS = await publicConfirm("lexis-srv-pub-v1", tr);
+  const expectFinish = await publicConfirm("lexis-cli-pub-v1", tr);
   let blob = concat(new Uint8Array([1, 2]), ephS.publicRaw, ltS, nonceS, confirmS, kdfBytes, new Uint8Array([features]));
   if (token) blob = concat(blob, await tokenMac(token, blob));
   const serverWire = await encodeStatic(blob);
@@ -357,11 +367,11 @@ export async function edgeFinish(
     kdf: encodeKdf(server.kdf),
     features,
   });
-  const expectS = (await hmac(sk, concat(utf8("lexis-srv-v1"), tr))).subarray(0, 16);
+  const expectS = await publicConfirm("lexis-srv-pub-v1", tr);
   if (!timingSafeEqual(expectS, server.confirm)) {
-    throw new LexisError("闸门确认标记对不上，会话密钥没有对齐");
+    throw new LexisError("闸门确认标记对不上");
   }
-  const confirmC = (await hmac(sk, concat(utf8("lexis-cli-v1"), tr))).subarray(0, 16);
+  const confirmC = await publicConfirm("lexis-cli-pub-v1", tr);
   const finishWire = await encodeStatic(concat(new Uint8Array([1, 3]), confirmC));
   return {
     sk,

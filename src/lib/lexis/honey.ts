@@ -6,7 +6,7 @@ import { p256 } from "@noble/curves/nist.js";
 import { argon2id } from "@noble/hashes/argon2.js";
 import { concat, randomBytes, u32be, utf8, b64, unb64 } from "./bytes";
 import { hkdf, hmac, identityFromJwks, type KeyMaterial } from "./crypto";
-import { clampKdf, type ArgonParams } from "./kdf";
+import { clampVaultKdf, type ArgonParams } from "./kdf";
 import { sessionLexicon } from "./lexicon";
 import { SPEC } from "./spec";
 import type { StoredProgram, StoredVault } from "./types";
@@ -216,7 +216,7 @@ function b64url(bytes: Uint8Array): string {
 }
 
 async function stretch(passphrase: string, salt: Uint8Array, params: ArgonParams): Promise<Uint8Array> {
-  const c = clampKdf(params);
+  const c = clampVaultKdf(params);
   return argon2id(utf8(passphrase), salt, { t: c.iterations, m: c.memoryKiB, p: c.parallelism, dkLen: 32 });
 }
 
@@ -227,7 +227,7 @@ export async function sealIdentityVault(
   params: ArgonParams,
   slots = 4,
 ): Promise<IdentityVault> {
-  const c = clampKdf(params);
+  const c = clampVaultKdf(params);
   const seenPass = new Set<string>();
   for (const entry of entries) {
     if (seenPass.has(entry.passphrase)) throw new Error("口令重复，封不进同一条求值");
@@ -279,6 +279,10 @@ function unb64url(text: string): Uint8Array {
 }
 
 /** Scalar bytes of an unlocked key. Absent after a sealed key is reloaded. */
+export function freshScalar(): Uint8Array {
+  return p256.utils.randomSecretKey();
+}
+
 export function privateScalar(jwk: JsonWebKey): Uint8Array {
   if (!jwk.d) throw new Error("私钥不在内存里");
   const raw = unb64url(jwk.d);
@@ -335,7 +339,7 @@ export function vaultFromStored(raw: unknown): IdentityVault | null {
     if (salt.length < 8) return null;
     return {
       salt,
-      kdf: clampKdf({ memoryKiB: rec.memoryKiB, iterations: rec.iterations, parallelism: rec.parallelism }),
+      kdf: clampVaultKdf({ memoryKiB: rec.memoryKiB, iterations: rec.iterations, parallelism: rec.parallelism }),
       lo,
       hi,
     };

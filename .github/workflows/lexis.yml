@@ -11,5 +11,6 @@ jobs:
         with:
           node-version: 22
       - run: npm install
+      - run: node scripts/build-sockopt.mjs
       - run: npm run typecheck
       - run: npm run test:lexis

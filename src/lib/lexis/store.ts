@@ -142,21 +142,32 @@ export async function ensureSeed(): Promise<void> {
   }
 }
 
+export function sealFileOf(vault: NonNullable<MeshNode["vault"]>) {
+  return {
+    saltB64: vault.saltB64,
+    memoryKiB: vault.memoryKiB,
+    iterations: vault.iterations,
+    parallelism: vault.parallelism,
+    lo: vault.lo,
+    hi: vault.hi,
+  };
+}
+
 export function sidecarOf(node: MeshNode, peer: MeshNode | undefined) {
+  const secret = node.vault ? undefined : node.privateJwk;
   return {
     cipher: SPEC.name,
     role: node.role,
     name: node.name,
     fingerprint: node.fingerprint,
     publicJwk: node.publicJwk,
-    privateJwk: node.privateJwk,
+    privateJwk: secret,
     pinnedPeerFingerprint: peer?.fingerprint ?? null,
     pinnedPeerPublicJwk: peer?.publicJwk ?? null,
     windowSeconds: SPEC.windowSec,
     lexiconSize: SPEC.lexiconSize,
     handshake: "p256-ecdh-argon2id",
     kdf: node.kdf,
-    vault: node.vault ?? null,
     wire: "secret-lexicon-prose",
   };
 }
