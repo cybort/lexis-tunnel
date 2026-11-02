@@ -10,6 +10,8 @@ export const SPEC = {
   lexiconSize: 4096,
   bitsPerWord: 12,
   windowSec: 300,
+  /** Accept the previous window this many seconds in, and the next window this many seconds before the roll. */
+  skewSec: 120,
   counterBits: 24,
 } as const;
 

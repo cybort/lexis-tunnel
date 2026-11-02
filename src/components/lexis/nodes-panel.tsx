@@ -178,6 +178,7 @@ export function NodesPanel() {
                 wsPath: profile.outer.wsPath,
                 wsHost: "",
                 relay: false,
+                exit: false,
                 targets: [],
               };
               patch({ peers: [...profile.peers.filter((peer) => peer.id !== node.id), next] });

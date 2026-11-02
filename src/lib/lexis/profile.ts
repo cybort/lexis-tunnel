@@ -5,7 +5,7 @@ export const PROFILE_VERSION = 1 as const;
 export type RunMode = "fixed-port" | "system-forward";
 export type ClientRole = "edge" | "gate";
 export type RuleAction = "proxy" | "direct" | "bypass" | "reject";
-export type InboundProtocol = "socks" | "tcp" | "tunnel" | "http";
+export type InboundProtocol = "socks" | "tcp" | "tunnel" | "http" | "transparent";
 
 export type RuleType =
   | "DOMAIN"
@@ -62,6 +62,8 @@ export type NetPeer = {
   wsPath: string;
   wsHost: string;
   relay: boolean;
+  /** This peer may ask us to dial the public Internet. Default off. */
+  exit: boolean;
   targets: string[];
 };
 
@@ -98,7 +100,7 @@ export type LexisProfile = {
   statusHost: string;
   statusPort: number;
   heartbeatSec: number;
-  linux: { method: "tproxy" | "redirect"; mark: number; table: number; dnsRedirect: boolean };
+  linux: { method: "tproxy" | "redirect" | "tun"; mark: number; table: number; dnsRedirect: boolean };
   windows: { method: "windivert" | "portproxy"; gateway: string };
   android: { method: "vpn"; mtu: number; address: string; dns: string };
   kdf: ArgonParams;
@@ -238,6 +240,18 @@ function newId(prefix: string): string {
   return `${prefix}-${Math.random().toString(36).slice(2, 8)}`;
 }
 
+function linuxOf(base: LexisProfile["linux"], raw?: Partial<LexisProfile["linux"]> | null): LexisProfile["linux"] {
+  const method = raw?.method === "tproxy" || raw?.method === "tun" || raw?.method === "redirect" ? raw.method : base.method;
+  return {
+    ...base,
+    ...(raw ?? {}),
+    method,
+    mark: clampNum(raw?.mark, 1, 255, base.mark),
+    table: clampNum(raw?.table, 1, 65535, base.table),
+    dnsRedirect: raw?.dnsRedirect !== false,
+  };
+}
+
 export function normalizeProfile(input: unknown): LexisProfile {
   const base = defaultProfile();
   if (!input || typeof input !== "object") return base;
@@ -253,7 +267,7 @@ export function normalizeProfile(input: unknown): LexisProfile {
     inbounds: Array.isArray(raw.inbounds) ? raw.inbounds.map(normalizeInbound) : base.inbounds,
     processes: Array.isArray(raw.processes) ? raw.processes.map(normalizeProcess) : base.processes,
     rules: Array.isArray(raw.rules) ? raw.rules.map(normalizeRule) : base.rules,
-    linux: { ...base.linux, ...(raw.linux ?? {}) },
+    linux: linuxOf(base.linux, raw.linux),
     windows: { ...base.windows, ...(raw.windows ?? {}) },
     android: { ...base.android, ...(raw.android ?? {}) },
     heartbeatSec: clampNum(raw.heartbeatSec, 5, 120, base.heartbeatSec),
@@ -327,6 +341,7 @@ function normalizePeer(raw: Partial<NetPeer> | null | undefined): NetPeer | null
     wsPath: typeof raw.wsPath === "string" && raw.wsPath.startsWith("/") ? raw.wsPath : "/lexis",
     wsHost: String(raw.wsHost || "").trim(),
     relay: raw.relay === true,
+    exit: raw.exit === true,
     targets: Array.isArray(raw.targets) ? raw.targets.map((item) => String(item).trim()).filter(Boolean) : [],
   };
 }
@@ -365,7 +380,9 @@ function clampNum(value: unknown, min: number, max: number, fallback: number): n
 
 function normalizeInbound(raw: Partial<Inbound>): Inbound {
   const protocol: InboundProtocol =
-    raw.protocol === "tcp" || raw.protocol === "tunnel" || raw.protocol === "http" ? raw.protocol : "socks";
+    raw.protocol === "tcp" || raw.protocol === "tunnel" || raw.protocol === "http" || raw.protocol === "transparent"
+      ? raw.protocol
+      : "socks";
   return {
     id: raw.id || newId("in"),
     tag: raw.tag || "入站",
@@ -595,8 +612,8 @@ export function profileIssues(profile: LexisProfile): string[] {
   if ((joined || profile.role === "gate" || profile.peerEndpoint) && !profile.identity) {
     issues.push("常驻转发要有本机身份。在节点页把一把密钥写成常驻身份");
   }
-  if (joined && profile.link.token.trim().length < 8) {
-    issues.push("常驻握手要有至少 8 个字符的口令，用来在 Argon2 之前挡掉伪造问候");
+  if (joined && profile.link.token.trim().length < 16) {
+    issues.push("常驻握手要有至少 16 个字符的口令，用来在 Argon2 之前挡掉伪造问候");
   }
   if (!profile.outer.tlsVerify) issues.push("没有校验证书。正式部署请换成自己的证书并打开校验");
   if (profile.inbounds.some((item) => item.protocol === "tunnel") && profile.peers.length === 0) {
@@ -606,11 +623,18 @@ export function profileIssues(profile: LexisProfile): string[] {
     if (!/^.+:\d+$/.test(peer.endpoint)) issues.push(`${peer.name} 的地址要写成 主机:端口`);
     if (peer.publicRawB64.length < 16) issues.push(`${peer.name} 缺少公钥，不能加入词表握手`);
   }
+  if (profile.inbounds.some((item) => item.protocol === "tunnel") && profile.peers.length > 0 && !profile.peers.some((peer) => peer.exit)) {
+    issues.push("隧道入口还没有节点被允许把本机当出口");
+  }
   for (const door of profile.exposes) {
     if (!door.allow.length) issues.push(`${door.name} 没有写允许访问的节点`);
   }
   for (const door of profile.reverses) {
     if (!door.peer || !door.service) issues.push("反向入口要写节点和服务名");
+    const host = door.listen || "127.0.0.1";
+    if (!profile.link.allowLan && host !== "127.0.0.1" && host !== "::1") {
+      issues.push("反向入口写了非回环地址。没有允许局域网时会改绑回环，避免把后面的服务公开");
+    }
   }
   if ((profile.socksAuth.user && !profile.socksAuth.pass) || (!profile.socksAuth.user && profile.socksAuth.pass)) {
     issues.push("SOCKS 用户名和密码要一起填，或都留空");

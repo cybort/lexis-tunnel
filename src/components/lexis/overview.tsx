@@ -69,7 +69,7 @@ export function Overview({ onOpen }: { onOpen: () => void }) {
           ))}
         </ol>
         <p className="mt-4 text-sm text-mist">
-          浏览器里不能守一个真正的 TCP 端口。这条控制台把握手、词表和封装真实跑完。下载的常驻进程走同一套词表。TLS 和 WebSocket 只包在外面，方便过 CDN。安装包不再附带 TLS 私钥。中继默认关闭。虚拟网卡、WinDivert 驱动、Linux tproxy 的原始目的地址、Android 的 VpnService 仍然不在这个进程里。
+          浏览器里不能守一个真正的 TCP 端口。这条控制台把握手、词表和封装真实跑完。下载的常驻进程走同一套词表。TLS 和 WebSocket 只包在外面，方便过 CDN。安装包不再附带 TLS 私钥。时钟对不齐时，时间窗两边各留 120 秒。HTTP 代理按每个请求重写，去掉代理认证，并拒绝长度和分块写在一起。状态页还有 /health 和 /metrics。Linux 在有 root 时，redirect 和 tproxy 会读原始目的地址，虚拟网卡走用户态 TCP/UDP。Windows 的 WinDivert 只有源码，驱动不在包里。Android 只带 VpnService 源码和本机包通道，没有装好的系统 VPN。中继默认关闭。
         </p>
       </Panel>
 

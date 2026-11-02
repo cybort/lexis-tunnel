@@ -1,10 +1,10 @@
-词隙客户端 1.3.0
+词隙客户端 1.5.0
 
-这是同一份通信进程。Windows、Linux、Android（Termux）都读 lexis.config.json。需要 Node.js 22。目录里还要有 lexis-frame.mjs 和 zstd.wasm。安装包不带 TLS 私钥。要听 tls 或 wss，把自己的证书和私钥放到程序旁边，命名为 lexis-tls.crt 和 lexis-tls.key。两边都没有时，如果本机有 openssl，进程会在旁边生成一把，只给这一台用，不要把那把私钥分发出去。
+这是同一份通信进程。Windows、Linux、Android（Termux）都读 lexis.config.json。需要 Node.js 22。目录里还要有 lexis-frame.mjs、lexis-http.mjs、lexis-tun.mjs 和 zstd.wasm。Linux 还要有 lexis-sockopt.node；源码是 sockopt.c，换了架构可以自己编译。安装包不带 TLS 私钥，也不带 WinDivert 驱动。
 
-转发正文和控制台是同一套词表。两端用长期公钥做 ECDH，会话密钥用 Argon2id。常驻进程用自己配置里的内存、迭代和并行，不采用对端报上来的更高开销。伪造问候要先过握手口令。口令写在 link.token，两端相同，至少 8 个字符。它在 Argon2 之前校验，不是词表密钥。过期的问候和同一个时间窗里的重放都会被拒绝。
+转发正文和控制台是同一套词表。两端用长期公钥做 ECDH，会话密钥用 Argon2id。常驻进程用自己配置里的内存、迭代和并行，不采用对端报上来的更高开销。伪造问候要先过握手口令。口令写在 link.token，两端相同，至少 16 个字符。它在 Argon2 之前校验，不是词表密钥。问候的时间窗是 300 秒。时钟慢或快时，上一窗只在新窗的前 120 秒还接受，下一窗只在当前窗的最后 120 秒接受。更远的窗仍然拒绝。两端都要换成 1.5.0，旧进程对不上这 120 秒。过期的问候和同一个时间窗里的重放都会被拒绝。同一个节点或同一个地址在一个时间窗里不能占满全部名额。派生密钥的线程如果出错或超时，下一次握手会再拉起一个。
 
-计数器、密钥流和秘密词表把明文写成散文。明文第一个字节决定是原文还是 zstd。蜜文打开时，校验对不上不报错，而落成公开词表里的另一句话。计数器接近上限，或时间窗换了，会话里会换一把密钥。心跳如果连续三个周期没有收到对端，这条会话会关掉。
+计数器、密钥流和秘密词表把明文写成散文。明文第一个字节决定是原文还是 zstd。蜜文打开时，校验对不上不报错，而落成公开词表里的另一句话。计数器接近上限，或时间窗换了，会话里会换一把密钥。换钥载荷是 16 字节随机数再加 4 字节时间窗。1.3.0 只有前 16 字节，和这一版对不上。心跳如果连续三个周期没有收到对端，这条会话会关掉。
 
 外层只负责把头和协议走完，方便过 CDN：
 - tcp：一行一句词表
@@ -13,16 +13,18 @@
 
 身份写在 identity。peers 里放要加入的节点，公钥必须对上。导出的配置带本机私钥，不要外传。没有口令校验位，换一把密钥不会提示口令错误。改名单不用重启：摘掉的节点，会话会关掉。
 
-一条会话上可以开多路。打开命令是 `tcp 主机 端口`、`udp 主机 端口`、`relay 节点 tcp 主机 端口`，或 `expose 服务名`。中继默认关闭。想让某个节点借本机中继，把那个节点的 relay 设为 true。targets 写了就只允许那些目标，空着不限制。跳数超过 4 就拒绝。把流送回上一跳也会拒绝。某一路读得慢，只堵住这一路，不会拆掉整条会话。
+一条会话上可以开多路。打开命令是 `tcp 主机 端口`、`udp 主机 端口`、`relay 节点 tcp 主机 端口`，或 `expose 服务名`。中继默认关闭，出口也默认关闭。想让某个节点借本机中继，把 relay 设为 true。想让它把本机当出口，把 exit 设为 true。targets 写了就只允许那些目标，空着不限制。暴露不能经中继打开。跳数超过 4 就拒绝。把流送回上一跳也会拒绝。某一路读得慢，只堵住这一路，不会拆掉整条会话。本机这一侧也会停下来等信用，不会无限读进内存。
 
-NAT 后面的机器用边缘角色连出去。exposes 里写服务名、本机 host:port，以及允许访问的节点名或编号。公网闸门用 reverses 在本地听一个端口，从已经连进来的会话反向打开同名服务。也可以访问「节点名:服务名」。没有那条会话时，会说没有来自该节点的会话。断线后边缘角色会退避重连。
+NAT 后面的机器用边缘角色连出去。exposes 里写服务名、本机 host:port，以及允许访问的节点名或编号。公网闸门用 reverses 在本地听一个端口，从已经连进来的会话反向打开同名服务。也可以访问「节点名:服务名」。没有那条会话时，会说没有来自该节点的会话。没有打开 link.allowLan 时，反向入口即使写成 0.0.0.0 也只绑回环，并且计入连接数上限。断线后边缘角色会退避重连。
 
-SOCKS 接受 CONNECT 和 UDP ASSOCIATE，UDP 可以是 IPv6。http 入站是 HTTP 代理，支持 CONNECT 和绝对地址的普通请求，认证跟 SOCKS 用同一对用户名密码。socksAuth 的用户名和密码都填了才认证，留空就不认证。
+要听 tls 或 wss，把自己的证书和私钥放到程序旁边，命名为 lexis-tls.crt 和 lexis-tls.key。两边都没有时，如果本机有 openssl，进程会在旁边生成一把，只给这一台用，不要把那把私钥分发出去。
+
+SOCKS 接受 CONNECT 和 UDP ASSOCIATE，UDP 可以是 IPv6。http 入站是 HTTP 代理，支持 CONNECT 和绝对地址的普通请求，认证跟 SOCKS 用同一对用户名密码。同一条连接上的每一个请求都会单独重写：代理认证不会带到目标，Host 必须和绝对地址一致，Content-Length 和 Transfer-Encoding 写在一起会直接拒绝，不会转发出去。socksAuth 的用户名和密码都填了才认证，留空就不认证。
 
 固定端口：进程监听配置里的端口。SOCKS 和 HTTP 给本机程序当代理；TCP 入站按目标转发；tunnel 入站做词表握手，然后接受上面的打开命令。
-系统接管：进程仍常驻，并写出平台脚本。Linux 在有 root 时写 iptables redirect，或一条 tproxy 规则；tproxy 还不会取原始目的地址，也没有策略路由，所以并没有真正接管。Windows 的 portproxy 只绑 127.0.0.1；WinDivert 只留下说明，驱动不在包里。Android 写出 vpn-session.json 给 VpnService，Termux 本身打不开系统 VPN。没有虚拟网卡。
+系统接管：进程仍常驻，并写出平台脚本。Linux 在有 root 和 iptables 时写 redirect 或 tproxy，接受连接后用 SO_ORIGINAL_DST 读原始目的地址；本进程出站先打 fwmark，避免被规则转回来。选虚拟网卡时打开 lexis0，用户态处理 IPv4 的 TCP 和 UDP。没有 root、没有 iptables，或内核拒绝 IP_TRANSPARENT、SO_MARK、TUN 时，规则只留在文件里，流量不会被真正接管。Windows 的 portproxy 只绑 127.0.0.1。WinDivert 只有 windivert-redirect.c，驱动和 exe 不在包里，选了也不会改系统流量。Android 写出 vpn-session.json，包通道在 127.0.0.1:17891，旁边有 LexisVpnService.kt 源码。Termux 不能弹出系统 VPN，也没有编译好的安装包。
 
-SOCKS、HTTP 和固定转发默认只绑 127.0.0.1。只有 link.allowLan 为 true 时才按配置里的地址监听。隧道入口可以听更宽的地址。
+SOCKS、HTTP 和固定转发默认只绑 127.0.0.1。只有 link.allowLan 为 true 时才按配置里的地址监听。反向入口同样受这道限制。隧道入口可以听更宽的地址。
 出口拨号前会先解析域名。回环、内网、链路本地、运营商级 NAT 和文档地址默认拒绝。egress.allow 一行一个主机、主机:端口或 IPv4 网段，用来单独放行。这道拦截不作用于你本机 SOCKS 的直连和绕行，也不作用于你自己暴露的本机服务。公网的 22、80、443 不单独封禁。握手超时、拨号超时和同时握手数在 link.handshakeMs、link.dialMs、link.maxHandshakes。
 
 程序名：接入、绕行或拒绝。Linux 从 /proc 认进程，Windows 用当前连接的进程名，Android 上认不到进程时规则仍留在配置里。
@@ -33,5 +35,6 @@ SOCKS、HTTP 和固定转发默认只绑 127.0.0.1。只有 link.allowLan 为 tr
 - Linux：sh install.sh。有 systemd 就装用户服务，没有就 nohup。
 - Android：在 Termux 里 sh install.sh。
 
-状态页默认是 http://127.0.0.1:17890/
-控制台导出的 JSON 覆盖 lexis.config.json。名单和吊销会自己重读。两端都要把对方公钥放进 peers，并写同一个握手口令。
+状态页默认是 http://127.0.0.1:17890/ ，同端口还有 /health 和 /metrics。
+镜像说明在 Dockerfile，样例配置的口令是空的，进程会拒绝启动，要换成至少 16 个字符再跑。
+控制台导出的 JSON 覆盖 lexis.config.json。名单和公钥变化会自己重读，旧会话会断开。两端都要把对方公钥放进 peers，并写同一个至少 16 个字符的握手口令。要让对方从本机出去，把那个节点的 exit 打开。没有做过连续 24 小时的浸泡。

@@ -11,7 +11,7 @@ const CARDS = [
     title: "Windows",
     icon: Monitor,
     resident: "登录任务常驻，失败会重试",
-    listen: "固定端口。portproxy 只绑回环，WinDivert 只记录",
+    listen: "固定端口。portproxy 只绑回环。WinDivert 只有源码，驱动不在包里",
     process: "按进程名接入或绕行",
   },
   {
@@ -19,7 +19,7 @@ const CARDS = [
     title: "Linux",
     icon: Terminal,
     resident: "systemd 用户服务，断了自己拉起",
-    listen: "固定端口。转发脚本可写，tproxy 还取不到原始目的地址",
+    listen: "固定端口。redirect / tproxy 读原始目的，虚拟网卡要 root",
     process: "从 /proc 认出程序名",
   },
   {
@@ -27,7 +27,7 @@ const CARDS = [
     title: "Android",
     icon: Smartphone,
     resident: "Termux 后台，Termux:Boot 开机拉起",
-    listen: "固定端口。系统接管只写出 VpnService 会话",
+    listen: "固定端口。系统 VPN 要另编源码，包通道只在本机",
     process: "程序规则写在配置里，认不到进程时不乱改动作",
   },
 ] as const;
@@ -81,7 +81,7 @@ export function DownloadPage() {
           <p className="font-mono text-xs text-sage">LEXIS {manifest?.version ?? "1.0.0"}</p>
           <h2 className="mt-2 text-2xl font-bold">三个系统，同一份配置</h2>
           <p className="mt-2 max-w-2xl text-sm text-mist">
-            通信进程安装后留在后台。转发正文和控制台是同一套词表。TLS 和 WebSocket 只做外层。安装包不带 TLS 私钥，要听 TLS 就放自己的证书，或让进程在旁边生成一把。握手口令两端相同，中继要逐个节点打开。NAT 后面的服务用暴露和反向入口。导出的配置带本机私钥，两端要互相放上对方公钥。需要 Node.js 22。
+            通信进程安装后留在后台。转发正文和控制台是同一套词表。TLS 和 WebSocket 只做外层。安装包不带 TLS 私钥。握手口令两端相同，至少 16 个字符。中继和出口都要逐个节点打开。NAT 后面的服务用暴露和反向入口；反向入口默认只绑回环。导出的配置带本机私钥，两端要互相放上对方公钥。需要 Node.js 22。
           </p>
         </section>
         <div className="grid gap-3 lg:grid-cols-3">

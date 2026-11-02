@@ -1340,6 +1340,8 @@ var SPEC = {
   lexiconSize: 4096,
   bitsPerWord: 12,
   windowSec: 300,
+  /** Accept the previous window this many seconds in, and the next window this many seconds before the roll. */
+  skewSec: 120,
   counterBits: 24
 };
 var GLUE = ["the", "our", "its", "that", "and"];
@@ -2672,21 +2674,31 @@ function currentWindow(now = Date.now()) {
 var HELLO_CORE = 2 + 65 + 65 + 4 + 16 + 4 + 1;
 var SERVER_CORE = 2 + 65 + 65 + 16 + 16 + 4 + 1;
 var seenHellos = /* @__PURE__ */ new Map();
+var helloByPeer = /* @__PURE__ */ new Map();
+var helloByIp = /* @__PURE__ */ new Map();
+var HELLO_PEER_CAP = 16;
+var HELLO_IP_CAP = 32;
 function assertHelloWindow(helloWindow, now = Date.now()) {
   const current = currentWindow(now);
   const into = Math.floor(now / 1e3) % SPEC.windowSec;
-  const ok = helloWindow === current || helloWindow === current - 1 && into < 20;
-  if (!ok) throw new LexisError("\u63E1\u624B\u65F6\u95F4\u7A97\u5DF2\u7ECF\u8FC7\u671F");
+  const skew = SPEC.skewSec;
+  const prevOk = helloWindow === current - 1 && into < skew;
+  const nextOk = helloWindow === current + 1 && into >= SPEC.windowSec - skew;
+  if (helloWindow === current || prevOk || nextOk) return;
+  throw new LexisError("\u63E1\u624B\u65F6\u95F4\u7A97\u5DF2\u7ECF\u8FC7\u671F");
 }
 function nonceId(nonce) {
   let hex2 = "";
   for (const b of nonce) hex2 += b.toString(16).padStart(2, "0");
   return hex2;
 }
-function claimHello(window, nonce) {
+function claimHello(window, nonce, scope) {
+  const current = currentWindow();
   for (const key2 of [...seenHellos.keys()]) {
-    if (key2 < window - 1) seenHellos.delete(key2);
+    if (key2 < current - 1 || key2 > current + 1) seenHellos.delete(key2);
   }
+  pruneHelloScope(helloByPeer, current);
+  pruneHelloScope(helloByIp, current);
   let bag = seenHellos.get(window);
   if (!bag) {
     bag = /* @__PURE__ */ new Set();
@@ -2694,8 +2706,22 @@ function claimHello(window, nonce) {
   }
   const id = nonceId(nonce);
   if (bag.has(id)) throw new LexisError("\u63E1\u624B\u88AB\u91CD\u653E");
+  if (scope?.peer) bumpHelloScope(helloByPeer, scope.peer, window, HELLO_PEER_CAP, "\u8FD9\u4E2A\u8282\u70B9\u7684\u63E1\u624B\u592A\u5BC6");
+  if (scope?.ip) bumpHelloScope(helloByIp, scope.ip, window, HELLO_IP_CAP, "\u8FD9\u4E2A\u5730\u5740\u7684\u63E1\u624B\u592A\u5BC6");
   if (bag.size >= 4096) throw new LexisError("\u8FD9\u4E2A\u65F6\u95F4\u7A97\u7684\u63E1\u624B\u592A\u591A");
   bag.add(id);
+}
+function pruneHelloScope(map, current) {
+  for (const [key2, row] of map) {
+    if (row.window < current - 1 || row.window > current + 1) map.delete(key2);
+  }
+}
+function bumpHelloScope(map, key2, window, cap, message) {
+  const prev = map.get(key2);
+  const row = prev && prev.window === window ? prev : { window, n: 0 };
+  if (row.n >= cap) throw new LexisError(message);
+  row.n += 1;
+  map.set(key2, row);
 }
 async function tokenMac(token, body) {
   return (await hmac(utf8(token), concat(utf8("lexis-admit-v1"), body))).subarray(0, 16);
@@ -2779,7 +2805,7 @@ async function gateRespond(gate, peerRawB64, helloWire, opts = {}) {
   if (!timingSafeEqual(hello.ltRaw, pinned)) {
     throw new LexisError("\u5185\u7F51\u7AEF\u957F\u671F\u516C\u94A5\u548C\u95F8\u95E8\u4E0A\u7684\u7ED1\u5B9A\u4E0D\u4E00\u81F4");
   }
-  claimHello(hello.window, hello.nonce);
+  claimHello(hello.window, hello.nonce, { peer: opts.peerId || "", ip: opts.sourceIp || "" });
   const ephS = await createIdentity();
   const ltS = unb64(gate.publicRawB64);
   const nonceS = crypto.getRandomValues(new Uint8Array(16));
@@ -3101,7 +3127,7 @@ function hopCount(text) {
   return n;
 }
 var HANDSHAKE_CAP = 64 * 1024;
-var FRAME_CAP = 256 * 1024;
+var FRAME_CAP = 4 * 1024 * 1024;
 var LinePipe = class {
   constructor(socket) {
     this.socket = socket;
@@ -3578,9 +3604,14 @@ var LexSession = class {
           this.shutdown();
           return;
         }
+        this.kickRekey();
         void this.sendRecord(RECORD.heartbeat, 0, 0, heartbeatPayload()).catch(() => this.shutdown());
       }, heartbeatMs);
       this.heart.unref?.();
+    }
+    if (initiator) {
+      this.rekeyTimer = setInterval(() => this.kickRekey(), 2e4);
+      this.rekeyTimer.unref?.();
     }
   }
   pipe;
@@ -3600,6 +3631,7 @@ var LexSession = class {
   peerId = "";
   lastRx = Date.now();
   rekeyBusy = false;
+  rekeyTimer = null;
   rekeyAt;
   whenClosed() {
     if (this.closed) return Promise.resolve();
@@ -3609,6 +3641,7 @@ var LexSession = class {
     if (this.closed) return;
     this.closed = true;
     if (this.heart) clearInterval(this.heart);
+    if (this.rekeyTimer) clearInterval(this.rekeyTimer);
     for (const stream of this.streams.values()) stream.finish();
     this.pipe.close();
     while (this.closeWaiters.length) this.closeWaiters.shift()?.();
@@ -3650,13 +3683,16 @@ var LexSession = class {
     if (Math.max(this.sendLive.counters[dir], peer) < this.rekeyAt && !stale) return;
     this.rekeyBusy = true;
     const nonce = crypto.getRandomValues(new Uint8Array(16));
-    void this.sendRecord(RECORD.rekey, 0, 0, nonce, nonce).finally(() => {
+    const payload = concat(nonce, u32be(currentWindow()));
+    void this.sendRecord(RECORD.rekey, 0, 0, payload, payload).finally(() => {
       if (this.sendLive === this.recvLive) this.rekeyBusy = false;
     });
   }
-  async deriveNext(base, nonce) {
+  async deriveNext(base, payload) {
+    if (payload.length < 20) throw new Error("\u6362\u94A5\u62A5\u6587\u592A\u77ED");
+    const nonce = payload.subarray(0, 16);
+    const window = readU32(payload, 16);
     const sk = await hkdf(base.sk, nonce, utf8("lexis-rekey-v1"), 32);
-    const window = currentWindow();
     const lexicon = await sessionLexicon(sk, window);
     return {
       ...base,
@@ -3668,7 +3704,7 @@ var LexSession = class {
       seen: { e2g: 0, g2e: 0 }
     };
   }
-  async openLive(live, prose) {
+  async openLive(live, prose, honey = live.honey) {
     const dir = this.initiator ? "g2e" : "e2g";
     const opened = await open({
       key: live.sk,
@@ -3677,7 +3713,7 @@ var LexSession = class {
       direction: dir,
       prose,
       lastSeen: live.seen[dir],
-      honey: live.honey
+      honey
     });
     if (!opened.honey) live.seen[dir] = opened.counter;
     return opened;
@@ -3752,15 +3788,21 @@ var LexSession = class {
     try {
       for (; ; ) {
         const prose = await this.pipe.read();
+        const pending = this.sendLive !== this.recvLive;
         let opened;
         try {
-          opened = await this.openLive(this.recvLive, prose);
+          opened = await this.openLive(this.recvLive, prose, pending ? false : this.recvLive.honey);
         } catch (err2) {
-          if (this.sendLive === this.recvLive) throw err2;
-          opened = await this.openLive(this.sendLive, prose);
-          this.recvLive = this.sendLive;
-          this.live = this.sendLive;
-          this.rekeyBusy = false;
+          if (!pending) throw err2;
+          try {
+            opened = await this.openLive(this.sendLive, prose, false);
+            this.recvLive = this.sendLive;
+            this.live = this.sendLive;
+            this.rekeyBusy = false;
+          } catch (err22) {
+            if (this.sendLive.honey || this.recvLive.honey) continue;
+            throw err22;
+          }
         }
         if (opened.honey) continue;
         this.lastRx = Date.now();
@@ -3828,7 +3870,12 @@ async function acceptSession(opts) {
   for (const peer of opts.peers) {
     if (!peer.publicRawB64) continue;
     try {
-      pending = await gateRespond(self, peer.publicRawB64, helloWire, { token: opts.token, kdf: opts.kdf });
+      pending = await gateRespond(self, peer.publicRawB64, helloWire, {
+        token: opts.token,
+        kdf: opts.kdf,
+        sourceIp: opts.sourceIp,
+        peerId: peer.id || ""
+      });
       matched = peer.id || "";
       break;
     } catch (err2) {
@@ -3888,6 +3935,7 @@ async function pipeMux(left, right) {
 }
 if (!isMainThread && parentPort) {
   parentPort.on("message", (msg) => {
+    if (msg.crash) throw new Error("\u6D3E\u751F\u7EBF\u7A0B\u6545\u969C");
     try {
       const out = deriveSessionKey(msg.ssE, msg.ssS, msg.nonceC, msg.nonceS, msg.window, msg.features, msg.params);
       parentPort?.postMessage({ id: msg.id, key: out.key, ms: out.ms });
@@ -3901,35 +3949,89 @@ var kdfSeq = 0;
 var kdfInflight = 0;
 var kdfMax = 2;
 var kdfWait = /* @__PURE__ */ new Map();
+var KDF_TASK_MS = 6e4;
+function failKdfWaiters(err2) {
+  const jobs = [...kdfWait.values()];
+  kdfWait.clear();
+  for (const job of jobs) job.reject(err2);
+}
+function dropKdfWorker(err2) {
+  const worker = kdfWorker;
+  kdfWorker = null;
+  failKdfWaiters(err2);
+  if (!worker) return;
+  void worker.terminate().catch(() => void 0);
+}
+function ensureKdfWorker() {
+  if (!isMainThread || kdfWorker) return;
+  const worker = new Worker(new URL(import.meta.url));
+  kdfWorker = worker;
+  worker.unref?.();
+  worker.on("message", (msg) => {
+    const job = kdfWait.get(msg.id);
+    if (!job) return;
+    kdfWait.delete(msg.id);
+    if (msg.error || !msg.key) job.reject(new Error(msg.error || "\u6D3E\u751F\u5931\u8D25"));
+    else job.resolve({ key: new Uint8Array(msg.key), ms: msg.ms || 1 });
+  });
+  worker.on("error", (err2) => {
+    if (kdfWorker !== worker) return;
+    dropKdfWorker(err2 instanceof Error ? err2 : new Error(String(err2)));
+  });
+  worker.on("exit", () => {
+    if (kdfWorker !== worker) return;
+    kdfWorker = null;
+    failKdfWaiters(new Error("\u6D3E\u751F\u7EBF\u7A0B\u5DF2\u505C"));
+  });
+}
+function breakKdfWorkerForTests() {
+  const worker = kdfWorker;
+  if (!worker) return Promise.resolve();
+  return new Promise((resolve) => {
+    worker.once("exit", () => resolve());
+    worker.postMessage({ crash: true });
+  });
+}
 function startKdfPool(maxConcurrent = 2) {
   kdfMax = Math.max(1, Math.min(8, maxConcurrent || 2));
-  if (isMainThread && !kdfWorker) {
-    kdfWorker = new Worker(new URL(import.meta.url));
-    kdfWorker.unref?.();
-    kdfWorker.on("message", (msg) => {
-      const job = kdfWait.get(msg.id);
-      if (!job) return;
-      kdfWait.delete(msg.id);
-      if (msg.error || !msg.key) job.reject(new Error(msg.error || "\u6D3E\u751F\u5931\u8D25"));
-      else job.resolve({ key: new Uint8Array(msg.key), ms: msg.ms || 1 });
-    });
-    kdfWorker.on("error", (err2) => {
-      for (const job of kdfWait.values()) job.reject(err2 instanceof Error ? err2 : new Error(String(err2)));
-      kdfWait.clear();
-    });
-  }
+  ensureKdfWorker();
   setSessionKeyDeriver(async (ssE, ssS, nonceC, nonceS, window, features, params) => {
-    if (!kdfWorker) return deriveSessionKey(ssE, ssS, nonceC, nonceS, window, features, params);
+    ensureKdfWorker();
+    const worker = kdfWorker;
+    if (!worker) return deriveSessionKey(ssE, ssS, nonceC, nonceS, window, features, params);
     if (kdfInflight >= kdfMax) throw new Error("\u63E1\u624B\u592A\u591A");
     kdfInflight += 1;
     const id = ++kdfSeq;
     try {
       return await new Promise((resolve, reject) => {
-        kdfWait.set(id, { resolve, reject });
-        kdfWorker?.postMessage({ id, ssE, ssS, nonceC, nonceS, window, features, params });
+        const timer = setTimeout(() => {
+          if (!kdfWait.has(id)) return;
+          kdfWait.delete(id);
+          reject(new Error("\u6D3E\u751F\u8D85\u65F6"));
+          if (kdfWorker === worker) dropKdfWorker(new Error("\u6D3E\u751F\u8D85\u65F6"));
+        }, KDF_TASK_MS);
+        timer.unref?.();
+        kdfWait.set(id, {
+          resolve: (value) => {
+            clearTimeout(timer);
+            resolve(value);
+          },
+          reject: (err2) => {
+            clearTimeout(timer);
+            reject(err2);
+          }
+        });
+        try {
+          worker.postMessage({ id, ssE, ssS, nonceC, nonceS, window, features, params });
+        } catch (err2) {
+          kdfWait.delete(id);
+          clearTimeout(timer);
+          reject(err2 instanceof Error ? err2 : new Error(String(err2)));
+          if (kdfWorker === worker) dropKdfWorker(err2 instanceof Error ? err2 : new Error(String(err2)));
+        }
       });
     } finally {
-      kdfInflight -= 1;
+      kdfInflight = Math.max(0, kdfInflight - 1);
     }
   });
 }
@@ -3937,6 +4039,7 @@ export {
   LexSession,
   MuxStream,
   acceptSession,
+  breakKdfWorkerForTests,
   connectSession,
   createIdentity,
   dialOuter,

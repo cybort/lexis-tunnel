@@ -8,13 +8,17 @@ import { execFile, execFileSync } from "node:child_process";
 import { timingSafeEqual } from "node:crypto";
 import { createSocket as createUdp } from "node:dgram";
 import { lookup } from "node:dns";
-import { createServer as createTcp, connect as connectTcp } from "node:net";
+import { createServer as createTcp, connect as connectTcp, Socket } from "node:net";
 import { createServer as createHttp } from "node:http";
-import { mkdirSync, readFileSync, writeFileSync, existsSync, readdirSync, readlinkSync, statSync } from "node:fs";
+import { mkdirSync, readFileSync, writeFileSync, existsSync, readdirSync, readlinkSync, statSync, read as readFd, write as writeFd } from "node:fs";
+import { Duplex } from "node:stream";
+import { createRequire } from "node:module";
 import { platform } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { acceptSession, connectSession, dialOuter, hopCount, listenOuter, nodeFromIdentity, parseOpen, pipeMux, startKdfPool } from "./lexis-frame.mjs";
+import { serveHttpProxy, classifyFraming, hostsAgree, sanitizeHeaders } from "./lexis-http.mjs";
+import { buildTcpPacket, createEngine, parseIpv4, parseTcp, redirectTcp } from "./lexis-tun.mjs";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const configPath = process.argv.includes("--config")
@@ -43,6 +47,7 @@ const state = {
   resources: "未配置远程词表",
   errors: [],
 };
+const metrics = { httpOk: 0, httpReject: 0, smuggle: 0, transparent: 0, tunPackets: 0 };
 let remoteGeosite = "";
 let remoteGeoip = "";
 let liveConns = 0;
@@ -395,6 +400,24 @@ function pipe(a, b) {
 
 function dial(host, port, config) {
   const bare = String(host).replace(/^\[|\]$/g, "");
+  const live = activeConfig || config;
+  if (live?.mode === "system-forward" && platform() === "linux" && addonConnectMarked()) {
+    try {
+      const fd = loadSockopt().connectMarked(Number(live.linux?.mark) || 255, bare, Number(port), linkOf(live).dialMs || 10000);
+      const socket = new Socket({ fd });
+      socket.on("error", () => socket.destroy());
+      arm(socket, live);
+      queueMicrotask(() => {
+        if (!socket.destroyed) socket.emit("connect");
+      });
+      return socket;
+    } catch (err) {
+      if (!dial.warned) {
+        dial.warned = true;
+        log(`出站标记失败，系统接管可能把本进程的连接又转回来：${err.message || err}`);
+      }
+    }
+  }
   const socket = connectTcp({ host: bare, port, family: bare.includes(":") ? 6 : 4 });
   socket.on("error", () => socket.destroy());
   const onTimeout = () => {
@@ -410,6 +433,11 @@ function dial(host, port, config) {
   return socket;
 }
 
+function addonConnectMarked() {
+  const addon = loadSockopt();
+  return Boolean(addon && typeof addon.connectMarked === "function");
+}
+
 const lexSessions = new Map();
 const inboundSessions = new Map();
 const downUntil = new Map();
@@ -423,7 +451,7 @@ function ensurePool(config) {
 
 function requireToken(config) {
   const token = linkOf(config).token;
-  if (token.length < 8) throw new Error("握手口令至少 8 个字符");
+  if (token.length < 16) throw new Error("握手口令至少 16 个字符");
   return token;
 }
 
@@ -528,11 +556,19 @@ async function sessionFor(config, peer) {
 }
 
 function bridgeSocket(stream, socket) {
+  let writing = Promise.resolve();
   socket.on("data", (chunk) => {
-    void stream.write(chunk).catch(() => socket.destroy());
+    socket.pause();
+    writing = writing
+      .then(() => stream.write(chunk))
+      .then(() => {
+        if (!socket.destroyed) socket.resume();
+      })
+      .catch(() => socket.destroy());
   });
   socket.on("error", () => void stream.close());
   socket.on("close", () => void stream.close());
+  socket.resume();
   const pull = async () => {
     try {
       for (;;) {
@@ -569,6 +605,16 @@ function reverseName(config, host) {
   if (parts.length !== 2 || !parts[0] || !parts[1]) return null;
   if (!namedPeer(config, parts[0])) return null;
   return { peer: parts[0], service: parts[1] };
+}
+
+function opensExpose(text) {
+  let rest = String(text || "").trim();
+  for (let guard = 0; guard < 8 && rest.startsWith("relay "); guard += 1) {
+    const match = rest.match(/^relay\s+\S+\s+([\s\S]+)$/);
+    if (!match) break;
+    rest = match[1].trim();
+  }
+  return /^expose\s+\S+$/.test(rest);
 }
 
 function targetAllowed(peer, rest) {
@@ -664,6 +710,10 @@ async function handleRemoteStream(stream, config, via) {
       return;
     }
     if (parsed.relay) {
+      if (opensExpose(command)) {
+        await stream.reject("暴露不能经中继打开");
+        return;
+      }
       const next = namedPeer(config, parsed.relay);
       if (!next) {
         await stream.reject("没有这个节点");
@@ -691,6 +741,11 @@ async function handleRemoteStream(stream, config, via) {
     }
     if (!parsed.host || !parsed.port) {
       await stream.reject("目标无效");
+      return;
+    }
+    const caller = namedPeer(config, via?.peerId || "");
+    if (!caller || caller.exit !== true) {
+      await stream.reject("这个节点没有出口权限");
       return;
     }
     const decision = decide(config, {
@@ -782,6 +837,11 @@ function applyAction(socket, config, decision, host, port) {
   else relayDirect(socket, host, port, config);
 }
 
+function sourceIp(socket) {
+  const raw = String(socket.remoteAddress || "");
+  return raw.startsWith("::ffff:") ? raw.slice(7) : raw;
+}
+
 async function acceptTunnel(socket, pipeReady, config) {
   let session = null;
   try {
@@ -802,6 +862,7 @@ async function acceptTunnel(socket, pipeReady, config) {
       maxStreams: link.maxConns,
       heartbeatMs: Math.max(5, config.heartbeatSec || 15) * 1000,
       handshakeMs: link.handshakeMs,
+      sourceIp: sourceIp(socket),
       onReady: (ready) => {
         if (ready.peerId) inboundSessions.set(ready.peerId, ready);
       },
@@ -1185,87 +1246,114 @@ function httpAuthOk(lines, config) {
 }
 
 function routeHttp(socket, config, host, port) {
+  void spliceTarget(socket, config, host, port).catch((err) => {
+    log(`http ${host}:${port} 失败：${err.message || err}`);
+    replyFail(socket);
+  });
+}
+
+function muxDuplex(stream) {
+  const duplex = new Duplex({
+    write(chunk, _enc, cb) {
+      stream.write(chunk).then(() => cb(), cb);
+    },
+    read() {},
+  });
   void (async () => {
     try {
-      const decision = decide(config, { host, ip: isIp(host) ? host : "", port: String(port), network: "tcp" });
-      if (decision.action === "reject") {
-        note(decision, `${host}:${port}`);
-        replyFail(socket);
-        return;
+      for (;;) {
+        const chunk = await stream.read();
+        if (!chunk) {
+          duplex.push(null);
+          return;
+        }
+        duplex.push(Buffer.from(chunk));
       }
-      applyAction(socket, config, decision, host, port);
     } catch (err) {
-      log(`http ${host}:${port} 失败：${err.message || err}`);
-      replyFail(socket);
+      duplex.destroy(err);
     }
   })();
+  return duplex;
+}
+
+function dialTcp(config, host, port) {
+  return new Promise((resolve, reject) => {
+    const live = activeConfig || config;
+    const decision = decide(live, { host, ip: isIp(host) ? host : "", port: String(port), network: "tcp" });
+    if (decision.action === "reject") {
+      note(decision, `${host}:${port}`);
+      reject(new Error(decision.reason));
+      return;
+    }
+    if (decision.action === "proxy") {
+      void (async () => {
+        const peer = choosePeer(live);
+        if (!peer) throw new Error("没有加入的节点");
+        const session = await sessionFor(live, peer);
+        resolve(muxDuplex(await session.open(`tcp ${host} ${port}`)));
+      })().catch(reject);
+      return;
+    }
+    const socket = dial(host, port, live);
+    socket.once("connect", () => resolve(socket));
+    socket.once("error", reject);
+  });
+}
+
+async function dialUdp(config, host, port) {
+  const live = activeConfig || config;
+  const decision = decide(live, { host, ip: isIp(host) ? host : "", port: String(port), network: "udp" });
+  if (decision.action === "reject") throw new Error(decision.reason);
+  if (decision.action === "proxy") {
+    const peer = choosePeer(live);
+    if (!peer) throw new Error("没有加入的节点");
+    const session = await sessionFor(live, peer);
+    const stream = await session.open(`udp ${host} ${port}`);
+    const events = new EventTarget();
+    const socket = {
+      send(data, _port, _host, cb) {
+        stream.write(Buffer.from(data)).then(() => cb?.(), (err) => cb?.(err));
+      },
+      on(name, fn) {
+        events.addEventListener(name, (event) => fn(event.detail));
+      },
+      close() {
+        void stream.close();
+      },
+    };
+    void (async () => {
+      try {
+        for (;;) {
+          const chunk = await stream.read();
+          if (!chunk) return;
+          events.dispatchEvent(new CustomEvent("message", { detail: Buffer.from(chunk) }));
+        }
+      } catch {
+        socket.close();
+      }
+    })();
+    return socket;
+  }
+  return createUdp(String(host).includes(":") ? "udp6" : "udp4");
+}
+
+async function spliceTarget(socket, config, host, port) {
+  const remote = await dialTcp(config, host, port);
+  pipe(socket, remote);
 }
 
 function handleHttp(socket, config) {
-  let buf = Buffer.alloc(0);
-  const cap = linkOf(config).headerBytes;
-  const onData = (chunk) => {
-    buf = Buffer.concat([buf, chunk]);
-    if (buf.length > cap) {
-      socket.destroy();
-      return;
-    }
-    const end = buf.indexOf("\r\n\r\n");
-    if (end < 0) return;
-    socket.removeListener("data", onData);
-    const head = buf.subarray(0, end).toString("utf8");
-    const rest = buf.subarray(end + 4);
-    const lines = head.split("\r\n");
-    const matched = (lines[0] || "").match(/^([A-Z]+)\s+(\S+)\s+HTTP\/1\.[01]$/i);
-    if (!matched) {
-      socket.end("HTTP/1.1 400 Bad Request\r\nConnection: close\r\n\r\n");
-      return;
-    }
-    const method = matched[1].toUpperCase();
-    const target = matched[2];
-    if (!httpAuthOk(lines, activeConfig || config)) {
-      socket.end('HTTP/1.1 407 Proxy Authentication Required\r\nProxy-Authenticate: Basic realm="lexis"\r\nConnection: close\r\n\r\n');
-      return;
-    }
-    const fail = () => {
-      if (!socket.destroyed) socket.end("HTTP/1.1 502 Bad Gateway\r\nConnection: close\r\n\r\n");
-    };
-    if (method === "CONNECT") {
-      const hostPort = target.match(/^(?:\[([^\]]+)\]|([^:]+)):(\d+)$/);
-      if (!hostPort) {
-        socket.end("HTTP/1.1 400 Bad Request\r\nConnection: close\r\n\r\n");
-        return;
-      }
-      socket._lexisReady = () => {
-        socket.write("HTTP/1.1 200 Connection Established\r\n\r\n");
-        if (rest.length) socket.unshift(rest);
-      };
-      socket._lexisFail = fail;
-      socket.pause();
-      routeHttp(socket, activeConfig || config, hostPort[1] || hostPort[2], Number(hostPort[3]));
-      return;
-    }
-    let url;
-    try {
-      url = new URL(target);
-    } catch {
-      socket.end("HTTP/1.1 400 Bad Request\r\nConnection: close\r\n\r\n");
-      return;
-    }
-    const path = `${url.pathname || "/"}${url.search || ""}`;
-    const kept = lines.slice(1).filter((line) => line && !/^proxy-/i.test(line));
-    const rebuilt = Buffer.from(`${method} ${path} HTTP/1.1\r\n${kept.join("\r\n")}\r\n\r\n`);
-    const prefix = Buffer.concat([rebuilt, rest]);
-    socket._lexisReady = () => {
-      if (prefix.length) socket.unshift(prefix);
-    };
-    socket._lexisFail = fail;
-    socket.pause();
-    const port = Number(url.port || (url.protocol === "https:" ? 443 : 80));
-    routeHttp(socket, activeConfig || config, url.hostname, port);
-  };
-  socket.on("data", onData);
   socket.on("error", () => socket.destroy());
+  void serveHttpProxy(socket, {
+    headerCap: linkOf(config).headerBytes,
+    authorize: (lines) => httpAuthOk(lines, activeConfig || config),
+    openUpstream: (host, port) => dialTcp(activeConfig || config, host, port),
+    count(name) {
+      if (name === "smuggle") metrics.smuggle += 1;
+      else if (name === "httpOk") metrics.httpOk += 1;
+      else metrics.httpReject += 1;
+    },
+  }).catch((err) => log(`http ${err.message || err}`));
 }
 
 function listenHost(config, inbound) {
@@ -1359,20 +1447,173 @@ function serveInbound(config, inbound) {
   return server;
 }
 
+function loadSockopt() {
+  if (loadSockopt.addon !== undefined) return loadSockopt.addon;
+  try {
+    const require = createRequire(import.meta.url);
+    const path = existsSync(join(here, "linux", "lexis-sockopt.node")) ? join(here, "linux", "lexis-sockopt.node") : join(here, "lexis-sockopt.node");
+    loadSockopt.addon = require(path);
+  } catch {
+    loadSockopt.addon = null;
+  }
+  return loadSockopt.addon;
+}
+
+function transparentPort(config) {
+  const found = (config.inbounds || []).find((item) => item.protocol === "transparent");
+  return found ? Number(found.port) : 12345;
+}
+
+function onTransparent(socket, config) {
+  socket.on("error", () => socket.destroy());
+  if (!admit(socket, config)) return;
+  const addon = loadSockopt();
+  const fd = socket._handle?.fd;
+  let dest = null;
+  try {
+    dest = addon && fd != null ? addon.originalDest(fd) : null;
+  } catch {
+    dest = null;
+  }
+  if (!dest?.host || !dest.port) {
+    socket.destroy();
+    return;
+  }
+  if ((dest.host === "127.0.0.1" || dest.host === "0.0.0.0") && Number(dest.port) === transparentPort(config)) {
+    socket.destroy();
+    return;
+  }
+  metrics.transparent += 1;
+  note({ action: "direct", reason: "原始目的" }, `${dest.host}:${dest.port}`);
+  void spliceTarget(socket, config, dest.host, dest.port).catch((err) => {
+    log(`透明 ${dest.host}:${dest.port} 失败：${err.message || err}`);
+    socket.destroy();
+  });
+}
+
+function serveTransparent(config) {
+  if (config.mode !== "system-forward" || platform() !== "linux" || config.linux?.method === "tun") return;
+  const port = transparentPort(config);
+  const addon = loadSockopt();
+  if (!addon) log("没有 lexis-sockopt.node，连上来也读不到原始目的地址");
+  if (config.linux?.method === "tproxy" && addon) {
+    try {
+      const opened = addon.listenTransparent(port);
+      const server = createTcp((socket) => onTransparent(socket, config));
+      server.on("error", (err) => log(`透明监听失败 ${err.message}`));
+      server.listen({ fd: opened.fd }, () => {
+        state.listeners.push(`tproxy ${opened.port}`);
+        log(`透明监听 0.0.0.0:${opened.port}`);
+      });
+      return;
+    } catch (err) {
+      log(`透明监听失败，改听 redirect：${err.message || err}`);
+    }
+  }
+  const server = createTcp((socket) => onTransparent(socket, config));
+  server.on("error", (err) => log(`重定向监听失败 ${err.message}`));
+  server.listen(port, "127.0.0.1", () => {
+    state.listeners.push(`redirect 127.0.0.1:${port}`);
+    log(`重定向监听 127.0.0.1:${port}`);
+  });
+}
+
+function serveTun(config) {
+  if (config.mode !== "system-forward" || platform() !== "linux" || config.linux?.method !== "tun") return;
+  const addon = loadSockopt();
+  if (!addon) {
+    log("没有虚拟网卡模块");
+    return;
+  }
+  let opened;
+  try {
+    opened = addon.openTun("lexis0");
+  } catch (err) {
+    log(`虚拟网卡没有起来：${err.message || err}`);
+    return;
+  }
+  const engine = createEngine({
+    dialTcp: (host, port) => dialTcp(config, host, port),
+    dialUdp: (host, port) => dialUdp(config, host, port),
+    emit: (packet) => writeFd(opened.fd, packet, () => undefined),
+  });
+  const buf = Buffer.alloc(65535);
+  const pull = () => {
+    readFd(opened.fd, buf, 0, buf.length, null, (err, n) => {
+      if (err) return;
+      metrics.tunPackets += 1;
+      void engine.push(Buffer.from(buf.subarray(0, n))).finally(pull);
+    });
+  };
+  pull();
+  state.listeners.push(`tun ${opened.name}`);
+  log(`虚拟网卡 ${opened.name}`);
+}
+
+function servePacketBridge(config) {
+  if (config.mode !== "system-forward") return;
+  const server = createTcp((socket) => {
+    socket.on("error", () => socket.destroy());
+    let buf = Buffer.alloc(0);
+    const engine = createEngine({
+      dialTcp: (host, port) => dialTcp(config, host, port),
+      dialUdp: (host, port) => dialUdp(config, host, port),
+      emit(packet) {
+        const head = Buffer.alloc(2);
+        head.writeUInt16BE(packet.length);
+        if (!socket.destroyed) socket.write(Buffer.concat([head, packet]));
+      },
+    });
+    socket.on("data", (chunk) => {
+      buf = Buffer.concat([buf, chunk]);
+      if (buf.length > 1024 * 1024) {
+        socket.destroy();
+        return;
+      }
+      while (buf.length >= 2) {
+        const size = buf.readUInt16BE(0);
+        if (size < 1 || size > 65535) {
+          socket.destroy();
+          return;
+        }
+        if (buf.length < 2 + size) return;
+        const packet = buf.subarray(2, 2 + size);
+        buf = buf.subarray(2 + size);
+        metrics.tunPackets += 1;
+        void engine.push(packet);
+      }
+    });
+    socket.on("close", () => engine.close());
+  });
+  server.on("error", (err) => log(`包通道失败 ${err.message}`));
+  server.listen(17891, "127.0.0.1", () => {
+    state.listeners.push("packet 127.0.0.1:17891");
+    log("包通道 127.0.0.1:17891");
+  });
+}
+
 function forwardScript(config) {
-  const port = (config.inbounds || []).find((item) => item.protocol === "socks")?.port || config.inbounds?.[0]?.port || 1080;
+  const socks = (config.inbounds || []).find((item) => item.protocol === "socks")?.port || config.inbounds?.[0]?.port || 1080;
+  const port = transparentPort(config);
   if (platform() === "win32") {
     const gateway = String(config.windows?.gateway || "10.7.0.1").replace(/[^0-9a-fA-F:.]/g, "") || "10.7.0.1";
-  const winMethod = config.windows?.method === "windivert" ? "windivert" : "portproxy";
-  return {
+    const winMethod = config.windows?.method === "windivert" ? "windivert" : "portproxy";
+    return {
       file: "apply-forward.ps1",
-      body: `$port = ${port}
+      body: `$port = ${socks}
+$proxy = ${port}
 $gateway = "${gateway}"
 if ("${winMethod}" -eq "portproxy") {
   netsh interface portproxy add v4tov4 listenaddress=127.0.0.1 listenport=$port connectaddress=127.0.0.1 connectport=$port
   Write-Output "portproxy 只绑 127.0.0.1:$port，不向局域网公布"
 } else {
-  Write-Output "WinDivert 过滤已记录，网关 $gateway。驱动需要单独安装后由本进程的监听端口承接。"
+  $exe = Join-Path $PSScriptRoot "lexis-windivert.exe"
+  if (Test-Path $exe) {
+    Start-Process -FilePath $exe -ArgumentList @("$proxy") -WindowStyle Hidden
+    Write-Output "已启动 WinDivert 重定向到 127.0.0.1:$proxy。驱动要和程序放在一起。"
+  } else {
+    Write-Output "没有 lexis-windivert.exe。源码是旁边的 windivert-redirect.c，要用 WinDivert SDK 自己编译。驱动不在安装包里，这次没有改系统流量。"
+  }
 }
 `,
     };
@@ -1384,33 +1625,63 @@ if ("${winMethod}" -eq "portproxy") {
       address: config.android?.address || "10.7.0.2/32",
       dns: config.android?.dns || "1.1.1.1",
       routes: ["0.0.0.0/0"],
+      packet: "127.0.0.1:17891",
       bypass: (GEOIP.private || []).concat(["127.0.0.0/8"]),
       processes: config.processes || [],
+      note: "LexisVpnService.kt 把 tun 上的 IP 包按 2 字节长度送到 packet。Termux 不能自己弹出 VPN 授权。",
     };
     return { file: "vpn-session.json", body: JSON.stringify(session, null, 2) };
   }
-  const mark = config.linux?.mark || 255;
-  const method = config.linux?.method === "tproxy" ? "tproxy" : "redirect";
+  const mark = Number(config.linux?.mark) || 255;
+  const table = Number(config.linux?.table) || 100;
+  const method = config.linux?.method === "tproxy" || config.linux?.method === "tun" ? config.linux.method : "redirect";
   return {
     file: "apply-forward.sh",
     body: `#!/bin/sh
 set -eu
 PORT=${port}
 MARK=${mark}
+TABLE=${table}
+METHOD=${method}
 if [ "$(id -u)" -ne 0 ]; then
   echo "没有 root，规则留在本文件，未改系统转发"
   exit 0
 fi
-if [ "${method}" = "tproxy" ]; then
-  iptables -t mangle -C PREROUTING -p tcp -j TPROXY --on-port "$PORT" --tproxy-mark "$MARK" 2>/dev/null || iptables -t mangle -A PREROUTING -p tcp ! -d 127.0.0.0/8 -j TPROXY --on-port "$PORT" --tproxy-mark "$MARK"
-else
-  iptables -t nat -N LEXIS 2>/dev/null || true
-  iptables -t nat -F LEXIS
-  iptables -t nat -A LEXIS -d 127.0.0.0/8 -j RETURN
-  iptables -t nat -A LEXIS -p tcp -j REDIRECT --to-ports "$PORT"
-  iptables -t nat -C OUTPUT -p tcp -j LEXIS 2>/dev/null || iptables -t nat -A OUTPUT -p tcp -j LEXIS
+if [ "$METHOD" = "tun" ]; then
+  if command -v ip >/dev/null 2>&1; then
+    ip link show lexis0 >/dev/null 2>&1 || ip tuntap add dev lexis0 mode tun
+    ip addr replace 10.7.0.1/24 dev lexis0
+    ip link set lexis0 up
+    ip rule del fwmark "$MARK" lookup main priority 100 2>/dev/null || true
+    ip rule add fwmark "$MARK" lookup main priority 100
+    ip route replace default dev lexis0 table "$TABLE"
+    ip rule del lookup "$TABLE" priority 200 2>/dev/null || true
+    ip rule add lookup "$TABLE" priority 200
+    echo "虚拟网卡 lexis0 已起来。本进程出站要带 fwmark $MARK，否则会绕回去。"
+  else
+    echo "没有 ip 命令。进程仍会尝试打开 lexis0。"
+  fi
+  exit 0
 fi
-echo "系统转发已指向 $PORT"
+if ! command -v iptables >/dev/null 2>&1; then
+  echo "没有 iptables，规则留在本文件"
+  exit 0
+fi
+if [ "$METHOD" = "tproxy" ]; then
+  if command -v ip >/dev/null 2>&1; then
+    ip rule del fwmark "$MARK" lookup "$TABLE" priority 100 2>/dev/null || true
+    ip rule add fwmark "$MARK" lookup "$TABLE" priority 100
+    ip route replace local 0.0.0.0/0 dev lo table "$TABLE"
+  fi
+  iptables -t mangle -C PREROUTING -p tcp -m mark --mark "$MARK" -j RETURN 2>/dev/null || iptables -t mangle -I PREROUTING -p tcp -m mark --mark "$MARK" -j RETURN
+  iptables -t mangle -C PREROUTING -p tcp ! -d 127.0.0.0/8 -j TPROXY --on-port "$PORT" --tproxy-mark "$MARK" 2>/dev/null || iptables -t mangle -A PREROUTING -p tcp ! -d 127.0.0.0/8 -j TPROXY --on-port "$PORT" --tproxy-mark "$MARK"
+  echo "tproxy 已指向 $PORT。接受连接后读取原始目的地址。"
+else
+  iptables -t nat -C OUTPUT -p tcp -m mark --mark "$MARK" -j RETURN 2>/dev/null || iptables -t nat -I OUTPUT -p tcp -m mark --mark "$MARK" -j RETURN
+  iptables -t nat -C OUTPUT -p tcp -d 127.0.0.0/8 -j RETURN 2>/dev/null || iptables -t nat -I OUTPUT -p tcp -d 127.0.0.0/8 -j RETURN
+  iptables -t nat -C OUTPUT -p tcp -j REDIRECT --to-ports "$PORT" 2>/dev/null || iptables -t nat -A OUTPUT -p tcp -j REDIRECT --to-ports "$PORT"
+  echo "redirect 已指向 $PORT。接受连接后读取原始目的地址。本进程出站要带 fwmark $MARK。"
+fi
 `,
   };
 }
@@ -1437,7 +1708,7 @@ function applySystem(config) {
     });
     return;
   }
-  state.system = "已写出 vpn-session.json。Android 的 VpnService 读取这份会话；Termux 进程本身不能打开系统 VPN。";
+  state.system = "已写出 vpn-session.json。包通道在 127.0.0.1:17891。Termux 不能自己弹出 VPN 授权，要编译 android/LexisVpnService.kt。";
   log(state.system);
 }
 
@@ -1450,6 +1721,35 @@ function escapeHtml(value) {
 
 function startStatus(config) {
   const server = createHttp((req, res) => {
+    const url = new URL(req.url || "/", "http://127.0.0.1");
+    if (url.pathname === "/health") {
+      res.writeHead(200, { "content-type": "application/json; charset=utf-8" });
+      res.end(JSON.stringify({ ok: true, beats: state.beats, live: liveConns, listeners: state.listeners }));
+      return;
+    }
+    if (url.pathname === "/metrics") {
+      const lines = [
+        "# TYPE lexis_up gauge",
+        "lexis_up 1",
+        "# TYPE lexis_beats counter",
+        `lexis_beats ${state.beats}`,
+        "# TYPE lexis_live_conns gauge",
+        `lexis_live_conns ${liveConns}`,
+        "# TYPE lexis_http_ok counter",
+        `lexis_http_ok ${metrics.httpOk}`,
+        "# TYPE lexis_http_reject counter",
+        `lexis_http_reject ${metrics.httpReject}`,
+        "# TYPE lexis_smuggle_blocked counter",
+        `lexis_smuggle_blocked ${metrics.smuggle}`,
+        "# TYPE lexis_transparent counter",
+        `lexis_transparent ${metrics.transparent}`,
+        "# TYPE lexis_tun_packets counter",
+        `lexis_tun_packets ${metrics.tunPackets}`,
+      ];
+      res.writeHead(200, { "content-type": "text/plain; version=0.0.4; charset=utf-8" });
+      res.end(`${lines.join("\n")}\n`);
+      return;
+    }
     const up = Math.floor((Date.now() - started) / 1000);
     const rows = state.decisions
       .map((item) => `<li>${escapeHtml(new Date(item.at).toLocaleTimeString())} ${escapeHtml(item.action)} ${escapeHtml(item.host)} <span>${escapeHtml(item.reason)}</span></li>`)
@@ -1465,7 +1765,7 @@ ul{padding-left:1.1rem} li span{color:#b4bbae}
 <main>
 <h1>词隙 <span class="sage">客户端</span></h1>
 <p class="mist">${escapeHtml(platform())} · 角色 ${escapeHtml(config.role)} · ${escapeHtml(config.mode === "system-forward" ? "系统接管" : "固定端口")}</p>
-<section><p>已运行 ${up} 秒 · 心跳 ${state.beats}</p><p>${escapeHtml(state.listeners.join(" · ") || "还没有入站")}</p></section>
+<section><p class="mist">已运行 ${up} 秒 · 心跳 ${state.beats} · /health · /metrics</p><p>${escapeHtml(state.listeners.join(" · ") || "还没有入站")}</p></section>
 <section><p>${escapeHtml(state.system)}</p><p class="mist">${escapeHtml(state.resources)}</p></section>
 <section><ul>${rows || "<li class='mist'>还没有连接</li>"}</ul></section>
 </main>`;
@@ -1478,20 +1778,31 @@ ul{padding-left:1.1rem} li span{color:#b4bbae}
 
 const reverseOn = new Set();
 
+function reverseHost(config, door, quiet = false) {
+  const listen = String(door.listen || "127.0.0.1").trim() || "127.0.0.1";
+  if (linkOf(config).allowLan) return listen;
+  if (!quiet && listen !== "127.0.0.1" && listen !== "::1") {
+    log(`反向 ${door.service || door.port} 改绑 127.0.0.1。要听更宽的地址，先打开允许局域网`);
+  }
+  return listen === "127.0.0.1" || listen === "::1" || linkOf(config).allowLan ? listen : "127.0.0.1";
+}
+
 function serveReverse(door) {
-  const host = door.listen || "127.0.0.1";
+  const config = activeConfig;
+  const host = reverseHost(config || {}, door);
   const server = createTcp((socket) => {
     socket.on("error", () => socket.destroy());
-    const config = activeConfig;
-    if (config) arm(socket, config);
+    const live = activeConfig;
+    if (!live || !admit(socket, live)) return;
+    arm(socket, live);
+    const current = (live.reverses || []).find((item) => Number(item.port) === Number(door.port)) || door;
     void (async () => {
       try {
-        if (!activeConfig) throw new Error("没有配置");
-        const session = inboundSessionFor(activeConfig, door.peer);
-        const stream = await session.open(`expose ${door.service}`);
+        const session = inboundSessionFor(activeConfig || live, current.peer);
+        const stream = await session.open(`expose ${current.service}`);
         bridgeSocket(stream, socket);
       } catch (err) {
-        log(`反向 ${door.peer}:${door.service} 失败：${err.message || err}`);
+        log(`反向 ${current.peer}:${current.service} 失败：${err.message || err}`);
         socket.destroy();
       }
     })();
@@ -1511,7 +1822,8 @@ function bootReverses() {
   const config = activeConfig;
   if (!config) return;
   for (const door of config.reverses || []) {
-    const key = `${door.listen || "127.0.0.1"}:${door.port}:${door.peer}:${door.service}`;
+    const host = reverseHost(config, door, true);
+    const key = `${host}:${door.port}`;
     if (reverseOn.has(key)) continue;
     reverseOn.add(key);
     serveReverse(door);
@@ -1577,18 +1889,20 @@ function watchConfig() {
     last = mtime;
     try {
       const next = loadConfig();
-      const prevIds = new Set(peerList(activeConfig || {}).map((peer) => peer.id).filter(Boolean));
-      const nextIds = new Set(peerList(next).map((peer) => peer.id).filter(Boolean));
+      const prevPeers = peerList(activeConfig || {});
+      const nextById = new Map(peerList(next).filter((peer) => peer.id).map((peer) => [peer.id, String(peer.publicRawB64 || "")]));
       activeConfig = next;
       state.config = next;
-      for (const id of prevIds) {
-        if (nextIds.has(id)) continue;
-        const pending = lexSessions.get(id);
-        lexSessions.delete(id);
-        inboundSessions.get(id)?.shutdown?.();
-        inboundSessions.delete(id);
+      for (const peer of prevPeers) {
+        if (!peer.id) continue;
+        const nowKey = nextById.has(peer.id) ? nextById.get(peer.id) : null;
+        if (nowKey === String(peer.publicRawB64 || "")) continue;
+        const pending = lexSessions.get(peer.id);
+        lexSessions.delete(peer.id);
+        inboundSessions.get(peer.id)?.shutdown?.();
+        inboundSessions.delete(peer.id);
         void Promise.resolve(pending).then((session) => session?.shutdown?.()).catch(() => undefined);
-        log(`节点 ${id} 已从名单摘掉`);
+        log(nowKey == null ? `节点 ${peer.id} 已从名单摘掉` : `节点 ${peer.name || peer.id} 的公钥变了，旧会话已断开`);
       }
       keepPeers();
       bootReverses();
@@ -1625,12 +1939,30 @@ function selfCheck() {
     console.error("self-check failed", a, b, c, d);
     process.exit(1);
   }
-  if (hopCount("relay a relay b tcp h 1") !== 2 || !parseOpen("udp h 9").udp || parseOpen("expose ssh").expose !== "ssh") {
+  if (hopCount("relay a relay b tcp h 1") !== 2 || !parseOpen("udp h 9").udp || parseOpen("expose ssh").expose !== "ssh" || !opensExpose("relay a expose ssh") || opensExpose("relay a tcp h 1")) {
     console.error("open grammar failed");
     process.exit(1);
   }
   if (!isBlockedAddress("127.0.0.1") || !isBlockedAddress("10.0.0.8") || !isBlockedAddress("169.254.169.254") || !isBlockedAddress("::1") || isBlockedAddress("8.8.8.8")) {
     console.error("address check failed");
+    process.exit(1);
+  }
+  const badFrame = classifyFraming(["Host: a", "Content-Length: 1", "Transfer-Encoding: chunked"]);
+  const folded = classifyFraming(["Host: a", " folded"]);
+  const clean = sanitizeHeaders(["Host: example.com", "Proxy-Authorization: Basic eA==", "X-Token: 1"]);
+  const table = new Map();
+  const redirected = redirectTcp(buildTcpPacket({ src: "10.0.0.8", dst: "9.9.9.9", sport: 40000, dport: 443, seq: 1, ack: 0, flags: 2 }), table, 12345);
+  const restored = redirectTcp(buildTcpPacket({ src: "127.0.0.1", dst: "10.0.0.8", sport: 12345, dport: 40000, seq: 9, ack: 2, flags: 16 }), table, 12345);
+  const ip = parseIpv4(redirected);
+  const tcp = ip && parseTcp(ip.payload);
+  const ipBack = parseIpv4(restored);
+  const tcpBack = ipBack && parseTcp(ipBack.payload);
+  if (badFrame.ok || folded.ok || hostsAgree("example.com", 80, "evil.test") || !hostsAgree("example.com", 80, "example.com") || clean.some((line) => /^proxy-authorization:/i.test(line)) || !clean.some((line) => /^x-token:/i.test(line))) {
+    console.error("http framing check failed", badFrame, clean);
+    process.exit(1);
+  }
+  if (!ip || ip.dst !== "127.0.0.1" || !tcp || tcp.dport !== 12345 || !ipBack || ipBack.src !== "9.9.9.9" || !tcpBack || tcpBack.sport !== 443) {
+    console.error("redirect check failed");
     process.exit(1);
   }
   console.log("lexis-agent check ok");
@@ -1659,6 +1991,9 @@ async function main() {
   mkdirSync(home, { recursive: true });
   writeFileSync(join(home, "lexis-agent.pid"), String(process.pid));
   for (const inbound of config.inbounds || []) serveInbound(config, inbound);
+  serveTransparent(config);
+  serveTun(config);
+  servePacketBridge(config);
   bootReverses();
   applySystem(config);
   startStatus(config);

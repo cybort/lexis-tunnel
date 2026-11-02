@@ -6,7 +6,7 @@ import { t as p256 } from "../_libs/noble__curves+noble__hashes.mjs";
 import { t as argon2id } from "../_libs/noble__hashes.mjs";
 import { t as require_index_node } from "../_libs/bokuweb__zstd-wasm.mjs";
 import { a as Cell, i as Bar, n as YAxis, o as ResponsiveContainer, r as XAxis, s as Tooltip, t as BarChart } from "../_libs/recharts+[...].mjs";
-//#region node_modules/.nitro/vite/services/ssr/assets/routes-BVoH_aPG.js
+//#region node_modules/.nitro/vite/services/ssr/assets/routes-BFi9VR3p.js
 var import_react = /* @__PURE__ */ __toESM(require_react());
 var import_jsx_runtime = require_jsx_runtime();
 var import_index_node = require_index_node();
@@ -221,6 +221,8 @@ var SPEC = {
 	lexiconSize: 4096,
 	bitsPerWord: 12,
 	windowSec: 300,
+	/** Accept the previous window this many seconds in, and the next window this many seconds before the roll. */
+	skewSec: 120,
 	counterBits: 24
 };
 var GLUE_SET = /* @__PURE__ */ new Set([
@@ -699,6 +701,17 @@ function actionLabel(action) {
 function newId(prefix) {
 	return `${prefix}-${Math.random().toString(36).slice(2, 8)}`;
 }
+function linuxOf(base, raw) {
+	const method = raw?.method === "tproxy" || raw?.method === "tun" || raw?.method === "redirect" ? raw.method : base.method;
+	return {
+		...base,
+		...raw ?? {},
+		method,
+		mark: clampNum(raw?.mark, 1, 255, base.mark),
+		table: clampNum(raw?.table, 1, 65535, base.table),
+		dnsRedirect: raw?.dnsRedirect !== false
+	};
+}
 function normalizeProfile(input) {
 	const base = defaultProfile();
 	if (!input || typeof input !== "object") return base;
@@ -714,10 +727,7 @@ function normalizeProfile(input) {
 		inbounds: Array.isArray(raw.inbounds) ? raw.inbounds.map(normalizeInbound) : base.inbounds,
 		processes: Array.isArray(raw.processes) ? raw.processes.map(normalizeProcess) : base.processes,
 		rules: Array.isArray(raw.rules) ? raw.rules.map(normalizeRule) : base.rules,
-		linux: {
-			...base.linux,
-			...raw.linux ?? {}
-		},
+		linux: linuxOf(base.linux, raw.linux),
 		windows: {
 			...base.windows,
 			...raw.windows ?? {}
@@ -793,6 +803,7 @@ function normalizePeer(raw) {
 		wsPath: typeof raw.wsPath === "string" && raw.wsPath.startsWith("/") ? raw.wsPath : "/lexis",
 		wsHost: String(raw.wsHost || "").trim(),
 		relay: raw.relay === true,
+		exit: raw.exit === true,
 		targets: Array.isArray(raw.targets) ? raw.targets.map((item) => String(item).trim()).filter(Boolean) : []
 	};
 }
@@ -825,7 +836,7 @@ function clampNum(value, min, max, fallback) {
 	return n;
 }
 function normalizeInbound(raw) {
-	const protocol = raw.protocol === "tcp" || raw.protocol === "tunnel" || raw.protocol === "http" ? raw.protocol : "socks";
+	const protocol = raw.protocol === "tcp" || raw.protocol === "tunnel" || raw.protocol === "http" || raw.protocol === "transparent" ? raw.protocol : "socks";
 	return {
 		id: raw.id || newId("in"),
 		tag: raw.tag || "入站",
@@ -1047,15 +1058,20 @@ function profileIssues(profile) {
 	if (profile.peerEndpoint && !/^.+:\d+$/.test(profile.peerEndpoint)) issues.push("对端地址要写成 主机:端口");
 	const joined = profile.peers.length > 0 || profile.inbounds.some((item) => item.protocol === "tunnel") || profile.reverses.length > 0 || profile.exposes.length > 0;
 	if ((joined || profile.role === "gate" || profile.peerEndpoint) && !profile.identity) issues.push("常驻转发要有本机身份。在节点页把一把密钥写成常驻身份");
-	if (joined && profile.link.token.trim().length < 8) issues.push("常驻握手要有至少 8 个字符的口令，用来在 Argon2 之前挡掉伪造问候");
+	if (joined && profile.link.token.trim().length < 16) issues.push("常驻握手要有至少 16 个字符的口令，用来在 Argon2 之前挡掉伪造问候");
 	if (!profile.outer.tlsVerify) issues.push("没有校验证书。正式部署请换成自己的证书并打开校验");
 	if (profile.inbounds.some((item) => item.protocol === "tunnel") && profile.peers.length === 0) issues.push("隧道入口还没有对端公钥，握不上手");
 	for (const peer of profile.peers) {
 		if (!/^.+:\d+$/.test(peer.endpoint)) issues.push(`${peer.name} 的地址要写成 主机:端口`);
 		if (peer.publicRawB64.length < 16) issues.push(`${peer.name} 缺少公钥，不能加入词表握手`);
 	}
+	if (profile.inbounds.some((item) => item.protocol === "tunnel") && profile.peers.length > 0 && !profile.peers.some((peer) => peer.exit)) issues.push("隧道入口还没有节点被允许把本机当出口");
 	for (const door of profile.exposes) if (!door.allow.length) issues.push(`${door.name} 没有写允许访问的节点`);
-	for (const door of profile.reverses) if (!door.peer || !door.service) issues.push("反向入口要写节点和服务名");
+	for (const door of profile.reverses) {
+		if (!door.peer || !door.service) issues.push("反向入口要写节点和服务名");
+		const host = door.listen || "127.0.0.1";
+		if (!profile.link.allowLan && host !== "127.0.0.1" && host !== "::1") issues.push("反向入口写了非回环地址。没有允许局域网时会改绑回环，避免把后面的服务公开");
+	}
 	if (profile.socksAuth.user && !profile.socksAuth.pass || !profile.socksAuth.user && profile.socksAuth.pass) issues.push("SOCKS 用户名和密码要一起填，或都留空");
 	return issues;
 }
@@ -1297,19 +1313,30 @@ function windowRemain(now = Date.now()) {
 var HELLO_CORE = 157;
 var SERVER_CORE = 169;
 var seenHellos = /* @__PURE__ */ new Map();
-/** Current window, plus the previous one only in the first 20 seconds (clock skew). */
+var helloByPeer = /* @__PURE__ */ new Map();
+var helloByIp = /* @__PURE__ */ new Map();
+var HELLO_PEER_CAP = 16;
+var HELLO_IP_CAP = 32;
+/** Current window, the previous one during the first skewSec, and the next one during the last skewSec. */
 function assertHelloWindow(helloWindow, now = Date.now()) {
 	const current = currentWindow(now);
 	const into = Math.floor(now / 1e3) % SPEC.windowSec;
-	if (!(helloWindow === current || helloWindow === current - 1 && into < 20)) throw new LexisError("握手时间窗已经过期");
+	const skew = SPEC.skewSec;
+	const prevOk = helloWindow === current - 1 && into < skew;
+	const nextOk = helloWindow === current + 1 && into >= SPEC.windowSec - skew;
+	if (helloWindow === current || prevOk || nextOk) return;
+	throw new LexisError("握手时间窗已经过期");
 }
 function nonceId(nonce) {
 	let hex = "";
 	for (const b of nonce) hex += b.toString(16).padStart(2, "0");
 	return hex;
 }
-function claimHello(window, nonce) {
-	for (const key of [...seenHellos.keys()]) if (key < window - 1) seenHellos.delete(key);
+function claimHello(window, nonce, scope) {
+	const current = currentWindow();
+	for (const key of [...seenHellos.keys()]) if (key < current - 1 || key > current + 1) seenHellos.delete(key);
+	pruneHelloScope(helloByPeer, current);
+	pruneHelloScope(helloByIp, current);
 	let bag = seenHellos.get(window);
 	if (!bag) {
 		bag = /* @__PURE__ */ new Set();
@@ -1317,8 +1344,23 @@ function claimHello(window, nonce) {
 	}
 	const id = nonceId(nonce);
 	if (bag.has(id)) throw new LexisError("握手被重放");
+	if (scope?.peer) bumpHelloScope(helloByPeer, scope.peer, window, HELLO_PEER_CAP, "这个节点的握手太密");
+	if (scope?.ip) bumpHelloScope(helloByIp, scope.ip, window, HELLO_IP_CAP, "这个地址的握手太密");
 	if (bag.size >= 4096) throw new LexisError("这个时间窗的握手太多");
 	bag.add(id);
+}
+function pruneHelloScope(map, current) {
+	for (const [key, row] of map) if (row.window < current - 1 || row.window > current + 1) map.delete(key);
+}
+function bumpHelloScope(map, key, window, cap, message) {
+	const prev = map.get(key);
+	const row = prev && prev.window === window ? prev : {
+		window,
+		n: 0
+	};
+	if (row.n >= cap) throw new LexisError(message);
+	row.n += 1;
+	map.set(key, row);
 }
 async function tokenMac(token, body) {
 	return (await hmac(utf8(token), concat(utf8("lexis-admit-v1"), body))).subarray(0, 16);
@@ -1399,7 +1441,10 @@ async function gateRespond(gate, peerRawB64, helloWire, opts = {}) {
 	} else if (hello.mac) throw new LexisError("对端带了口令，这边没有");
 	const pinned = unb64(peerRawB64);
 	if (!timingSafeEqual(hello.ltRaw, pinned)) throw new LexisError("内网端长期公钥和闸门上的绑定不一致");
-	claimHello(hello.window, hello.nonce);
+	claimHello(hello.window, hello.nonce, {
+		peer: opts.peerId || "",
+		ip: opts.sourceIp || ""
+	});
 	const ephS = await createIdentity();
 	const ltS = unb64(gate.publicRawB64);
 	const nonceS = crypto.getRandomValues(/* @__PURE__ */ new Uint8Array(16));
@@ -2673,7 +2718,7 @@ function ConfigPanel() {
 					}),
 					/* @__PURE__ */ (0, import_jsx_runtime.jsx)("p", {
 						className: "mt-2 text-sm text-mist",
-						children: "一条会话上可以开多路。打开写成 tcp 主机 端口、udp 主机 端口、relay 节点 再接后面的命令，或 expose 服务名。中继要逐个节点打开，跳数到 4 就停。慢的那一路只堵住自己。SOCKS 的用户名和密码留空就是不认证，HTTP 代理共用这一对。"
+						children: "一条会话上可以开多路。打开写成 tcp 主机 端口、udp 主机 端口、relay 节点 再接后面的命令，或 expose 服务名。中继和出口都要逐个节点打开。暴露不能经中继绕过去。跳数到 4 就停。慢的那一路只堵住自己。SOCKS 的用户名和密码留空就是不认证，HTTP 代理共用这一对。"
 					}),
 					/* @__PURE__ */ (0, import_jsx_runtime.jsx)("div", {
 						className: "mt-4 flex flex-wrap gap-2",
@@ -2804,7 +2849,7 @@ function ConfigPanel() {
 					}),
 					/* @__PURE__ */ (0, import_jsx_runtime.jsx)("p", {
 						className: "mt-2 text-sm text-mist",
-						children: "握手口令在 Argon2 之前校验，用来挡伪造问候，不是词表密钥。两端要写成同一个，至少 8 个字符。校验关掉时，外层 TLS 认不出对端，正式部署请换自己的证书。"
+						children: "握手口令在 Argon2 之前校验，用来挡伪造问候，不是词表密钥。两端要写成同一个，至少 16 个字符。校验关掉时，外层 TLS 认不出对端，正式部署请换自己的证书。"
 					}),
 					/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", {
 						className: "mt-4 rounded-sm bg-panel-2 p-3",
@@ -2855,6 +2900,7 @@ function ConfigPanel() {
 										wsPath: profile.outer.wsPath,
 										wsHost: "",
 										relay: false,
+										exit: false,
 										targets: []
 									}] }),
 									children: "添加节点"
@@ -3172,7 +3218,7 @@ function ConfigPanel() {
 					}),
 					/* @__PURE__ */ (0, import_jsx_runtime.jsx)("p", {
 						className: "mt-2 text-sm text-mist",
-						children: "公网这一侧听一个本地端口，从那个节点已经连进来的会话里打开同名服务。会话不在时会说没有来自该节点的会话。也可以直接访问「节点名:服务名」。"
+						children: "公网这一侧听一个端口，从那个节点已经连进来的会话里打开同名服务。没有允许局域网时，写成 0.0.0.0 也会改绑回环，并且和别的入站共用连接数上限。会话不在时会说没有来自该节点的会话。"
 					}),
 					/* @__PURE__ */ (0, import_jsx_runtime.jsx)("div", {
 						className: "mt-4 flex flex-col gap-3",
@@ -3243,7 +3289,7 @@ function ConfigPanel() {
 						children: [
 							/* @__PURE__ */ (0, import_jsx_runtime.jsxs)(Platform, {
 								title: "Linux",
-								body: "iptables redirect 或 tproxy。需要 root 才会改规则。",
+								body: "redirect、tproxy 或虚拟网卡。需要 root 才会改规则，并读取原始目的地址。",
 								children: [/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("select", {
 									className: control,
 									value: profile.linux.method,
@@ -3251,13 +3297,20 @@ function ConfigPanel() {
 										...profile.linux,
 										method: e.target.value
 									} }),
-									children: [/* @__PURE__ */ (0, import_jsx_runtime.jsx)("option", {
-										value: "redirect",
-										children: "redirect"
-									}), /* @__PURE__ */ (0, import_jsx_runtime.jsx)("option", {
-										value: "tproxy",
-										children: "tproxy"
-									})]
+									children: [
+										/* @__PURE__ */ (0, import_jsx_runtime.jsx)("option", {
+											value: "redirect",
+											children: "redirect"
+										}),
+										/* @__PURE__ */ (0, import_jsx_runtime.jsx)("option", {
+											value: "tproxy",
+											children: "tproxy"
+										}),
+										/* @__PURE__ */ (0, import_jsx_runtime.jsx)("option", {
+											value: "tun",
+											children: "虚拟网卡"
+										})
+									]
 								}), /* @__PURE__ */ (0, import_jsx_runtime.jsx)("input", {
 									className: control,
 									"aria-label": "fwmark",
@@ -3271,7 +3324,7 @@ function ConfigPanel() {
 							}),
 							/* @__PURE__ */ (0, import_jsx_runtime.jsxs)(Platform, {
 								title: "Windows",
-								body: "portproxy 只绑回环，避免把本地端口公布到局域网。WinDivert 只留下记录，驱动不在包里。",
+								body: "portproxy 只绑回环。WinDivert 只有源码，驱动不在包里，选了也不会改系统流量。",
 								children: [/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("select", {
 									className: control,
 									value: profile.windows.method,
@@ -3298,7 +3351,7 @@ function ConfigPanel() {
 							}),
 							/* @__PURE__ */ (0, import_jsx_runtime.jsxs)(Platform, {
 								title: "Android",
-								body: "写出 VpnService 会话。地址、MTU、DNS 和绕行网段。",
+								body: "写出会话和本机包通道。VpnService 只有源码，Termux 不能弹出系统 VPN。",
 								children: [/* @__PURE__ */ (0, import_jsx_runtime.jsx)("input", {
 									className: control,
 									"aria-label": "VPN 地址",
@@ -3669,18 +3722,29 @@ function PeerEditor({ peer, onChange, onRemove }) {
 			}),
 			/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", {
 				className: "flex flex-wrap gap-2",
-				children: [/* @__PURE__ */ (0, import_jsx_runtime.jsx)(Btn, {
-					kind: peer.relay ? "solid" : "ghost",
-					onClick: () => onChange({
-						...peer,
-						relay: !peer.relay
+				children: [
+					/* @__PURE__ */ (0, import_jsx_runtime.jsx)(Btn, {
+						kind: peer.relay ? "solid" : "ghost",
+						onClick: () => onChange({
+							...peer,
+							relay: !peer.relay
+						}),
+						children: peer.relay ? "允许借本机中继" : "不借本机中继"
 					}),
-					children: peer.relay ? "允许借本机中继" : "不借本机中继"
-				}), /* @__PURE__ */ (0, import_jsx_runtime.jsx)(Btn, {
-					kind: "ember",
-					onClick: onRemove,
-					children: "移出名单"
-				})]
+					/* @__PURE__ */ (0, import_jsx_runtime.jsx)(Btn, {
+						kind: peer.exit ? "solid" : "ghost",
+						onClick: () => onChange({
+							...peer,
+							exit: !peer.exit
+						}),
+						children: peer.exit ? "允许把本机当出口" : "不把本机当出口"
+					}),
+					/* @__PURE__ */ (0, import_jsx_runtime.jsx)(Btn, {
+						kind: "ember",
+						onClick: onRemove,
+						children: "移出名单"
+					})
+				]
 			}),
 			/* @__PURE__ */ (0, import_jsx_runtime.jsx)("textarea", {
 				className: "min-h-16 w-full rounded-sm border border-line bg-ink px-3 py-3 font-mono text-xs text-fg",
@@ -4224,6 +4288,7 @@ function NodesPanel() {
 							wsPath: profile.outer.wsPath,
 							wsHost: "",
 							relay: false,
+							exit: false,
 							targets: []
 						};
 						patch({ peers: [...profile.peers.filter((peer) => peer.id !== node.id), next] });
@@ -4450,7 +4515,7 @@ function Overview({ onOpen }) {
 					}, title))
 				}), /* @__PURE__ */ (0, import_jsx_runtime.jsx)("p", {
 					className: "mt-4 text-sm text-mist",
-					children: "浏览器里不能守一个真正的 TCP 端口。这条控制台把握手、词表和封装真实跑完。下载的常驻进程走同一套词表。TLS 和 WebSocket 只包在外面，方便过 CDN。安装包不再附带 TLS 私钥。中继默认关闭。虚拟网卡、WinDivert 驱动、Linux tproxy 的原始目的地址、Android 的 VpnService 仍然不在这个进程里。"
+					children: "浏览器里不能守一个真正的 TCP 端口。这条控制台把握手、词表和封装真实跑完。下载的常驻进程走同一套词表。TLS 和 WebSocket 只包在外面，方便过 CDN。安装包不再附带 TLS 私钥。时钟对不齐时，时间窗两边各留 120 秒。HTTP 代理按每个请求重写，去掉代理认证，并拒绝长度和分块写在一起。状态页还有 /health 和 /metrics。Linux 在有 root 时，redirect 和 tproxy 会读原始目的地址，虚拟网卡走用户态 TCP/UDP。Windows 的 WinDivert 只有源码，驱动不在包里。Android 只带 VpnService 源码和本机包通道，没有装好的系统 VPN。中继默认关闭。"
 				})]
 			}),
 			/* @__PURE__ */ (0, import_jsx_runtime.jsx)("div", {

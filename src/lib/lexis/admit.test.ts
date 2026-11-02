@@ -3,6 +3,7 @@ import { b64 } from "./bytes.ts";
 import { createIdentity, LexisError } from "./crypto.ts";
 import { assertHelloWindow, claimHello, currentWindow, edgeFinish, edgeStart, establish, gateRespond, resetHandshakeGuards } from "./handshake.ts";
 import { clampKdf } from "./kdf.ts";
+import { SPEC } from "./spec.ts";
 import type { MeshNode } from "./types.ts";
 
 const FAST = { memoryKiB: 32, iterations: 1, parallelism: 1, honey: false };
@@ -74,10 +75,38 @@ async function main() {
   );
 
   assert.throws(() => assertHelloWindow(currentWindow() - 3), /过期/);
+  const skewNow = currentWindow() * SPEC.windowSec * 1000;
+  const skewId = currentWindow(skewNow);
+  assert.doesNotThrow(() => assertHelloWindow(skewId, skewNow + 1000));
+  assert.doesNotThrow(() => assertHelloWindow(skewId - 1, skewNow + (SPEC.skewSec - 1) * 1000));
+  assert.throws(() => assertHelloWindow(skewId - 1, skewNow + (SPEC.skewSec + 1) * 1000), /过期/);
+  assert.doesNotThrow(() => assertHelloWindow(skewId + 1, skewNow + (SPEC.windowSec - 30) * 1000));
+  assert.throws(() => assertHelloWindow(skewId + 1, skewNow + 150 * 1000), /过期/);
   resetHandshakeGuards();
   const nonce = crypto.getRandomValues(new Uint8Array(16));
   claimHello(currentWindow(), nonce);
   assert.throws(() => claimHello(currentWindow(), nonce), /重放/);
+  resetHandshakeGuards();
+  const win = currentWindow();
+  for (let i = 0; i < 16; i += 1) {
+    const n = new Uint8Array(16);
+    n[0] = i + 1;
+    claimHello(win, n, { peer: "node-a" });
+  }
+  const crowded = new Uint8Array(16);
+  crowded[0] = 200;
+  assert.throws(() => claimHello(win, crowded, { peer: "node-a" }), /节点的握手太密/);
+  const otherPeer = new Uint8Array(16);
+  otherPeer[0] = 201;
+  claimHello(win, otherPeer, { peer: "node-b" });
+  for (let i = 0; i < 32; i += 1) {
+    const n = new Uint8Array(16);
+    n[1] = i + 1;
+    claimHello(win, n, { ip: "203.0.113.9" });
+  }
+  const crowdedIp = new Uint8Array(16);
+  crowdedIp[1] = 200;
+  assert.throws(() => claimHello(win, crowdedIp, { ip: "203.0.113.9" }), /地址的握手太密/);
   console.log("admit ok");
 }
 

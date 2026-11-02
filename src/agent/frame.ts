@@ -12,7 +12,7 @@ import { fileURLToPath } from "node:url";
 import { Module, waitInitialized } from "../../node_modules/@bokuweb/zstd-wasm/dist/esm/module.js";
 import { compress as zstdCompress } from "../../node_modules/@bokuweb/zstd-wasm/dist/esm/simple/compress.js";
 import { decompress as zstdDecompress } from "../../node_modules/@bokuweb/zstd-wasm/dist/esm/simple/decompress.js";
-import { b64, concat, fromUtf8, readU16, u16be, utf8 } from "../lib/lexis/bytes";
+import { b64, concat, fromUtf8, readU16, readU32, u16be, u32be, utf8 } from "../lib/lexis/bytes";
 import { createIdentity, hkdf, identityFromJwks } from "../lib/lexis/crypto";
 import { currentWindow, edgeFinish, edgeStart, gateAccept, gateRespond, openSession, type GatePending, type LiveSession } from "../lib/lexis/handshake";
 import { deriveSessionKey, honeyFromFeatures, setSessionKeyDeriver, type ArgonParams, type SessionOffer } from "../lib/lexis/kdf";
@@ -110,7 +110,7 @@ export function hopCount(text: string): number {
 }
 
 const HANDSHAKE_CAP = 64 * 1024;
-const FRAME_CAP = 256 * 1024;
+const FRAME_CAP = 4 * 1024 * 1024;
 
 class LinePipe implements ProsePipe {
   private buf = Buffer.alloc(0);
@@ -640,6 +640,7 @@ export class LexSession {
   peerId = "";
   private lastRx = Date.now();
   private rekeyBusy = false;
+  private rekeyTimer: ReturnType<typeof setInterval> | null = null;
   readonly rekeyAt: number;
 
   constructor(
@@ -662,9 +663,14 @@ export class LexSession {
           this.shutdown();
           return;
         }
+        this.kickRekey();
         void this.sendRecord(RECORD.heartbeat, 0, 0, heartbeatPayload()).catch(() => this.shutdown());
       }, heartbeatMs);
       this.heart.unref?.();
+    }
+    if (initiator) {
+      this.rekeyTimer = setInterval(() => this.kickRekey(), 20000);
+      this.rekeyTimer.unref?.();
     }
   }
 
@@ -677,6 +683,7 @@ export class LexSession {
     if (this.closed) return;
     this.closed = true;
     if (this.heart) clearInterval(this.heart);
+    if (this.rekeyTimer) clearInterval(this.rekeyTimer);
     for (const stream of this.streams.values()) stream.finish();
     this.pipe.close();
     while (this.closeWaiters.length) this.closeWaiters.shift()?.();
@@ -721,14 +728,17 @@ export class LexSession {
     if (Math.max(this.sendLive.counters[dir], peer) < this.rekeyAt && !stale) return;
     this.rekeyBusy = true;
     const nonce = crypto.getRandomValues(new Uint8Array(16));
-    void this.sendRecord(RECORD.rekey, 0, 0, nonce, nonce).finally(() => {
+    const payload = concat(nonce, u32be(currentWindow()));
+    void this.sendRecord(RECORD.rekey, 0, 0, payload, payload).finally(() => {
       if (this.sendLive === this.recvLive) this.rekeyBusy = false;
     });
   }
 
-  private async deriveNext(base: LiveSession, nonce: Uint8Array) {
+  private async deriveNext(base: LiveSession, payload: Uint8Array) {
+    if (payload.length < 20) throw new Error("换钥报文太短");
+    const nonce = payload.subarray(0, 16);
+    const window = readU32(payload, 16);
     const sk = await hkdf(base.sk, nonce, utf8("lexis-rekey-v1"), 32);
-    const window = currentWindow();
     const lexicon = await sessionLexicon(sk, window);
     return {
       ...base,
@@ -741,7 +751,7 @@ export class LexSession {
     };
   }
 
-  private async openLive(live: LiveSession, prose: string) {
+  private async openLive(live: LiveSession, prose: string, honey = live.honey) {
     const dir = this.initiator ? "g2e" : "e2g";
     const opened = await open({
       key: live.sk,
@@ -750,7 +760,7 @@ export class LexSession {
       direction: dir,
       prose,
       lastSeen: live.seen[dir],
-      honey: live.honey,
+      honey,
     });
     if (!opened.honey) live.seen[dir] = opened.counter;
     return opened;
@@ -829,15 +839,21 @@ export class LexSession {
     try {
       for (;;) {
         const prose = await this.pipe.read();
+        const pending = this.sendLive !== this.recvLive;
         let opened;
         try {
-          opened = await this.openLive(this.recvLive, prose);
+          opened = await this.openLive(this.recvLive, prose, pending ? false : this.recvLive.honey);
         } catch (err) {
-          if (this.sendLive === this.recvLive) throw err;
-          opened = await this.openLive(this.sendLive, prose);
-          this.recvLive = this.sendLive;
-          this.live = this.sendLive;
-          this.rekeyBusy = false;
+          if (!pending) throw err;
+          try {
+            opened = await this.openLive(this.sendLive, prose, false);
+            this.recvLive = this.sendLive;
+            this.live = this.sendLive;
+            this.rekeyBusy = false;
+          } catch (err2) {
+            if (this.sendLive.honey || this.recvLive.honey) continue;
+            throw err2;
+          }
         }
         if (opened.honey) continue;
         this.lastRx = Date.now();
@@ -934,6 +950,7 @@ export async function acceptSession(opts: {
   heartbeatMs?: number;
   handshakeMs?: number;
   rekeyAt?: number;
+  sourceIp?: string;
   onReady?: (session: LexSession) => void;
   onStream?: (stream: MuxStream) => void;
 }) {
@@ -946,7 +963,12 @@ export async function acceptSession(opts: {
   for (const peer of opts.peers) {
     if (!peer.publicRawB64) continue;
     try {
-      pending = await gateRespond(self, peer.publicRawB64, helloWire, { token: opts.token, kdf: opts.kdf });
+      pending = await gateRespond(self, peer.publicRawB64, helloWire, {
+        token: opts.token,
+        kdf: opts.kdf,
+        sourceIp: opts.sourceIp,
+        peerId: peer.id || "",
+      });
       matched = peer.id || "";
       break;
     } catch (err) {
@@ -1018,7 +1040,8 @@ type KdfMsg = {
 };
 
 if (!isMainThread && parentPort) {
-  parentPort.on("message", (msg: KdfMsg) => {
+  parentPort.on("message", (msg: KdfMsg & { crash?: boolean }) => {
+    if (msg.crash) throw new Error("派生线程故障");
     try {
       const out = deriveSessionKey(msg.ssE, msg.ssS, msg.nonceC, msg.nonceS, msg.window, msg.features, msg.params);
       parentPort?.postMessage({ id: msg.id, key: out.key, ms: out.ms });
@@ -1033,36 +1056,95 @@ let kdfSeq = 0;
 let kdfInflight = 0;
 let kdfMax = 2;
 const kdfWait = new Map<number, { resolve: (v: { key: Uint8Array; ms: number }) => void; reject: (e: Error) => void }>();
+const KDF_TASK_MS = 60_000;
+
+function failKdfWaiters(err: Error) {
+  const jobs = [...kdfWait.values()];
+  kdfWait.clear();
+  for (const job of jobs) job.reject(err);
+}
+
+function dropKdfWorker(err: Error) {
+  const worker = kdfWorker;
+  kdfWorker = null;
+  failKdfWaiters(err);
+  if (!worker) return;
+  void worker.terminate().catch(() => undefined);
+}
+
+function ensureKdfWorker() {
+  if (!isMainThread || kdfWorker) return;
+  const worker = new Worker(new URL(import.meta.url));
+  kdfWorker = worker;
+  worker.unref?.();
+  worker.on("message", (msg: { id: number; key?: Uint8Array; ms?: number; error?: string }) => {
+    const job = kdfWait.get(msg.id);
+    if (!job) return;
+    kdfWait.delete(msg.id);
+    if (msg.error || !msg.key) job.reject(new Error(msg.error || "派生失败"));
+    else job.resolve({ key: new Uint8Array(msg.key), ms: msg.ms || 1 });
+  });
+  worker.on("error", (err) => {
+    if (kdfWorker !== worker) return;
+    dropKdfWorker(err instanceof Error ? err : new Error(String(err)));
+  });
+  worker.on("exit", () => {
+    if (kdfWorker !== worker) return;
+    kdfWorker = null;
+    failKdfWaiters(new Error("派生线程已停"));
+  });
+}
+
+/** Test hook. The resident process rebuilds the thread on the next handshake. */
+export function breakKdfWorkerForTests(): Promise<void> {
+  const worker = kdfWorker;
+  if (!worker) return Promise.resolve();
+  return new Promise((resolve) => {
+    worker.once("exit", () => resolve());
+    worker.postMessage({ crash: true });
+  });
+}
 
 export function startKdfPool(maxConcurrent = 2) {
   kdfMax = Math.max(1, Math.min(8, maxConcurrent || 2));
-  if (isMainThread && !kdfWorker) {
-    kdfWorker = new Worker(new URL(import.meta.url));
-    kdfWorker.unref?.();
-    kdfWorker.on("message", (msg: { id: number; key?: Uint8Array; ms?: number; error?: string }) => {
-      const job = kdfWait.get(msg.id);
-      if (!job) return;
-      kdfWait.delete(msg.id);
-      if (msg.error || !msg.key) job.reject(new Error(msg.error || "派生失败"));
-      else job.resolve({ key: new Uint8Array(msg.key), ms: msg.ms || 1 });
-    });
-    kdfWorker.on("error", (err) => {
-      for (const job of kdfWait.values()) job.reject(err instanceof Error ? err : new Error(String(err)));
-      kdfWait.clear();
-    });
-  }
+  ensureKdfWorker();
   setSessionKeyDeriver(async (ssE, ssS, nonceC, nonceS, window, features, params) => {
-    if (!kdfWorker) return deriveSessionKey(ssE, ssS, nonceC, nonceS, window, features, params);
+    ensureKdfWorker();
+    const worker = kdfWorker;
+    if (!worker) return deriveSessionKey(ssE, ssS, nonceC, nonceS, window, features, params);
     if (kdfInflight >= kdfMax) throw new Error("握手太多");
     kdfInflight += 1;
     const id = ++kdfSeq;
     try {
       return await new Promise<{ key: Uint8Array; ms: number }>((resolve, reject) => {
-        kdfWait.set(id, { resolve, reject });
-        kdfWorker?.postMessage({ id, ssE, ssS, nonceC, nonceS, window, features, params });
+        const timer = setTimeout(() => {
+          if (!kdfWait.has(id)) return;
+          kdfWait.delete(id);
+          reject(new Error("派生超时"));
+          if (kdfWorker === worker) dropKdfWorker(new Error("派生超时"));
+        }, KDF_TASK_MS);
+        timer.unref?.();
+        kdfWait.set(id, {
+          resolve: (value) => {
+            clearTimeout(timer);
+            resolve(value);
+          },
+          reject: (err) => {
+            clearTimeout(timer);
+            reject(err);
+          },
+        });
+        try {
+          worker.postMessage({ id, ssE, ssS, nonceC, nonceS, window, features, params });
+        } catch (err) {
+          kdfWait.delete(id);
+          clearTimeout(timer);
+          reject(err instanceof Error ? err : new Error(String(err)));
+          if (kdfWorker === worker) dropKdfWorker(err instanceof Error ? err : new Error(String(err)));
+        }
       });
     } finally {
-      kdfInflight -= 1;
+      kdfInflight = Math.max(0, kdfInflight - 1);
     }
   });
 }

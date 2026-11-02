@@ -83,17 +83,26 @@ export function windowRemain(now = Date.now()): number {
 const HELLO_CORE = 2 + 65 + 65 + 4 + 16 + 4 + 1;
 const SERVER_CORE = 2 + 65 + 65 + 16 + 16 + 4 + 1;
 const seenHellos = new Map<number, Set<string>>();
+const helloByPeer = new Map<string, { window: number; n: number }>();
+const helloByIp = new Map<string, { window: number; n: number }>();
+const HELLO_PEER_CAP = 16;
+const HELLO_IP_CAP = 32;
 
 export function resetHandshakeGuards() {
   seenHellos.clear();
+  helloByPeer.clear();
+  helloByIp.clear();
 }
 
-/** Current window, plus the previous one only in the first 20 seconds (clock skew). */
+/** Current window, the previous one during the first skewSec, and the next one during the last skewSec. */
 export function assertHelloWindow(helloWindow: number, now = Date.now()) {
   const current = currentWindow(now);
   const into = Math.floor(now / 1000) % SPEC.windowSec;
-  const ok = helloWindow === current || (helloWindow === current - 1 && into < 20);
-  if (!ok) throw new LexisError("握手时间窗已经过期");
+  const skew = SPEC.skewSec;
+  const prevOk = helloWindow === current - 1 && into < skew;
+  const nextOk = helloWindow === current + 1 && into >= SPEC.windowSec - skew;
+  if (helloWindow === current || prevOk || nextOk) return;
+  throw new LexisError("握手时间窗已经过期");
 }
 
 function nonceId(nonce: Uint8Array): string {
@@ -102,10 +111,13 @@ function nonceId(nonce: Uint8Array): string {
   return hex;
 }
 
-export function claimHello(window: number, nonce: Uint8Array) {
+export function claimHello(window: number, nonce: Uint8Array, scope?: { peer?: string; ip?: string }) {
+  const current = currentWindow();
   for (const key of [...seenHellos.keys()]) {
-    if (key < window - 1) seenHellos.delete(key);
+    if (key < current - 1 || key > current + 1) seenHellos.delete(key);
   }
+  pruneHelloScope(helloByPeer, current);
+  pruneHelloScope(helloByIp, current);
   let bag = seenHellos.get(window);
   if (!bag) {
     bag = new Set();
@@ -113,8 +125,30 @@ export function claimHello(window: number, nonce: Uint8Array) {
   }
   const id = nonceId(nonce);
   if (bag.has(id)) throw new LexisError("握手被重放");
+  if (scope?.peer) bumpHelloScope(helloByPeer, scope.peer, window, HELLO_PEER_CAP, "这个节点的握手太密");
+  if (scope?.ip) bumpHelloScope(helloByIp, scope.ip, window, HELLO_IP_CAP, "这个地址的握手太密");
   if (bag.size >= 4096) throw new LexisError("这个时间窗的握手太多");
   bag.add(id);
+}
+
+function pruneHelloScope(map: Map<string, { window: number; n: number }>, current: number) {
+  for (const [key, row] of map) {
+    if (row.window < current - 1 || row.window > current + 1) map.delete(key);
+  }
+}
+
+function bumpHelloScope(
+  map: Map<string, { window: number; n: number }>,
+  key: string,
+  window: number,
+  cap: number,
+  message: string,
+) {
+  const prev = map.get(key);
+  const row = prev && prev.window === window ? prev : { window, n: 0 };
+  if (row.n >= cap) throw new LexisError(message);
+  row.n += 1;
+  map.set(key, row);
 }
 
 async function tokenMac(token: string, body: Uint8Array): Promise<Uint8Array> {
@@ -126,6 +160,10 @@ export type AdmitOpts = {
   /** Gate's own Argon2 parameters. The client's offer cannot raise this cost. */
   kdf?: ArgonParams;
   now?: number;
+  /** Remote address, used only to cap how many hellos one host can spend. */
+  sourceIp?: string;
+  /** Peer id after the pinned key matches. Caps hellos per node, not just globally. */
+  peerId?: string;
 };
 
 function transcript(parts: {
@@ -231,7 +269,7 @@ export async function gateRespond(
   if (!timingSafeEqual(hello.ltRaw, pinned)) {
     throw new LexisError("内网端长期公钥和闸门上的绑定不一致");
   }
-  claimHello(hello.window, hello.nonce);
+  claimHello(hello.window, hello.nonce, { peer: opts.peerId || "", ip: opts.sourceIp || "" });
   const ephS = await createIdentity();
   const ltS = unb64(gate.publicRawB64);
   const nonceS = crypto.getRandomValues(new Uint8Array(16));

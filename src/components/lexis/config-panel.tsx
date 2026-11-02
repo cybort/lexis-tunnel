@@ -205,7 +205,7 @@ export function ConfigPanel() {
           常驻进程和这条控制台用同一套词表。握手仍是两次 ECDH 加 Argon2id，正文是密钥、计数器和秘密词表。TCP、TLS、WebSocket 只负责协议和头，用来过 CDN。路径默认 /lexis。CDN 若自己终结 TLS，源站可以听 WebSocket。
         </p>
         <p className="mt-2 text-sm text-mist">
-          一条会话上可以开多路。打开写成 tcp 主机 端口、udp 主机 端口、relay 节点 再接后面的命令，或 expose 服务名。中继要逐个节点打开，跳数到 4 就停。慢的那一路只堵住自己。SOCKS 的用户名和密码留空就是不认证，HTTP 代理共用这一对。
+          一条会话上可以开多路。打开写成 tcp 主机 端口、udp 主机 端口、relay 节点 再接后面的命令，或 expose 服务名。中继和出口都要逐个节点打开。暴露不能经中继绕过去。跳数到 4 就停。慢的那一路只堵住自己。SOCKS 的用户名和密码留空就是不认证，HTTP 代理共用这一对。
         </p>
         <div className="mt-4 flex flex-wrap gap-2">
           {(["tcp", "tls", "ws", "wss"] as OuterTransport[]).map((name) => (
@@ -269,7 +269,7 @@ export function ConfigPanel() {
             <input className={control} type="password" autoComplete="off" value={profile.socksAuth.pass} onChange={(e) => patch({ socksAuth: { ...profile.socksAuth, pass: e.target.value } })} />
           </Field>
         </div>
-        <p className="mt-2 text-sm text-mist">握手口令在 Argon2 之前校验，用来挡伪造问候，不是词表密钥。两端要写成同一个，至少 8 个字符。校验关掉时，外层 TLS 认不出对端，正式部署请换自己的证书。</p>
+        <p className="mt-2 text-sm text-mist">握手口令在 Argon2 之前校验，用来挡伪造问候，不是词表密钥。两端要写成同一个，至少 16 个字符。校验关掉时，外层 TLS 认不出对端，正式部署请换自己的证书。</p>
         <div className="mt-4 rounded-sm bg-panel-2 p-3">
           <p className="text-sm text-mist">本机身份</p>
           <p className="mt-2 break-all font-mono text-xs text-fg">{profile.identity?.fingerprint || "还没有"}</p>
@@ -303,6 +303,7 @@ export function ConfigPanel() {
                       wsPath: profile.outer.wsPath,
                       wsHost: "",
                       relay: false,
+                      exit: false,
                       targets: [],
                     },
                   ],
@@ -473,7 +474,7 @@ export function ConfigPanel() {
             添加入口
           </Btn>
         </div>
-        <p className="mt-2 text-sm text-mist">公网这一侧听一个本地端口，从那个节点已经连进来的会话里打开同名服务。会话不在时会说没有来自该节点的会话。也可以直接访问「节点名:服务名」。</p>
+        <p className="mt-2 text-sm text-mist">公网这一侧听一个端口，从那个节点已经连进来的会话里打开同名服务。没有允许局域网时，写成 0.0.0.0 也会改绑回环，并且和别的入站共用连接数上限。会话不在时会说没有来自该节点的会话。</p>
         <div className="mt-4 flex flex-col gap-3">
           {profile.reverses.map((door) => (
             <div key={door.id} className="grid gap-2 rounded-sm bg-panel-2 p-3 sm:grid-cols-2">
@@ -495,21 +496,22 @@ export function ConfigPanel() {
           {profile.mode === "system-forward" ? "客户端启动时会按当前系统写出并尝试执行。" : "现在走固定端口。这些参数会跟着配置走，切到系统接管才生效。"}
         </p>
         <div className="mt-4 grid gap-3 lg:grid-cols-3">
-          <Platform title="Linux" body="iptables redirect 或 tproxy。需要 root 才会改规则。">
+          <Platform title="Linux" body="redirect、tproxy 或虚拟网卡。需要 root 才会改规则，并读取原始目的地址。">
             <select className={control} value={profile.linux.method} onChange={(e) => patch({ linux: { ...profile.linux, method: e.target.value as LexisProfile["linux"]["method"] } })}>
               <option value="redirect">redirect</option>
               <option value="tproxy">tproxy</option>
+              <option value="tun">虚拟网卡</option>
             </select>
             <input className={control} aria-label="fwmark" inputMode="numeric" value={profile.linux.mark} onChange={(e) => patch({ linux: { ...profile.linux, mark: Number(e.target.value) } })} />
           </Platform>
-          <Platform title="Windows" body="portproxy 只绑回环，避免把本地端口公布到局域网。WinDivert 只留下记录，驱动不在包里。">
+          <Platform title="Windows" body="portproxy 只绑回环。WinDivert 只有源码，驱动不在包里，选了也不会改系统流量。">
             <select className={control} value={profile.windows.method} onChange={(e) => patch({ windows: { ...profile.windows, method: e.target.value as LexisProfile["windows"]["method"] } })}>
               <option value="portproxy">portproxy</option>
               <option value="windivert">WinDivert</option>
             </select>
             <input className={control} aria-label="网关" value={profile.windows.gateway} onChange={(e) => patch({ windows: { ...profile.windows, gateway: e.target.value } })} />
           </Platform>
-          <Platform title="Android" body="写出 VpnService 会话。地址、MTU、DNS 和绕行网段。">
+          <Platform title="Android" body="写出会话和本机包通道。VpnService 只有源码，Termux 不能弹出系统 VPN。">
             <input className={control} aria-label="VPN 地址" value={profile.android.address} onChange={(e) => patch({ android: { ...profile.android, address: e.target.value } })} />
             <input className={control} aria-label="DNS" value={profile.android.dns} onChange={(e) => patch({ android: { ...profile.android, dns: e.target.value } })} />
           </Platform>
@@ -680,6 +682,9 @@ function PeerEditor({ peer, onChange, onRemove }: { peer: NetPeer; onChange: (pe
       <div className="flex flex-wrap gap-2">
         <Btn kind={peer.relay ? "solid" : "ghost"} onClick={() => onChange({ ...peer, relay: !peer.relay })}>
           {peer.relay ? "允许借本机中继" : "不借本机中继"}
+        </Btn>
+        <Btn kind={peer.exit ? "solid" : "ghost"} onClick={() => onChange({ ...peer, exit: !peer.exit })}>
+          {peer.exit ? "允许把本机当出口" : "不把本机当出口"}
         </Btn>
         <Btn kind="ember" onClick={onRemove}>
           移出名单
