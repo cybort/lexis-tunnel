@@ -21,7 +21,7 @@ import { buildModel, bytesToWords, wordsToBytes, type WordModel } from "./model"
 
 /** Wire protocol identity. Deliberately NOT sent on the wire (a version byte is a fingerprint);
  *  both ends must run the same protocol. Incompatible with 1.8.0 (lexis-codebook-ctr-v1). */
-export const PROTOCOL = { name: "lexis-hctr2-rans-v3", version: 3, agent: "3.0.0" } as const;
+export const PROTOCOL = { name: "lexis-hctr2-rans-v3", version: 3, agent: "3.0.2" } as const;
 
 export type Dir = "e2g" | "g2e";
 const enc = new TextEncoder();

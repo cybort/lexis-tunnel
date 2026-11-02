@@ -50,6 +50,8 @@ export type ProsePipe = {
   read(timeoutMs?: number): Promise<string>;
   close(): void;
   setCap?(n: number): void;
+  /** V3-8: resolves on the first byte received from the peer (undefined = unknown / already). */
+  firstByte?: Promise<void>;
 };
 
 export type OpenCommand = {
@@ -136,9 +138,12 @@ class LinePipe implements ProsePipe {
   private waiters: Array<(value: string | Error) => void> = [];
   private dead: Error | null = null;
   private cap = HANDSHAKE_CAP;
+  private gotByte!: () => void;
+  readonly firstByte = new Promise<void>((resolve) => (this.gotByte = resolve));
 
   constructor(private socket: Socket) {
     socket.on("data", (chunk) => {
+      this.gotByte();
       this.buf = Buffer.concat([this.buf, chunk]);
       if (this.buf.length > this.cap) {
         this.fail(new Error("词表缓冲过大"));
@@ -1106,6 +1111,16 @@ export async function acceptSession(opts: {
   sourceIp?: string;
   maxHalfOpen?: number;
   maxHalfOpenPerIp?: number;
+  /** V3-6: maxHalfOpenPerIp counts per network prefix: IPv4 /24, IPv6 /64 by default. */
+  halfOpenPrefixV4?: number;
+  halfOpenPrefixV6?: number;
+  /** V3-5: hard cap on connections held silently (over-cap, or failed and already released). Default 1024. */
+  maxSilent?: number;
+  /** V3-8: no byte within this many ms -> release the half-open slot, go silent (0 = off). Default 2000. */
+  firstByteMs?: number;
+  /** V3-5b: called once when the connection goes silent, so the caller can stop counting it
+   * as a live connection (silent ones are bounded by maxSilent instead). */
+  onSilent?: () => void;
   /** D5: caller already decided to refuse (e.g. maxConns); take the silent path. */
   refuse?: boolean;
   program?: LiveSession["program"];
@@ -1114,50 +1129,124 @@ export async function acceptSession(opts: {
 }) {
   const self = { ...opts.self, role: "gate" as const };
   const wait = opts.handshakeMs ?? 10000;
-  const ip = opts.sourceIp || "";
+  const ip = halfOpenKey(opts.sourceIp || "", opts.halfOpenPrefixV4 ?? 24, opts.halfOpenPrefixV6 ?? 64);
   // D5: half-open caps. Over a cap we never parse anything; we read and discard until the
   // same deadline, then close -- identical from outside to a bad or missing hello.
   const overCap =
     opts.refuse === true ||
     (opts.maxHalfOpen !== undefined && halfOpen.total >= opts.maxHalfOpen) ||
     (opts.maxHalfOpenPerIp !== undefined && (halfOpen.perIp.get(ip) || 0) >= opts.maxHalfOpenPerIp);
+  const maxSilent = opts.maxSilent ?? 1024;
   if (overCap) {
     halfOpen.refused += 1;
-    const until = Date.now() + wait;
-    try {
-      for (;;) {
-        const rest = until - Date.now();
-        if (rest <= 0) break;
-        await opts.pipe.read(rest);
-      }
-    } catch {
-      const rest = until - Date.now();
-      if (rest > 0) await new Promise((r) => setTimeout(r, rest));
-    }
+    await holdSilent(opts.pipe, Date.now() + wait, maxSilent, true, opts.onSilent);
     throw new Error("握手超时");
   }
   halfOpen.total += 1;
   halfOpen.perIp.set(ip, (halfOpen.perIp.get(ip) || 0) + 1);
   let released = false;
+  // idempotent; counts can never go negative or be released twice
   const release = () => {
     if (released) return;
     released = true;
-    halfOpen.total -= 1;
+    halfOpen.total = Math.max(0, halfOpen.total - 1);
     const n = (halfOpen.perIp.get(ip) || 1) - 1;
     if (n <= 0) halfOpen.perIp.delete(ip);
     else halfOpen.perIp.set(ip, n);
   };
   try {
-    return await acceptSessionInner(opts, self, wait);
+    return await acceptSessionInner(opts, self, wait, release, maxSilent);
   } finally {
     release();
   }
 }
 
-/** D5: live half-open handshake counters (exported for metrics/tests). */
-export const halfOpen = { total: 0, refused: 0, perIp: new Map<string, number>() };
+/** Keep a refused/failed connection silent until `until`, then let the caller close it (FIN).
+ * `drain`: over-cap path reads and discards (D5 behaviour, unchanged); the failed-hello path
+ * does not read (unchanged). If more than maxSilent connections are already silent, return at
+ * once (caller closes early) -- the only externally visible change, and only past the cap. */
+async function holdSilent(pipe: ProsePipe, until: number, maxSilent: number, drain: boolean, onSilent?: () => void) {
+  try {
+    onSilent?.();
+  } catch {
+    /* ignore */
+  }
+  if (halfOpen.silent >= maxSilent) {
+    halfOpen.silentOverflow += 1;
+    return;
+  }
+  halfOpen.silent += 1;
+  try {
+    if (drain) {
+      try {
+        for (;;) {
+          const rest = until - Date.now();
+          if (rest <= 0) break;
+          await pipe.read(rest);
+        }
+      } catch {
+        /* fall through to the timer */
+      }
+    }
+    const rest = until - Date.now();
+    if (rest > 0) await new Promise((r) => setTimeout(r, rest));
+  } finally {
+    halfOpen.silent = Math.max(0, halfOpen.silent - 1);
+  }
+}
 
-async function acceptSessionInner(opts: Parameters<typeof acceptSession>[0], self: MeshNode & { role: "gate" }, wait: number) {
+function parseV6(a: string): number[] | null {
+  let s = a.split("%")[0];
+  // embedded dotted IPv4 tail
+  const m = s.match(/^(.*:)(\d+\.\d+\.\d+\.\d+)$/);
+  if (m) {
+    const v4 = m[2].split(".").map(Number);
+    if (v4.some((x) => !(x >= 0 && x <= 255))) return null;
+    s = `${m[1]}${((v4[0] << 8) | v4[1]).toString(16)}:${((v4[2] << 8) | v4[3]).toString(16)}`;
+  }
+  const halves = s.split("::");
+  if (halves.length > 2) return null;
+  const head = halves[0] ? halves[0].split(":") : [];
+  const tail = halves.length === 2 && halves[1] ? halves[1].split(":") : [];
+  const fill = halves.length === 2 ? 8 - head.length - tail.length : 0;
+  if (fill < 0 || (halves.length === 1 && head.length !== 8)) return null;
+  const parts = [...head, ...Array(fill).fill("0"), ...tail].map((h) => parseInt(h, 16));
+  if (parts.length !== 8 || parts.some((x) => !(x >= 0 && x <= 0xffff))) return null;
+  return parts;
+}
+
+/** V3-6: bucket key for maxHalfOpenPerIp. IPv4 (and IPv4-mapped IPv6) -> /v4 prefix,
+ * IPv6 -> /v6 prefix. Unparseable addresses are counted as themselves. */
+export function halfOpenKey(addr: string, v4 = 24, v6 = 64): string {
+  const p4 = Math.max(0, Math.min(32, Math.floor(v4)));
+  const p6 = Math.max(0, Math.min(128, Math.floor(v6)));
+  const asV4 = (oct: number[]) => {
+    const n = (((oct[0] << 24) >>> 0) + (oct[1] << 16) + (oct[2] << 8) + oct[3]) >>> 0;
+    const masked = p4 === 0 ? 0 : (n & ((0xffffffff << (32 - p4)) >>> 0)) >>> 0;
+    return `${[masked >>> 24, (masked >>> 16) & 255, (masked >>> 8) & 255, masked & 255].join(".")}/${p4}`;
+  };
+  if (/^\d+\.\d+\.\d+\.\d+$/.test(addr)) {
+    const oct = addr.split(".").map(Number);
+    return oct.every((x) => x >= 0 && x <= 255) ? asV4(oct) : addr;
+  }
+  if (!addr.includes(":")) return addr;
+  const w = parseV6(addr.toLowerCase());
+  if (!w) return addr;
+  // IPv4-mapped ::ffff:a.b.c.d
+  if (w.slice(0, 5).every((x) => x === 0) && w[5] === 0xffff) return asV4([w[6] >> 8, w[6] & 255, w[7] >> 8, w[7] & 255]);
+  const out = w.map((x, i) => {
+    const lo = i * 16;
+    if (p6 >= lo + 16) return x;
+    if (p6 <= lo) return 0;
+    return x & (0xffff << (16 - (p6 - lo))) & 0xffff;
+  });
+  return `${out.map((x) => x.toString(16)).join(":")}/${p6}`;
+}
+
+/** D5: live half-open handshake counters (exported for metrics/tests). */
+export const halfOpen = { total: 0, refused: 0, perIp: new Map<string, number>(), silent: 0, silentOverflow: 0, earlyReleased: 0, firstByteTimeouts: 0 };
+
+async function acceptSessionInner(opts: Parameters<typeof acceptSession>[0], self: MeshNode & { role: "gate" }, wait: number, release: () => void = () => undefined, maxSilent = 1024) {
   // T21: every failure (no hello, unparsable, wrong token, unknown peer, replay, bad
   // finish) looks the same from outside: nothing is written and the pipe is closed
   // when the handshake deadline expires.
@@ -1167,14 +1256,36 @@ async function acceptSessionInner(opts: Parameters<typeof acceptSession>[0], sel
   let finishWire = "";
   let accepted: ReturnType<typeof gateAccept3>;
   try {
-    helloWire = await opts.pipe.read(wait);
+    // V3-8: first-byte timeout. If nothing at all arrives in firstByteMs, give up on this
+    // connection: the catch below releases the slot (once) and holds it silent until the
+    // original deadline. Bytes arriving later are ignored (the pending read result is dropped).
+    const fb = opts.firstByteMs ?? 2000;
+    let fbTimer: ReturnType<typeof setTimeout> | undefined;
+    const fbAbort =
+      fb > 0 && fb < wait && opts.pipe.firstByte
+        ? new Promise<never>((_, reject) => {
+            fbTimer = setTimeout(() => {
+              halfOpen.firstByteTimeouts += 1;
+              reject(new Error("first byte timeout"));
+            }, fb);
+            opts.pipe.firstByte!.then(() => clearTimeout(fbTimer), () => undefined);
+          })
+        : null;
+    try {
+      helloWire = fbAbort ? await Promise.race([opts.pipe.read(wait), fbAbort]) : await opts.pipe.read(wait);
+    } finally {
+      if (fbTimer) clearTimeout(fbTimer);
+    }
     pending = await gateRespond3(self, opts.peers, helloWire, { token: opts.token, kdf: opts.kdf, sourceIp: opts.sourceIp });
     await opts.pipe.write(pending.serverWire);
     finishWire = await opts.pipe.read(Math.max(1, deadline - Date.now()));
     accepted = gateAccept3(pending, finishWire);
   } catch {
-    const rest = deadline - Date.now();
-    if (rest > 0) await new Promise((r) => setTimeout(r, rest));
+    // V3-5: free the half-open slot now; the connection itself stays silent until the
+    // original deadline, so nothing changes on the wire.
+    if (deadline - Date.now() > 0) halfOpen.earlyReleased += 1;
+    release();
+    await holdSilent(opts.pipe, deadline, maxSilent, false, opts.onSilent);
     throw new Error("握手超时");
   }
   const matched = pending.peerId;

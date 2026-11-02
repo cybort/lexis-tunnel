@@ -376,12 +376,44 @@ export function ConfigPanel() {
               onChange={(e) => patch({ link: { ...profile.link, maxHalfOpen: Number(e.target.value) } })}
             />
           </Field>
-          <Field label="每地址半开">
+          <Field label="每网段半开">
             <input
               className={control}
               inputMode="numeric"
               value={profile.link.maxHalfOpenPerIp}
               onChange={(e) => patch({ link: { ...profile.link, maxHalfOpenPerIp: Number(e.target.value) } })}
+            />
+          </Field>
+          <Field label="网段长度 IPv4">
+            <input
+              className={control}
+              inputMode="numeric"
+              value={profile.link.halfOpenPrefixV4}
+              onChange={(e) => patch({ link: { ...profile.link, halfOpenPrefixV4: Number(e.target.value) } })}
+            />
+          </Field>
+          <Field label="网段长度 IPv6">
+            <input
+              className={control}
+              inputMode="numeric"
+              value={profile.link.halfOpenPrefixV6}
+              onChange={(e) => patch({ link: { ...profile.link, halfOpenPrefixV6: Number(e.target.value) } })}
+            />
+          </Field>
+          <Field label="静默连接上限">
+            <input
+              className={control}
+              inputMode="numeric"
+              value={profile.link.maxSilent}
+              onChange={(e) => patch({ link: { ...profile.link, maxSilent: Number(e.target.value) } })}
+            />
+          </Field>
+          <Field label="首字节超时（毫秒，0 关闭）">
+            <input
+              className={control}
+              inputMode="numeric"
+              value={profile.link.firstByteMs}
+              onChange={(e) => patch({ link: { ...profile.link, firstByteMs: Number(e.target.value) } })}
             />
           </Field>
           <Field label="UDP 空闲（秒）">
@@ -402,7 +434,7 @@ export function ConfigPanel() {
           </Field>
         </div>
         <p className="mt-2 text-sm text-mist">
-          握手口令在 Argon2 之前参与问候。估约 {estimateTokenBits(profile.link.token.trim())} bit，需要至少 128。两端写成同一个。手写短口令会被常驻进程拒绝。半开超限的连接和坏问候一样，等到握手超时再关，外面看不出差别。校验关掉时，外层 TLS 认不出对端，正式部署请换自己的证书。
+          握手口令在 Argon2 之前参与问候。估约 {estimateTokenBits(profile.link.token.trim())} bit，需要至少 128。两端写成同一个。手写短口令会被常驻进程拒绝。半开按网段计，IPv4 默认 /24，IPv6 默认 /64，写成 32 和 128 就回到按单个地址。校验失败会马上让出名额，连接仍等到握手超时再关，外面看不出差别。一个字节都没有的连接，到首字节超时也会让出名额，晚到的字节不再处理。静默连接超过上限才会马上关掉，这是外面能看出来的。半开中的连接也占连接上限，所以连接上限要大于半开上限。新配置默认 1024 和 512。旧配置里写死 128 的，要自己改大。校验关掉时，外层 TLS 认不出对端，正式部署请换自己的证书。
         </p>
         <div className="mt-4 rounded-sm bg-panel-2 p-3">
           <p className="text-sm text-mist">本机身份</p>

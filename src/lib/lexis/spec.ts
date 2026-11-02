@@ -1,12 +1,18 @@
-/** LEXIS codebook-CTR v1. Wire image is prose; secrecy is the session key. */
+/** LEXIS 3.x. Wire image is prose; secrecy is the session key.
+ * Wire format: HCTR2 wide-block + keyed rANS corpus words (v2/frame2.ts, v2/handshake3.ts).
+ * `lexiconSize` / `bitsPerWord` / `mac*` below describe the legacy v1 codebook record layer
+ * (seal.ts, lexicon.ts), which is still in the lib but not used on the wire. */
 
 export const SPEC = {
-  name: "lexis-codebook-ctr-v1",
-  curve: "P-256",
+  name: "lexis-hctr2-rans-v3",
+  /** Sidecar `cipher` values written by older builds; recognised on import. */
+  legacyNames: ["lexis-codebook-ctr-v1", "lexis-hctr2-rans-v2"] as readonly string[],
+  curve: "X25519",
   kdf: "Argon2id",
   expand: "HKDF-SHA-256",
   mac: "HMAC-SHA-256",
   macBytes: 16,
+  /** legacy v1 codebook size (seal.ts); the v3 vocabulary is the corpus model (v2/model.ts). */
   lexiconSize: 4096,
   bitsPerWord: 12,
   windowSec: 300,

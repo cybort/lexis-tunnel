@@ -3,7 +3,6 @@
  * nothing here compares a key against a list.
  */
 import { x25519 } from "@noble/curves/ed25519.js";
-import { p256 } from "@noble/curves/nist.js";
 import { argon2id } from "@noble/hashes/argon2.js";
 import { concat, randomBytes, u32be, utf8, b64, unb64 } from "./bytes";
 import { hkdf, hmac, identityFromJwks, type KeyMaterial } from "./crypto";
@@ -272,7 +271,8 @@ function unb64url(text: string): Uint8Array {
 
 /** Scalar bytes of an unlocked key. Absent after a sealed key is reloaded. */
 export function freshScalar(): Uint8Array {
-  return p256.utils.randomSecretKey();
+  // 3.0: identities are X25519; any 32 random bytes are a valid seed (clamped at use).
+  return crypto.getRandomValues(new Uint8Array(32));
 }
 
 export function privateScalar(jwk: JsonWebKey): Uint8Array {

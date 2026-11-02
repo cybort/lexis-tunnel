@@ -2,12 +2,12 @@ import { i as __toESM } from "../_runtime.mjs";
 import { q as require_react, x as require_jsx_runtime, y as Link } from "../_libs/@tanstack/react-router+[...].mjs";
 import { a as Radio, c as ArrowRight, n as Trash2, s as Download } from "../_libs/lucide-react.mjs";
 import { n as persist, r as create, t as createJSONStorage } from "../_libs/zustand.mjs";
-import { i as x25519, n as ed25519, t as p256 } from "../_libs/noble__curves+noble__hashes.mjs";
+import { r as x25519, t as ed25519 } from "../_libs/noble__curves+noble__hashes.mjs";
 import { i as argon2id, n as hkdf, r as hmac, t as sha256 } from "../_libs/noble__hashes.mjs";
 import { n as unsafe, r as polyval, t as ctr } from "../_libs/noble__ciphers.mjs";
 import { t as require_index_node } from "../_libs/bokuweb__zstd-wasm.mjs";
 import { a as Cell, i as Bar, n as YAxis, o as ResponsiveContainer, r as XAxis, s as Tooltip, t as BarChart } from "../_libs/recharts+[...].mjs";
-//#region node_modules/.nitro/vite/services/ssr/assets/routes-BVNBR6CP.js
+//#region node_modules/.nitro/vite/services/ssr/assets/routes-JRFnRHoy.js
 var import_react = /* @__PURE__ */ __toESM(require_react());
 var import_jsx_runtime = require_jsx_runtime();
 var import_index_node = require_index_node();
@@ -116,7 +116,7 @@ async function createIdentity() {
 			fingerprint: await fingerprintOf(publicRaw)
 		};
 	} catch {
-		const { x25519 } = await import("../_libs/noble__curves+noble__hashes.mjs").then((n) => n.r);
+		const { x25519 } = await import("../_libs/noble__curves+noble__hashes.mjs").then((n) => n.n);
 		const d = crypto.getRandomValues(/* @__PURE__ */ new Uint8Array(32));
 		const x = x25519.getPublicKey(d);
 		return {
@@ -195,7 +195,7 @@ async function identityFromJwks(publicJwk, privateJwk) {
 	if (privateJwk.kty !== "OKP" || privateJwk.crv !== "X25519" || !privateJwk.d) throw new LexisError("侧车里的私钥不是 X25519");
 	const publicRaw = jwkOkpToRaw(publicJwk);
 	const seed = b64urlDecode(privateJwk.d);
-	const { x25519 } = await import("../_libs/noble__curves+noble__hashes.mjs").then((n) => n.r);
+	const { x25519 } = await import("../_libs/noble__curves+noble__hashes.mjs").then((n) => n.n);
 	const expect = x25519.getPublicKey(seed);
 	if (publicRaw.length !== 32 || !expect.every((b, i) => b === publicRaw[i])) throw new LexisError("侧车里的私钥和公钥不是一对");
 	return {
@@ -205,14 +205,20 @@ async function identityFromJwks(publicJwk, privateJwk) {
 		fingerprint: await fingerprintOf(publicRaw)
 	};
 }
-/** LEXIS codebook-CTR v1. Wire image is prose; secrecy is the session key. */
+/** LEXIS 3.x. Wire image is prose; secrecy is the session key.
+* Wire format: HCTR2 wide-block + keyed rANS corpus words (v2/frame2.ts, v2/handshake3.ts).
+* `lexiconSize` / `bitsPerWord` / `mac*` below describe the legacy v1 codebook record layer
+* (seal.ts, lexicon.ts), which is still in the lib but not used on the wire. */
 var SPEC = {
-	name: "lexis-codebook-ctr-v1",
-	curve: "P-256",
+	name: "lexis-hctr2-rans-v3",
+	/** Sidecar `cipher` values written by older builds; recognised on import. */
+	legacyNames: ["lexis-codebook-ctr-v1", "lexis-hctr2-rans-v2"],
+	curve: "X25519",
 	kdf: "Argon2id",
 	expand: "HKDF-SHA-256",
 	mac: "HMAC-SHA-256",
 	macBytes: 16,
+	/** legacy v1 codebook size (seal.ts); the v3 vocabulary is the corpus model (v2/model.ts). */
 	lexiconSize: 4096,
 	bitsPerWord: 12,
 	windowSec: 300,
@@ -375,9 +381,10 @@ function sidecarOf(node, peer) {
 		pinnedPeerPublicJwk: peer?.publicJwk ?? null,
 		windowSeconds: SPEC.windowSec,
 		lexiconSize: SPEC.lexiconSize,
-		handshake: "p256-ecdh-argon2id",
+		curve: SPEC.curve,
+		handshake: "x25519-noise-nk-argon2id",
 		kdf: node.kdf,
-		wire: "secret-lexicon-prose"
+		wire: "hctr2-rans-prose"
 	};
 }
 function downloadJson(filename, data) {
@@ -885,7 +892,7 @@ async function openIdentityVault(vault, passphrase) {
 }
 /** Scalar bytes of an unlocked key. Absent after a sealed key is reloaded. */
 function freshScalar() {
-	return p256.utils.randomSecretKey();
+	return crypto.getRandomValues(/* @__PURE__ */ new Uint8Array(32));
 }
 function programToStored(program) {
 	return {
@@ -1129,7 +1136,7 @@ function defaultProfile() {
 		link: {
 			token: "",
 			idleMs: 12e4,
-			maxConns: 128,
+			maxConns: 1024,
 			headerBytes: 8192,
 			allowLan: false,
 			handshakeMs: 1e4,
@@ -1137,8 +1144,12 @@ function defaultProfile() {
 			maxHandshakes: 2,
 			udpIdleMs: 6e4,
 			udpMax: 64,
-			maxHalfOpen: 64,
-			maxHalfOpenPerIp: 8
+			maxHalfOpen: 512,
+			maxHalfOpenPerIp: 8,
+			halfOpenPrefixV4: 24,
+			halfOpenPrefixV6: 64,
+			maxSilent: 1024,
+			firstByteMs: 2e3
 		},
 		egress: {
 			blockPrivate: true,
@@ -1230,7 +1241,11 @@ function normalizeProfile(input) {
 			udpIdleMs: clampNum(raw.link?.udpIdleMs, 1e3, 6e5, base.link.udpIdleMs),
 			udpMax: clampNum(raw.link?.udpMax, 4, 4096, base.link.udpMax),
 			maxHalfOpen: clampNum(raw.link?.maxHalfOpen, 1, 1e4, base.link.maxHalfOpen),
-			maxHalfOpenPerIp: clampNum(raw.link?.maxHalfOpenPerIp, 1, 1024, base.link.maxHalfOpenPerIp)
+			maxHalfOpenPerIp: clampNum(raw.link?.maxHalfOpenPerIp, 1, 1024, base.link.maxHalfOpenPerIp),
+			halfOpenPrefixV4: clampNum(raw.link?.halfOpenPrefixV4, 0, 32, base.link.halfOpenPrefixV4),
+			halfOpenPrefixV6: clampNum(raw.link?.halfOpenPrefixV6, 0, 128, base.link.halfOpenPrefixV6),
+			maxSilent: clampNum(raw.link?.maxSilent, 0, 1e5, base.link.maxSilent),
+			firstByteMs: clampNum(raw.link?.firstByteMs, 0, 6e4, base.link.firstByteMs)
 		},
 		egress: {
 			blockPrivate: raw.egress?.blockPrivate !== false,
@@ -1593,6 +1608,7 @@ function mintHandshakeToken() {
 function profileIssues(profile) {
 	const issues = [];
 	if (profile.role !== "edge" && profile.role !== "gate") issues.push("常驻进程不接受缺省角色。写成 edge 或 gate");
+	if (profile.link.maxConns < profile.link.maxHalfOpen) issues.push(`连接上限 ${profile.link.maxConns} 小于半开上限 ${profile.link.maxHalfOpen}。半开中的连接也占连接上限，实际半开会被截住。建议连接上限至少比半开上限大出平时的会话数`);
 	const statusHost = profile.statusHost.trim().toLowerCase();
 	if (!(statusHost === "127.0.0.1" || statusHost === "::1" || statusHost === "localhost") && !profile.statusToken.trim()) issues.push("状态页不在回环上，要填状态口令，否则指标和页面会拒绝");
 	const seen = /* @__PURE__ */ new Set();
@@ -1709,8 +1725,23 @@ function bigToLe(x, len = 32) {
 	return out;
 }
 function isSquare(x) {
-	if (x === 0n) return true;
-	return Fp.pow(x, HALF) === 1n;
+	let a = Fp.create(x);
+	if (a === 0n) return true;
+	let n = p;
+	let r = 1;
+	while (a !== 0n) {
+		while ((a & 1n) === 0n) {
+			a >>= 1n;
+			const m = n & 7n;
+			if (m === 3n || m === 5n) r = -r;
+		}
+		const t = a;
+		a = n;
+		n = t;
+		if ((a & 3n) === 3n && (n & 3n) === 3n) r = -r;
+		a %= n;
+	}
+	return n === 1n && r === 1;
 }
 function clampScalar(seed) {
 	const s = seed.slice();
@@ -1729,15 +1760,109 @@ function elligatorMap(rep) {
 function rand$1(n) {
 	return crypto.getRandomValues(new Uint8Array(n));
 }
+var PKCS8 = Uint8Array.from([
+	48,
+	46,
+	2,
+	1,
+	0,
+	48,
+	5,
+	6,
+	3,
+	43,
+	101,
+	110,
+	4,
+	34,
+	4,
+	32
+]);
+var SPKI = Uint8Array.from([
+	48,
+	42,
+	48,
+	5,
+	6,
+	3,
+	43,
+	101,
+	110,
+	3,
+	33,
+	0
+]);
+var privCache = /* @__PURE__ */ new Map();
+/** cacheKey: only for long-term (static) keys; ephemeral secrets are never kept. */
+function nativeShared(c, seed, u, cacheKey = false) {
+	const sk = cacheKey ? Buffer.from(seed.buffer, seed.byteOffset, seed.byteLength).toString("hex") : "";
+	let priv = cacheKey ? privCache.get(sk) : void 0;
+	if (!priv) {
+		priv = c.createPrivateKey({
+			key: Buffer.concat([PKCS8, seed]),
+			format: "der",
+			type: "pkcs8"
+		});
+		if (cacheKey) {
+			if (privCache.size >= 8) privCache.clear();
+			privCache.set(sk, priv);
+		}
+	}
+	const pub = c.createPublicKey({
+		key: Buffer.concat([SPKI, u]),
+		format: "der",
+		type: "spki"
+	});
+	const out = new Uint8Array(c.diffieHellman({
+		privateKey: priv,
+		publicKey: pub
+	}));
+	if (out.every((b) => b === 0)) throw new Error("x25519 low-order");
+	return out;
+}
+function nativeEphemeral(c, seed) {
+	const priv = c.createPrivateKey({
+		key: Buffer.concat([PKCS8, seed]),
+		format: "der",
+		type: "pkcs8"
+	});
+	const jwk = c.createPublicKey(priv).export({ format: "jwk" });
+	return new Uint8Array(Buffer.from(jwk.x, "base64url"));
+}
+var nodeCrypto = (() => {
+	try {
+		const c = globalThis.process?.getBuiltinModule?.("node:crypto");
+		if (!c?.diffieHellman) return null;
+		const s = (/* @__PURE__ */ new Uint8Array(32)).fill(7);
+		const u = x25519.getPublicKey((/* @__PURE__ */ new Uint8Array(32)).fill(9));
+		const a = nativeShared(c, s, u);
+		const b = x25519.getSharedSecret(s, u);
+		return a.every((v, i) => v === b[i]) ? c : null;
+	} catch {
+		return null;
+	}
+})();
+function x25519Shared(seed, u, staticKey = false) {
+	return nodeCrypto ? nativeShared(nodeCrypto, seed, u, staticKey) : x25519.getSharedSecret(seed, u);
+}
+var T8M = [ed25519.Point.ZERO, ...Array.from({ length: 7 }, (_, i) => T8.multiplyUnsafe(BigInt(i + 1)))];
+/** Edwards point for the X25519 public key of `seed`: clean u natively, then lift to Edwards (either
+* sign of x; u(-P + kT) = u(P - kT) = u(P + (8-k)T), so the dirty-u distribution over random k is
+* unchanged and X25519 results with the clamped scalar are unaffected). */
+function cleanEdwards(seed) {
+	if (!nodeCrypto) return ed25519.Point.BASE.multiply(clampScalar(seed) % N);
+	const u = leBytesToBig(nativeEphemeral(nodeCrypto, seed));
+	const y = Fp.mul(Fp.sub(u, 1n), Fp.inv(Fp.add(u, 1n)));
+	return ed25519.Point.fromBytes(bigToLe(y));
+}
 /** Retry until the dirty public key is representable on a randomly chosen branch. */
 function elligatorKeyPair() {
 	for (let tries = 0; tries < 256; tries++) {
 		const seed = rand$1(32);
-		const s = clampScalar(seed);
 		const extra = rand$1(2);
-		const k = BigInt(extra[0] & 7);
-		let Pe = ed25519.Point.BASE.multiply(s % N);
-		if (k > 0n) Pe = Pe.add(T8.multiplyUnsafe(k));
+		const k = extra[0] & 7;
+		let Pe = cleanEdwards(seed);
+		if (k > 0) Pe = Pe.add(T8M[k]);
 		const y = Pe.toAffine().y;
 		if (y === 1n) continue;
 		const u = Fp.mul(Fp.add(1n, y), Fp.inv(Fp.sub(1n, y)));
@@ -1759,12 +1884,12 @@ function elligatorKeyPair() {
 	throw new Error("elligator key generation failed");
 }
 /** X25519 with our seed and the peer's representative. */
-function sharedFromRep(seed, peerRep) {
-	return x25519.getSharedSecret(seed, elligatorMap(peerRep));
+function sharedFromRep(seed, peerRep, staticKey = false) {
+	return x25519Shared(seed, elligatorMap(peerRep), staticKey);
 }
 /** X25519 with our seed and a raw 32-byte peer public key (long-term or mapped). */
-function sharedFromPub(seed, peerPub) {
-	return x25519.getSharedSecret(seed, peerPub);
+function sharedFromPub(seed, peerPub, staticKey = false) {
+	return x25519Shared(seed, peerPub, staticKey);
 }
 /**
 * HCTR2 (Crowley, Huckleberry, Biggers 2021) over AES-256: a tweakable,
@@ -2505,7 +2630,7 @@ async function gateRespond3(gate, peers, helloWire, opts = {}) {
 	if (bytes.length < 101) fail("parse");
 	const repC = bytes.slice(0, 32);
 	const ct = bytes.subarray(32);
-	const es = sharedFromRep(gateSeed, repC);
+	const es = sharedFromRep(gateSeed, repC, true);
 	const ikm = helloIkm(opts.token || "", es);
 	let body = null;
 	let window = 0;
@@ -2540,7 +2665,7 @@ async function gateRespond3(gate, peers, helloWire, opts = {}) {
 	}
 	let ssS;
 	try {
-		ssS = sharedFromPub(gateSeed, ltC);
+		ssS = sharedFromPub(gateSeed, ltC, true);
 	} catch {
 		return fail("point");
 	}
@@ -4166,7 +4291,7 @@ function ConfigPanel() {
 								})
 							}),
 							/* @__PURE__ */ (0, import_jsx_runtime.jsx)(Field, {
-								label: "每地址半开",
+								label: "每网段半开",
 								children: /* @__PURE__ */ (0, import_jsx_runtime.jsx)("input", {
 									className: control,
 									inputMode: "numeric",
@@ -4174,6 +4299,54 @@ function ConfigPanel() {
 									onChange: (e) => patch({ link: {
 										...profile.link,
 										maxHalfOpenPerIp: Number(e.target.value)
+									} })
+								})
+							}),
+							/* @__PURE__ */ (0, import_jsx_runtime.jsx)(Field, {
+								label: "网段长度 IPv4",
+								children: /* @__PURE__ */ (0, import_jsx_runtime.jsx)("input", {
+									className: control,
+									inputMode: "numeric",
+									value: profile.link.halfOpenPrefixV4,
+									onChange: (e) => patch({ link: {
+										...profile.link,
+										halfOpenPrefixV4: Number(e.target.value)
+									} })
+								})
+							}),
+							/* @__PURE__ */ (0, import_jsx_runtime.jsx)(Field, {
+								label: "网段长度 IPv6",
+								children: /* @__PURE__ */ (0, import_jsx_runtime.jsx)("input", {
+									className: control,
+									inputMode: "numeric",
+									value: profile.link.halfOpenPrefixV6,
+									onChange: (e) => patch({ link: {
+										...profile.link,
+										halfOpenPrefixV6: Number(e.target.value)
+									} })
+								})
+							}),
+							/* @__PURE__ */ (0, import_jsx_runtime.jsx)(Field, {
+								label: "静默连接上限",
+								children: /* @__PURE__ */ (0, import_jsx_runtime.jsx)("input", {
+									className: control,
+									inputMode: "numeric",
+									value: profile.link.maxSilent,
+									onChange: (e) => patch({ link: {
+										...profile.link,
+										maxSilent: Number(e.target.value)
+									} })
+								})
+							}),
+							/* @__PURE__ */ (0, import_jsx_runtime.jsx)(Field, {
+								label: "首字节超时（毫秒，0 关闭）",
+								children: /* @__PURE__ */ (0, import_jsx_runtime.jsx)("input", {
+									className: control,
+									inputMode: "numeric",
+									value: profile.link.firstByteMs,
+									onChange: (e) => patch({ link: {
+										...profile.link,
+										firstByteMs: Number(e.target.value)
 									} })
 								})
 							}),
@@ -4208,7 +4381,7 @@ function ConfigPanel() {
 						children: [
 							"握手口令在 Argon2 之前参与问候。估约 ",
 							estimateTokenBits(profile.link.token.trim()),
-							" bit，需要至少 128。两端写成同一个。手写短口令会被常驻进程拒绝。半开超限的连接和坏问候一样，等到握手超时再关，外面看不出差别。校验关掉时，外层 TLS 认不出对端，正式部署请换自己的证书。"
+							" bit，需要至少 128。两端写成同一个。手写短口令会被常驻进程拒绝。半开按网段计，IPv4 默认 /24，IPv6 默认 /64，写成 32 和 128 就回到按单个地址。校验失败会马上让出名额，连接仍等到握手超时再关，外面看不出差别。一个字节都没有的连接，到首字节超时也会让出名额，晚到的字节不再处理。静默连接超过上限才会马上关掉，这是外面能看出来的。半开中的连接也占连接上限，所以连接上限要大于半开上限。新配置默认 1024 和 512。旧配置里写死 128 的，要自己改大。校验关掉时，外层 TLS 认不出对端，正式部署请换自己的证书。"
 						]
 					}),
 					/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", {
@@ -5634,8 +5807,9 @@ function NodesPanel() {
 		setError(null);
 		try {
 			const data = JSON.parse(await file.text());
-			if (data.lo && data.hi && typeof data.saltB64 === "string" && data.cipher !== SPEC.name) throw new LexisError("这是封存文件，不是侧车。放到常驻目录，命名为 lexis.seal.json，不要和公钥写在一起。");
-			if (data.cipher !== SPEC.name) throw new LexisError("这不是词隙侧车");
+			const known = data.cipher === SPEC.name || SPEC.legacyNames.includes(String(data.cipher));
+			if (data.lo && data.hi && typeof data.saltB64 === "string" && !known) throw new LexisError("这是封存文件，不是侧车。放到常驻目录，命名为 lexis.seal.json，不要和公钥写在一起。");
+			if (!known) throw new LexisError("这不是词隙侧车");
 			if (data.role !== "gate" && data.role !== "edge") throw new LexisError("角色不对");
 			const ident = await materialFromSidecar(data);
 			const node = {
@@ -6030,7 +6204,7 @@ var STEPS = [
 	{
 		n: "02",
 		title: "临时密钥握出会话密钥",
-		body: "内网端主动连出。问候用临时密钥和闸门长期公钥算出的共享秘密来加密，只拿口令和闸门公钥解不出里面的长期公钥。会话密钥还混入两把临时密钥的共享秘密，再交给 Argon2id。握手确认用这个临时秘密来算，不再是公开的转录。这一层不是 TLS。两端都要是 3.0.0。"
+		body: "内网端主动连出。问候用临时密钥和闸门长期公钥算出的共享秘密来加密，只拿口令和闸门公钥解不出里面的长期公钥。会话密钥还混入两把临时密钥的共享秘密，再交给 Argon2id。握手确认用这个临时秘密来算，不再是公开的转录。这一层不是 TLS。帧仍是这一版。安装包是 3.0.2，和 3.0.0 的帧对得上。"
 	},
 	{
 		n: "03",
@@ -6103,7 +6277,7 @@ function Overview({ onOpen }) {
 					}, title))
 				}), /* @__PURE__ */ (0, import_jsx_runtime.jsx)("p", {
 					className: "mt-4 text-sm text-mist",
-					children: "浏览器里不能守一个真正的 TCP 端口。这条控制台把握手和封装按 3.0 跑完，和下载的常驻进程是同一套帧。两端都要是这一版，口令至少 128 比特，长期密钥都是 X25519。TLS 和 WebSocket 只包在外面，方便过 CDN。安装包不再附带 TLS 私钥。时钟对不齐时，时间窗两边各留 120 秒。HTTP 代理按每个请求重写，去掉代理认证，并拒绝长度和分块写在一起。状态页在回环上可以看指标；离开回环要状态口令，健康检查仍然公开。Linux 上的用户态栈会切段、重传、暂存一段乱序，并按对端窗口停发。系统接管时，53 端口的查询答成 198.18.0.0/15 里的假地址，再映射回域名，假地址本身不会被拨出去。这不是 gVisor，也没有在这台机器上证明虚拟网卡或透明代理已经接住流量。Windows 的 WinDivert 只有源码，驱动不在包里。Android 只带 VpnService 源码和本机包通道，没有装好的系统 VPN。中继默认关闭。缺了角色的配置不会被当成边缘。"
+					children: "浏览器里不能守一个真正的 TCP 端口。这条控制台把握手和封装按 3.0 跑完，和下载的常驻进程是同一套帧。安装包是 3.0.2，和 3.0.0 的帧对得上。口令至少 128 比特，长期密钥都是 X25519。闸门半开按网段计，默认全局 512、每段 8，连接上限默认 1024。坏问候会马上让出名额，连接仍静默到握手超时；一个字节都不到，两秒后也会让出名额。静默连接堆过 1024 才会马上关掉。这不是系统层的建连限速，也不是 gVisor。TLS 和 WebSocket 只包在外面，方便过 CDN。安装包不再附带 TLS 私钥。时钟对不齐时，时间窗两边各留 120 秒。HTTP 代理按每个请求重写，去掉代理认证，并拒绝长度和分块写在一起。状态页在回环上可以看指标；离开回环要状态口令，健康检查仍然公开。Linux 上的用户态栈会切段、重传、暂存一段乱序，并按对端窗口停发。系统接管时，53 端口的查询答成 198.18.0.0/15 里的假地址，再映射回域名，假地址本身不会被拨出去。没有在这台机器上证明虚拟网卡或透明代理已经接住流量。Windows 的 WinDivert 只有源码，驱动不在包里。Android 只带 VpnService 源码和本机包通道，没有装好的系统 VPN。中继默认关闭。缺了角色的配置不会被当成边缘。"
 				})]
 			}),
 			/* @__PURE__ */ (0, import_jsx_runtime.jsx)("div", {

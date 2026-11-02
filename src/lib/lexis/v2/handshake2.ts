@@ -1,4 +1,9 @@
 /**
+ * @deprecated 2.x (lexis-hctr2-rans-v2) hello with the long-term key in the hello body.
+ * Superseded by handshake3 (Noise-NK `es`, X25519 long-term keys) in 3.0; nothing in the agent
+ * or the web app imports this module any more. Kept only for reference; do not use.
+ */
+/**
  * T19 + T21: handshake v2.
  *
  * hello  = words_H( repC(32) || HCTR2(K_h, "hello"|w, admitC || ltC || nonceC || kdf || feat || pad) )

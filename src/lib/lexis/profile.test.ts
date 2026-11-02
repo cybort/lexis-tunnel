@@ -43,7 +43,7 @@ assert.equal(matchRoute(custom, { ip: "203.0.113.9" }).action, "direct");
 
 const upgraded = normalizeProfile({ version: 1, role: "gate" });
 assert.equal(upgraded.link.idleMs, 120000);
-assert.equal(upgraded.link.maxConns, 128);
+assert.equal(upgraded.link.maxConns, 1024);
 assert.equal(upgraded.egress.blockPrivate, true);
 assert.equal(upgraded.outer.transport, "tcp");
 assert.equal(upgraded.outer.wsPath, "/lexis");
@@ -91,7 +91,11 @@ assert.equal(defaultProfile().frame.smallFramePolicy, "expansion");
 assert.equal(defaultProfile().frame.coalesceTarget, 1024);
 assert.equal(defaultProfile().link.udpIdleMs, 60000);
 assert.equal(defaultProfile().link.udpMax, 64);
-assert.equal(defaultProfile().link.maxHalfOpen, 64);
+assert.equal(defaultProfile().link.maxHalfOpen, 512);
+assert.equal(defaultProfile().link.halfOpenPrefixV4, 24);
+assert.equal(defaultProfile().link.halfOpenPrefixV6, 64);
+assert.equal(defaultProfile().link.maxSilent, 1024);
+assert.equal(defaultProfile().link.firstByteMs, 2000);
 assert.equal(defaultProfile().link.maxHalfOpenPerIp, 8);
 const framed = normalizeProfile({ frame: { maxExpansion: 99, smallFramePolicy: "honey", coalesceTarget: 8 }, link: { udpIdleMs: 50, udpMax: 1 } });
 assert.equal(framed.frame.maxExpansion, 5);
@@ -110,3 +114,13 @@ const strongJoin = normalizeProfile({ ...weakJoin, link: { ...weakJoin.link, tok
 assert.equal(profileIssues(strongJoin).some((item) => item.includes("口令")), false);
 
 console.log("profile ok");
+{
+  const p = normalizeProfile({ link: { halfOpenPrefixV4: 16, halfOpenPrefixV6: 48, maxSilent: 0, firstByteMs: 0 } });
+  assert.deepEqual([p.link.halfOpenPrefixV4, p.link.halfOpenPrefixV6, p.link.maxSilent, p.link.firstByteMs], [16, 48, 0, 0]);
+  const bad = normalizeProfile({ link: { halfOpenPrefixV4: 33, halfOpenPrefixV6: 129, maxSilent: -1, firstByteMs: 1.5 } });
+  assert.deepEqual([bad.link.halfOpenPrefixV4, bad.link.halfOpenPrefixV6, bad.link.maxSilent, bad.link.firstByteMs], [24, 64, 1024, 2000]);
+  const tight = normalizeProfile({ link: { maxConns: 128, maxHalfOpen: 512 } });
+  assert.equal(profileIssues(tight).some((item) => item.includes("连接上限")), true);
+  assert.equal(profileIssues(defaultProfile()).some((item) => item.includes("连接上限")), false);
+  console.log("profile half-open fields ok");
+}

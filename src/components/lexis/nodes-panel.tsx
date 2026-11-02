@@ -81,10 +81,13 @@ export function NodesPanel() {
     setError(null);
     try {
       const data = JSON.parse(await file.text()) as Record<string, unknown>;
-      if (data.lo && data.hi && typeof data.saltB64 === "string" && data.cipher !== SPEC.name) {
+      // 3.0: sidecars from older builds carry an older `cipher`; accept the name, the key check
+      // below still rejects P-256 keys with a migration message.
+      const known = data.cipher === SPEC.name || SPEC.legacyNames.includes(String(data.cipher));
+      if (data.lo && data.hi && typeof data.saltB64 === "string" && !known) {
         throw new LexisError("这是封存文件，不是侧车。放到常驻目录，命名为 lexis.seal.json，不要和公钥写在一起。");
       }
-      if (data.cipher !== SPEC.name) throw new LexisError("这不是词隙侧车");
+      if (!known) throw new LexisError("这不是词隙侧车");
       if (data.role !== "gate" && data.role !== "edge") throw new LexisError("角色不对");
       const ident = await materialFromSidecar(data);
       const node: MeshNode = {

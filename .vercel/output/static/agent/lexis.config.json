@@ -102,7 +102,7 @@
   "link": {
     "token": "",
     "idleMs": 120000,
-    "maxConns": 128,
+    "maxConns": 1024,
     "headerBytes": 8192,
     "allowLan": false,
     "handshakeMs": 10000,

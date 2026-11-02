@@ -172,9 +172,10 @@ export function sidecarOf(node: MeshNode, peer: MeshNode | undefined) {
     pinnedPeerPublicJwk: peer?.publicJwk ?? null,
     windowSeconds: SPEC.windowSec,
     lexiconSize: SPEC.lexiconSize,
-    handshake: "p256-ecdh-argon2id",
+    curve: SPEC.curve,
+    handshake: "x25519-noise-nk-argon2id",
     kdf: node.kdf,
-    wire: "secret-lexicon-prose",
+    wire: "hctr2-rans-prose",
   };
 }
 

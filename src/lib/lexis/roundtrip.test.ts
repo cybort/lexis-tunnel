@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { fromUtf8, utf8 } from "./bytes";
 import { decodeStatic, encodeStatic } from "./codec";
 import { shannonEntropy } from "./entropy";
-import { establish } from "./handshake";
+import { establish3 } from "./handshake";
 import { LexisError } from "./crypto";
 import { sessionLexicon } from "./lexicon";
 import { decodeRecord, encodeRecord, RECORD } from "./records";
@@ -11,6 +11,11 @@ import { b64 } from "./bytes";
 import { createIdentity } from "./crypto";
 import { SPEC } from "./spec";
 import type { MeshNode } from "./types";
+
+// 3.0: the v1 hello (P-256 era) is gone; the browser lab and this test use the v3 handshake.
+const TOKEN = "roundtrip-test-token-7c1e9a2b4d6f8011";
+const FAST = { memoryKiB: 32, iterations: 1, parallelism: 1, honey: false };
+const establish = (e: MeshNode, g: MeshNode) => establish3(e, g, Date.now(), FAST, TOKEN);
 
 async function makeNode(name: string, role: MeshNode["role"]): Promise<MeshNode> {
   const key = await createIdentity();
@@ -45,17 +50,24 @@ async function main() {
   const session = await establish(edge, gate);
   const elapsed = Date.now() - t0;
   console.log("handshake+lexicon ms", elapsed);
-  assert.equal(session.lexicon.length, SPEC.lexiconSize);
-  assert.equal(session.inverse.size, SPEC.lexiconSize);
+  // v3 session vocabulary is the keyed corpus model (VOCAB_SIZE words), not the v1 4096 codebook
+  assert.ok(session.lexicon.length >= SPEC.lexiconSize, `vocab ${session.lexicon.length}`);
+  assert.equal(session.inverse.size, session.lexicon.length);
+  assert.ok(session.v2, "v3 frame keys present");
 
+  // legacy v1 codebook record layer (seal/open) still ships in the lib; exercise it with its own lexicon
+  const v1lex = await sessionLexicon(session.sk, session.window);
+  assert.equal(v1lex.length, SPEC.lexiconSize);
+  const v1inv = new Map<string, number>();
+  v1lex.forEach((w, i) => v1inv.set(w, i));
   const other = await sessionLexicon(session.sk, session.window + 1);
-  assert.notDeepEqual(session.lexicon.slice(0, 12), other.slice(0, 12));
+  assert.notDeepEqual(v1lex.slice(0, 12), other.slice(0, 12));
 
   const http = utf8("GET /health HTTP/1.1\r\nHost: 127.0.0.1:8080\r\n\r\n");
   const frame = encodeRecord(RECORD.data, 7, 1, http);
   const prose = await seal({
     key: session.sk,
-    lexicon: session.lexicon,
+    lexicon: v1lex,
     counter: 1,
     window: session.window,
     direction: "g2e",
@@ -71,7 +83,7 @@ async function main() {
 
   const opened = await open({
     key: session.sk,
-    inverse: session.inverse,
+    inverse: v1inv,
     window: session.window,
     direction: "g2e",
     prose,
@@ -86,7 +98,7 @@ async function main() {
     () =>
       open({
         key: session.sk,
-        inverse: session.inverse,
+        inverse: v1inv,
         window: session.window,
         direction: "g2e",
         prose,
@@ -112,7 +124,7 @@ async function main() {
   await assert.rejects(() =>
     open({
       key: session.sk,
-      inverse: session.inverse,
+      inverse: v1inv,
       window: session.window,
       direction: "g2e",
       prose: flipped,

@@ -48,6 +48,7 @@ const state = {
   errors: [],
 };
 const metrics = { httpOk: 0, httpReject: 0, smuggle: 0, transparent: 0, tunPackets: 0 };
+let tunStalls = 0;
 let remoteGeosite = "";
 let remoteGeoip = "";
 let liveConns = 0;
@@ -245,15 +246,19 @@ function linkOf(config) {
   return {
     token: String(link.token || "").trim(),
     idleMs: Number.isInteger(idle) && idle >= 1000 ? idle : 120000,
-    maxConns: Number.isInteger(max) && max >= 1 ? max : 128,
+    maxConns: Number.isInteger(max) && max >= 1 ? max : 1024,
     headerBytes: Number.isInteger(header) && header >= 256 ? header : 8192,
     allowLan: link.allowLan === true,
     handshakeMs: Number.isInteger(Number(link.handshakeMs)) && Number(link.handshakeMs) >= 1000 ? Number(link.handshakeMs) : 10000,
     dialMs: Number.isInteger(Number(link.dialMs)) && Number(link.dialMs) >= 1000 ? Number(link.dialMs) : 10000,
     udpIdleMs: Number.isInteger(Number(link.udpIdleMs)) && Number(link.udpIdleMs) >= 1000 ? Number(link.udpIdleMs) : 60000,
     udpMax: Number.isInteger(Number(link.udpMax)) && Number(link.udpMax) >= 4 ? Number(link.udpMax) : 64,
-    maxHalfOpen: Number.isInteger(Number(link.maxHalfOpen)) && Number(link.maxHalfOpen) >= 1 ? Number(link.maxHalfOpen) : 64,
+    maxHalfOpen: Number.isInteger(Number(link.maxHalfOpen)) && Number(link.maxHalfOpen) >= 1 ? Number(link.maxHalfOpen) : 512,
     maxHalfOpenPerIp: Number.isInteger(Number(link.maxHalfOpenPerIp)) && Number(link.maxHalfOpenPerIp) >= 1 ? Number(link.maxHalfOpenPerIp) : 8,
+    halfOpenPrefixV4: Number.isInteger(Number(link.halfOpenPrefixV4)) && Number(link.halfOpenPrefixV4) >= 0 && Number(link.halfOpenPrefixV4) <= 32 ? Number(link.halfOpenPrefixV4) : 24,
+    halfOpenPrefixV6: Number.isInteger(Number(link.halfOpenPrefixV6)) && Number(link.halfOpenPrefixV6) >= 0 && Number(link.halfOpenPrefixV6) <= 128 ? Number(link.halfOpenPrefixV6) : 64,
+    firstByteMs: Number.isInteger(Number(link.firstByteMs)) && Number(link.firstByteMs) >= 0 ? Number(link.firstByteMs) : 2000,
+    maxSilent: Number.isInteger(Number(link.maxSilent)) && Number(link.maxSilent) >= 0 ? Number(link.maxSilent) : 1024,
     maxHandshakes: Number.isInteger(Number(link.maxHandshakes)) && Number(link.maxHandshakes) >= 1 ? Number(link.maxHandshakes) : 2,
   };
 }
@@ -274,11 +279,15 @@ function admit(socket, config, opts = {}) {
   }
   liveConns += 1;
   let closed = false;
-  socket.once("close", () => {
+  const release = () => {
     if (closed) return;
     closed = true;
     liveConns -= 1;
-  });
+  };
+  socket.once("close", release);
+  // V3-5b: a silent (failed / refused) tunnel connection stops counting toward maxConns;
+  // link.maxSilent bounds those instead.
+  socket.lexisUnadmit = release;
   return true;
 }
 
@@ -491,7 +500,9 @@ function dial(host, port, config) {
   const socket = openTcp(host, port, live);
   const onTimeout = () => {
     log("拨号超时");
-    socket.destroy();
+    // 3.0.3: destroy *with* an error so every waiter (dialTcp: connect/error) settles.
+    // A bare destroy() only emits "close", and the tun reader used to wait on that dial forever.
+    socket.destroy(new Error("拨号超时"));
   };
   socket.setTimeout(linkOf(live).dialMs || 10000);
   socket.once("timeout", onTimeout);
@@ -1006,6 +1017,11 @@ async function acceptTunnel(socket, pipeReady, config, refuse = false) {
       handshakeMs: link.handshakeMs,
       maxHalfOpen: link.maxHalfOpen,
       maxHalfOpenPerIp: link.maxHalfOpenPerIp,
+      maxSilent: link.maxSilent,
+      firstByteMs: link.firstByteMs,
+      onSilent: () => socket.lexisUnadmit?.(),
+      halfOpenPrefixV4: link.halfOpenPrefixV4,
+      halfOpenPrefixV6: link.halfOpenPrefixV6,
       refuse,
       program: programFromStored(config.honeyProgram),
       sourceIp: sourceIp(socket),
@@ -1017,7 +1033,7 @@ async function acceptTunnel(socket, pipeReady, config, refuse = false) {
     if (session.peerId) inboundSessions.set(session.peerId, session);
     await session.whenClosed();
   } catch (err) {
-    log(`隧道拒绝 ${err.message || err} (halfOpen=${halfOpen.total} refused=${halfOpen.refused})`);
+    log(`隧道拒绝 ${err.message || err} (halfOpen=${halfOpen.total} refused=${halfOpen.refused} silent=${halfOpen.silent})`);
     socket.destroy();
   } finally {
     if (session?.peerId && inboundSessions.get(session.peerId) === session) inboundSessions.delete(session.peerId);
@@ -1444,6 +1460,8 @@ function dialTcp(config, host, port) {
     const socket = dial(name, port, live);
     socket.once("connect", () => resolve(socket));
     socket.once("error", reject);
+    // 3.0.3: closed before connecting without an error event -> still settle (no-op after resolve).
+    socket.once("close", () => reject(new Error("连接关闭")));
   });
 }
 
@@ -1802,10 +1820,22 @@ function serveTun(config) {
     readFd(opened.fd, buf, 0, buf.length, null, (err, n) => {
       if (err) return;
       metrics.tunPackets += 1;
-      void engine
-        .push(Buffer.from(buf.subarray(0, n)))
-        .catch((err) => log(`虚拟网卡包处理失败：${err?.message || err}`))
-        .finally(pull);
+      // 3.0.3: one packet's processing (e.g. a dial) must never stall the whole tun reader.
+      // Packets stay in order while push settles quickly; a push slower than the cap keeps
+      // running in the background and reading resumes.
+      let capTimer;
+      const cap = new Promise((resolve) => {
+        capTimer = setTimeout(() => {
+          tunStalls += 1;
+          log("虚拟网卡包处理过慢，先继续读后面的包");
+          resolve();
+        }, linkOf(activeConfig || config).dialMs + 2000);
+      });
+      const work = engine.push(Buffer.from(buf.subarray(0, n))).catch((err) => log(`虚拟网卡包处理失败：${err?.message || err}`));
+      void Promise.race([work, cap]).finally(() => {
+        clearTimeout(capTimer);
+        pull();
+      });
     });
   };
   pull();
@@ -2088,6 +2118,14 @@ function startStatus(config) {
         `lexis_half_open ${halfOpen.total}`,
         "# TYPE lexis_half_open_refused counter",
         `lexis_half_open_refused ${halfOpen.refused}`,
+        "# TYPE lexis_half_open_silent gauge",
+        `lexis_half_open_silent ${halfOpen.silent}`,
+        "# TYPE lexis_half_open_early_released counter",
+        `lexis_half_open_early_released ${halfOpen.earlyReleased}`,
+        "# TYPE lexis_half_open_first_byte_timeouts counter",
+        `lexis_half_open_first_byte_timeouts ${halfOpen.firstByteTimeouts}`,
+        "# TYPE lexis_half_open_silent_overflow counter",
+        `lexis_half_open_silent_overflow ${halfOpen.silentOverflow}`,
         "# TYPE lexis_http_ok counter",
         `lexis_http_ok ${metrics.httpOk}`,
         "# TYPE lexis_http_reject counter",
@@ -2098,6 +2136,8 @@ function startStatus(config) {
         `lexis_transparent ${metrics.transparent}`,
         "# TYPE lexis_tun_packets counter",
         `lexis_tun_packets ${metrics.tunPackets}`,
+        "# TYPE lexis_tun_stalls counter",
+        `lexis_tun_stalls ${tunStalls}`,
       ];
       res.writeHead(200, { "content-type": "text/plain; version=0.0.4; charset=utf-8" });
       res.end(`${lines.join("\n")}\n`);
@@ -2393,6 +2433,7 @@ async function main() {
   }
   try {
     requireToken(config);
+    { const l = linkOf(config); if (l.maxConns < l.maxHalfOpen) log(`提示：link.maxConns=${l.maxConns} 小于 link.maxHalfOpen=${l.maxHalfOpen}，半开中的连接也占 maxConns，实际半开上限会被它截住；建议 maxConns ≥ maxHalfOpen + 平时会话数（3.0.2 默认 1024 / 512）`); }
   } catch (err) {
     console.error(err.message || err);
     process.exit(1);

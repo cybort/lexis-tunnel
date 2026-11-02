@@ -1,7 +1,7 @@
 import { i as __toESM } from "../_runtime.mjs";
 import { q as require_react, x as require_jsx_runtime, y as Link } from "../_libs/@tanstack/react-router+[...].mjs";
 import { i as Smartphone, o as Monitor, r as Terminal } from "../_libs/lucide-react.mjs";
-//#region node_modules/.nitro/vite/services/ssr/assets/download-BB1iZhcv.js
+//#region node_modules/.nitro/vite/services/ssr/assets/download-DfI1-rCg.js
 var import_react = /* @__PURE__ */ __toESM(require_react());
 var import_jsx_runtime = require_jsx_runtime();
 var CARDS = [
@@ -93,7 +93,7 @@ function DownloadPage() {
 						}),
 						/* @__PURE__ */ (0, import_jsx_runtime.jsx)("p", {
 							className: "mt-2 max-w-2xl text-sm text-mist",
-							children: "通信进程安装后留在后台。转发正文和这条控制台是同一套 3.0 帧。TLS 和 WebSocket 只做外层。安装包不带 TLS 私钥。长期密钥是 X25519，旧的 P-256 身份对不上。握手口令两端相同，至少 128 比特，可以用常驻进程的 --gen-token 生成。中继和出口都要逐个节点打开。NAT 后面的服务用暴露和反向入口；反向入口默认只绑回环。导出的配置带本机私钥，两端要互相放上对方公钥。需要 Node.js 22。两端都要是 3.0.0。"
+							children: "通信进程安装后留在后台。转发正文和这条控制台是同一套 3.0 帧。安装包是 3.0.2，和 3.0.0 的帧对得上。TLS 和 WebSocket 只做外层。安装包不带 TLS 私钥。长期密钥是 X25519，旧的 P-256 身份对不上。握手口令两端相同，至少 128 比特，可以用常驻进程的 --gen-token 生成。半开按网段计，默认全局 512、连接上限 1024。中继和出口都要逐个节点打开。NAT 后面的服务用暴露和反向入口；反向入口默认只绑回环。导出的配置带本机私钥，两端要互相放上对方公钥。需要 Node.js 22。"
 						})
 					]
 				}),

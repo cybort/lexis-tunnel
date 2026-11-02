@@ -132,7 +132,14 @@ export type LexisProfile = {
     udpIdleMs: number;
     udpMax: number;
     maxHalfOpen: number;
+    /** per network prefix since 3.0.1 (IPv4 /halfOpenPrefixV4, IPv6 /halfOpenPrefixV6) */
     maxHalfOpenPerIp: number;
+    halfOpenPrefixV4: number;
+    halfOpenPrefixV6: number;
+    /** hard cap on silently held (refused / failed) tunnel connections */
+    maxSilent: number;
+    /** release the half-open slot if no byte arrives within this many ms (0 = off) */
+    firstByteMs: number;
   };
   egress: { blockPrivate: boolean; allow: string[] };
   outer: { transport: OuterTransport; wsPath: string; tlsVerify: boolean };
@@ -237,7 +244,7 @@ export function defaultProfile(): LexisProfile {
     link: {
       token: "",
       idleMs: 120000,
-      maxConns: 128,
+      maxConns: 1024,
       headerBytes: 8192,
       allowLan: false,
       handshakeMs: 10000,
@@ -245,8 +252,12 @@ export function defaultProfile(): LexisProfile {
       maxHandshakes: 2,
       udpIdleMs: 60000,
       udpMax: 64,
-      maxHalfOpen: 64,
+      maxHalfOpen: 512,
       maxHalfOpenPerIp: 8,
+      halfOpenPrefixV4: 24,
+      halfOpenPrefixV6: 64,
+      maxSilent: 1024,
+      firstByteMs: 2000,
     },
     egress: { blockPrivate: true, allow: [] },
     outer: { transport: "tcp", wsPath: "/lexis", tlsVerify: true },
@@ -331,6 +342,10 @@ export function normalizeProfile(input: unknown): LexisProfile {
       udpMax: clampNum(raw.link?.udpMax, 4, 4096, base.link.udpMax),
       maxHalfOpen: clampNum(raw.link?.maxHalfOpen, 1, 10000, base.link.maxHalfOpen),
       maxHalfOpenPerIp: clampNum(raw.link?.maxHalfOpenPerIp, 1, 1024, base.link.maxHalfOpenPerIp),
+      halfOpenPrefixV4: clampNum(raw.link?.halfOpenPrefixV4, 0, 32, base.link.halfOpenPrefixV4),
+      halfOpenPrefixV6: clampNum(raw.link?.halfOpenPrefixV6, 0, 128, base.link.halfOpenPrefixV6),
+      maxSilent: clampNum(raw.link?.maxSilent, 0, 100000, base.link.maxSilent),
+      firstByteMs: clampNum(raw.link?.firstByteMs, 0, 60000, base.link.firstByteMs),
     },
     egress: {
       blockPrivate: raw.egress?.blockPrivate !== false,
@@ -696,6 +711,11 @@ export function profileIssues(profile: LexisProfile): string[] {
   const issues: string[] = [];
   if (profile.role !== "edge" && profile.role !== "gate") {
     issues.push("常驻进程不接受缺省角色。写成 edge 或 gate");
+  }
+  if (profile.link.maxConns < profile.link.maxHalfOpen) {
+    issues.push(
+      `连接上限 ${profile.link.maxConns} 小于半开上限 ${profile.link.maxHalfOpen}。半开中的连接也占连接上限，实际半开会被截住。建议连接上限至少比半开上限大出平时的会话数`,
+    );
   }
   const statusHost = profile.statusHost.trim().toLowerCase();
   const statusLoopback = statusHost === "127.0.0.1" || statusHost === "::1" || statusHost === "localhost";

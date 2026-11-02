@@ -182,7 +182,7 @@ export async function gateRespond3(
   const repC = bytes.slice(0, 32);
   const ct = bytes.subarray(32);
   // Noise NK es: gate_static_priv * client_eph_pub (from Elligator rep)
-  const es = sharedFromRep(gateSeed, repC);
+  const es = sharedFromRep(gateSeed, repC, true);
   const ikm = helloIkm(opts.token || "", es);
   let body: Uint8Array | null = null;
   let window = 0;
@@ -216,7 +216,7 @@ export async function gateRespond3(
   }
   let ssS: Uint8Array;
   try {
-    ssS = sharedFromPub(gateSeed, ltC);
+    ssS = sharedFromPub(gateSeed, ltC, true);
   } catch {
     return fail("point");
   }
