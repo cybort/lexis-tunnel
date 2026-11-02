@@ -72,7 +72,11 @@ export const useMesh = create<MeshState>()(
       name: "lexis-mesh-v1",
       storage: createJSONStorage(() => localStorage),
       skipHydration: true,
-      version: 1,
+      version: 2,
+      migrate: (persisted, version) => {
+        if (version < 2) return { nodes: [], mappings: [] };
+        return persisted as { nodes: MeshNode[]; mappings: PortMap[] };
+      },
       partialize: (state) => ({
         nodes: state.nodes.map(persistedNode),
         mappings: state.mappings,
@@ -98,48 +102,50 @@ export async function makeNode(name: string, role: MeshNode["role"]): Promise<Me
   };
 }
 
-let seeding = false;
+let seeding: Promise<void> | null = null;
 
-export async function ensureSeed(): Promise<void> {
-  if (useMesh.getState().nodes.length > 0) return;
-  if (seeding) return;
-  seeding = true;
-  try {
-    if (useMesh.getState().nodes.length > 0) return;
-    const gate = await makeNode("港区闸门", "gate");
-    const edge = await makeNode("内网工作室", "edge");
-    gate.pinnedPeerId = edge.id;
-    edge.pinnedPeerId = gate.id;
-    const mappings: PortMap[] = [
-      {
-        id: crypto.randomUUID(),
-        gateId: gate.id,
-        proto: "tcp",
-        listenPort: 18443,
-        targetHost: "127.0.0.1",
-        targetPort: 8080,
-        priority: 10,
-        enabled: true,
-        note: "工作室控制台",
-      },
-      {
-        id: crypto.randomUUID(),
-        gateId: gate.id,
-        proto: "udp",
-        listenPort: 51820,
-        targetHost: "10.0.0.8",
-        targetPort: 51820,
-        priority: 5,
-        enabled: true,
-        note: "内网报文",
-      },
-    ];
-    if (useMesh.getState().nodes.length === 0) {
-      useMesh.getState().seed([gate, edge], mappings);
+export function ensureSeed(): Promise<void> {
+  if (useMesh.getState().nodes.length > 0) return Promise.resolve();
+  if (seeding) return seeding;
+  seeding = (async () => {
+    try {
+      if (useMesh.getState().nodes.length > 0) return;
+      const gate = await makeNode("港区闸门", "gate");
+      const edge = await makeNode("内网工作室", "edge");
+      gate.pinnedPeerId = edge.id;
+      edge.pinnedPeerId = gate.id;
+      const mappings: PortMap[] = [
+        {
+          id: crypto.randomUUID(),
+          gateId: gate.id,
+          proto: "tcp",
+          listenPort: 18443,
+          targetHost: "127.0.0.1",
+          targetPort: 8080,
+          priority: 10,
+          enabled: true,
+          note: "工作室控制台",
+        },
+        {
+          id: crypto.randomUUID(),
+          gateId: gate.id,
+          proto: "udp",
+          listenPort: 51820,
+          targetHost: "10.0.0.8",
+          targetPort: 51820,
+          priority: 5,
+          enabled: true,
+          note: "内网报文",
+        },
+      ];
+      if (useMesh.getState().nodes.length === 0) {
+        useMesh.getState().seed([gate, edge], mappings);
+      }
+    } finally {
+      seeding = null;
     }
-  } finally {
-    seeding = false;
-  }
+  })();
+  return seeding;
 }
 
 export function sealFileOf(vault: NonNullable<MeshNode["vault"]>) {

@@ -26,6 +26,9 @@ import { invertLexicon, sessionLexicon } from "./lexicon";
 import { SPEC } from "./spec";
 import type { MeshNode } from "./types";
 import type { HoneyProgram } from "./honey";
+import { estimateTokenBits } from "./profile";
+import type { V2Keys } from "./v2/frame2";
+import { edgeFinish3, edgeStart3, gateAccept3, gateRespond3, HandshakeDrop } from "./v2/handshake3";
 
 export type Direction = "e2g" | "g2e";
 
@@ -49,6 +52,10 @@ export type LiveSession = {
   kdfMs: number;
   /** Cover coefficients. Evaluated for every key; omitted when unset. */
   program?: HoneyProgram | null;
+  /** Frame v2 keys (T19); generation increments on every rekey. */
+  v2?: V2Keys;
+  /** D2: per-handshake secret both ends contributed to (under the ephemeral DH secret). */
+  v2MnemonicBase?: Uint8Array;
 };
 
 export type EdgePending = {
@@ -404,9 +411,12 @@ export async function openSession(opts: {
   honey: boolean;
   kdfMs: number;
   program?: HoneyProgram | null;
+  lexicon?: string[];
+  v2?: V2Keys;
+  v2MnemonicBase?: Uint8Array;
 }): Promise<LiveSession> {
-  const lexicon = await sessionLexicon(opts.sk, opts.window);
-  const inverse = invertLexicon(lexicon);
+  const lexicon = opts.lexicon ?? (await sessionLexicon(opts.sk, opts.window));
+  const inverse = opts.lexicon ? indexWords(lexicon) : invertLexicon(lexicon);
   const skFp = await fingerprintOf(opts.sk);
   return {
     sk: opts.sk,
@@ -427,7 +437,74 @@ export async function openSession(opts: {
     honey: opts.honey,
     kdfMs: opts.kdfMs,
     program: opts.program ?? null,
+    v2: opts.v2,
+    v2MnemonicBase: opts.v2MnemonicBase,
   };
+}
+
+function indexWords(words: string[]): Map<string, number> {
+  const map = new Map<string, number>();
+  for (let i = 0; i < words.length; i++) map.set(words[i], i);
+  return map;
+}
+
+/** Browser lab. Same Noise-NK handshake and HCTR2 frame keys as the 3.0.0 agent. */
+export async function establish3(
+  edge: MeshNode,
+  gate: MeshNode,
+  now = Date.now(),
+  offer?: Partial<SessionOffer>,
+  token = "",
+): Promise<LiveSession> {
+  if (edge.role !== "edge" || gate.role !== "gate") {
+    throw new LexisError("需要一个内网端和一个公网闸门");
+  }
+  if (edge.pinnedPeerId !== gate.id || gate.pinnedPeerId !== edge.id) {
+    throw new LexisError("两端还没有互相绑定");
+  }
+  const shared = token.trim();
+  const bits = estimateTokenBits(shared);
+  if (bits < 128) {
+    throw new LexisError(`握手口令熵不足（估约 ${bits} bit，需要至少 128）。在配置页生成一口令，两端写成同一个`);
+  }
+  const started = edgeStart3(edge, gate.publicRawB64, now, offer, shared);
+  let responded;
+  try {
+    responded = await gateRespond3(
+      gate,
+      [{ id: edge.id, publicRawB64: edge.publicRawB64 }],
+      started.helloWire,
+      { token: shared, kdf: offer ? clampKdf(offer) : undefined, now },
+    );
+  } catch (err) {
+    if (err instanceof HandshakeDrop) throw new LexisError("闸门丢弃了这次握手");
+    throw err;
+  }
+  const finished = await edgeFinish3(edge, started, gate.publicRawB64, responded.serverWire);
+  try {
+    gateAccept3(responded, finished.finishWire);
+  } catch (err) {
+    if (err instanceof HandshakeDrop) throw new LexisError("闸门丢弃了结束握手");
+    throw err;
+  }
+  if (!timingSafeEqual(finished.sk, responded.sk)) {
+    throw new LexisError("两端会话密钥不一致");
+  }
+  return openSession({
+    edge,
+    gate,
+    sk: finished.sk,
+    window: finished.window,
+    helloWire: started.helloWire,
+    serverWire: responded.serverWire,
+    finishWire: finished.finishWire,
+    kdf: finished.kdf,
+    honey: honeyFromFeatures(finished.features),
+    kdfMs: finished.kdfMs,
+    lexicon: finished.keys.model.words,
+    v2: finished.keys,
+    v2MnemonicBase: finished.mnemonicBase,
+  });
 }
 
 /** Both roles, in order. The browser lab runs this; a real split process would run each step on its host. */

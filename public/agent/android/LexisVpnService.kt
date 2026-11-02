@@ -1,10 +1,14 @@
 package lexis
 
 import android.content.Intent
+import android.content.pm.PackageManager
+import android.net.IpPrefix
 import android.net.VpnService
+import android.os.Build
 import android.os.ParcelFileDescriptor
 import java.io.DataInputStream
 import java.io.DataOutputStream
+import java.net.InetAddress
 import java.net.InetSocketAddress
 import java.net.Socket
 import java.nio.ByteBuffer
@@ -26,6 +30,28 @@ class LexisVpnService : VpnService() {
             .addAddress(intent?.getStringExtra("address") ?: "10.7.0.2", 32)
             .addDnsServer(intent?.getStringExtra("dns") ?: "1.1.1.1")
             .addRoute("0.0.0.0", 0)
+        // Without this the agent's own tunnel connection to the gate is captured by
+        // 0.0.0.0/0, comes back through 127.0.0.1:17891 and loops. Keep this app and the
+        // app hosting lexis-agent.mjs (Termux by default) outside the VPN.
+        val disallowed = (intent?.getStringArrayExtra("disallowedApps") ?: arrayOf("com.termux")) + packageName
+        for (pkg in disallowed.distinct()) {
+            try {
+                builder.addDisallowedApplication(pkg)
+            } catch (_: PackageManager.NameNotFoundException) {
+                // Not installed on this device; nothing to exclude.
+            }
+        }
+        // Gate endpoints (IPv4 "a.b.c.d" or "a.b.c.d/n") are also routed outside the VPN on API 33+.
+        if (Build.VERSION.SDK_INT >= 33) {
+            for (item in intent?.getStringArrayExtra("excludeRoutes") ?: emptyArray()) {
+                val parts = item.split("/")
+                try {
+                    builder.excludeRoute(IpPrefix(InetAddress.getByName(parts[0]), parts.getOrNull(1)?.toInt() ?: 32))
+                } catch (_: Exception) {
+                    // Ignore malformed entries.
+                }
+            }
+        }
         val iface = builder.establish() ?: return START_NOT_STICKY
         tun = iface
         running = true

@@ -1,15 +1,14 @@
 import { useState } from "react";
 import { fromUtf8, hex, isPrintableText, randomBytes, utf8 } from "@/lib/lexis/bytes";
 import { entropyPair } from "@/lib/lexis/entropy";
-import { establish, type LiveSession } from "@/lib/lexis/handshake";
-import { programFromStored } from "@/lib/lexis/honey";
+import type { Direction } from "@/lib/lexis/seal";
+import { establish3, type LiveSession } from "@/lib/lexis/handshake";
 import { LexisError } from "@/lib/lexis/crypto";
-import { invertLexicon, sessionLexicon } from "@/lib/lexis/lexicon";
 import { packPayload, unpackPayload } from "@/lib/lexis/pack";
 import { useProfile } from "@/lib/lexis/profile-store";
 import { decodeRecord, encodeRecord, heartbeatPayload, RECORD, recordLabel } from "@/lib/lexis/records";
-import { open, seal, type Direction } from "@/lib/lexis/seal";
 import { useMesh } from "@/lib/lexis/store";
+import { FrameError, openV2, openV2Honey, packBatch, sealV2, SEG_COMPLETE, unpackBatch, deriveV2Keys } from "@/lib/lexis/v2/frame2";
 import { EntropyMeter } from "./meter";
 import { Btn, control, Field, Paper } from "./ui";
 
@@ -76,7 +75,7 @@ export function Bench({
   const [draft, setDraft] = useState("GET /health HTTP/1.1\r\nHost: 127.0.0.1:8080\r\n\r\n");
   const [direction, setDirection] = useState<Direction>("g2e");
   const [copied, setCopied] = useState<string | null>(null);
-  const [lastFrame, setLastFrame] = useState<{ prose: string; direction: Direction } | null>(null);
+  const [lastFrame, setLastFrame] = useState<{ prose: string; direction: Direction; counter: number } | null>(null);
 
   function push(item: Omit<LogItem, "id">) {
     setLogs((prev) => [{ ...item, id: crypto.randomUUID() }, ...prev].slice(0, 12));
@@ -95,11 +94,11 @@ export function Bench({
     setLastFrame(null);
     onSession(null);
     try {
-      const next = await establish(edge, gate, Date.now(), { ...profile.kdf, honey: profile.honey });
+      const next = await establish3(edge, gate, Date.now(), { ...profile.kdf, honey: profile.honey }, profile.link.token);
       onSession(next);
       push({
         title: "会话密钥已按握手回声派生",
-        meta: `Argon2id ${next.kdf.memoryKiB} KiB · t${next.kdf.iterations} · p${next.kdf.parallelism} · ${next.kdfMs} ms · ${next.honey ? "蜜文" : "坏帧会被拒绝"}`,
+        meta: `3.0 · HCTR2 + rANS · Argon2id ${next.kdf.memoryKiB} KiB · t${next.kdf.iterations} · p${next.kdf.parallelism} · ${next.kdfMs} ms · 词表 ${next.lexicon.length} · ${next.honey ? "握手带蜜文标志" : "坏帧会拆掉会话"}`,
       });
       for (const item of [
         { title: "内网端 → 闸门 · 问候", prose: next.helloWire },
@@ -123,43 +122,39 @@ export function Bench({
   }
 
   async function frame(current: LiveSession, dir: Direction, plaintext: Uint8Array) {
+    if (!current.v2) throw new LexisError("这次会话没有 3.0 帧密钥");
     const packed = await packPayload(plaintext, profile.zstd);
     const counter = current.counters[dir] + 1;
-    const prose = await seal({
-      key: current.sk,
-      lexicon: current.lexicon,
+    const batch = packBatch([{ flag: SEG_COMPLETE, data: packed.bytes }]);
+    const prose = sealV2({
+      keys: current.v2,
       counter,
       window: current.window,
-      direction: dir,
-      plaintext: packed.bytes,
+      dir,
+      plaintext: batch,
+      maxExpansion: profile.frame.maxExpansion,
+      smallFramePolicy: profile.frame.smallFramePolicy,
     });
-    const opened = await open({
-      key: current.sk,
-      inverse: current.inverse,
-      window: current.window,
-      direction: dir,
-      prose,
-      lastSeen: current.seen[dir],
-      honey: current.honey,
-    });
-    if (opened.honey) throw new LexisError("正确密钥不该落到蜜文");
-    const unpacked = await unpackPayload(opened.plaintext, false);
+    const opened = openV2({ keys: current.v2, counter, window: current.window, dir, prose });
+    const segs = unpackBatch(opened);
+    if (segs.length !== 1 || segs[0].flag !== SEG_COMPLETE) throw new LexisError("这一帧不是一条完整记录");
+    const unpacked = await unpackPayload(segs[0].data, false);
     const next: LiveSession = {
       ...current,
-      counters: { ...current.counters, [dir]: opened.counter },
-      seen: { ...current.seen, [dir]: opened.counter },
+      counters: { ...current.counters, [dir]: counter },
+      seen: { ...current.seen, [dir]: counter },
     };
     const sense = unpacked.compressed
       ? `对端看见类型 1，按帧头解开 zstd ${packed.level}`
       : "对端看见类型 0，按原文使用";
-    return { prose, unpacked, next, counter: opened.counter, sense };
+    return { prose, unpacked, next, counter, sense };
   }
 
   async function transmit(dir: Direction, plaintext: Uint8Array, title: string) {
     if (!session) throw new LexisError("还没有会话");
     const framed = await frame(session, dir, plaintext);
     onSession(framed.next);
-    setLastFrame({ prose: framed.prose, direction: dir });
+    setLastFrame({ prose: framed.prose, direction: dir, counter: framed.counter });
     const ent = entropyPair(framed.prose);
     const rec = decodeRecord(framed.unpacked.data);
     push({
@@ -235,7 +230,7 @@ export function Bench({
       const run = async (dir: Direction, type: number, conn: number, seq: number, body: string, title: string) => {
         const framed = await frame(current, dir, encodeRecord(type, conn, seq, utf8(body)));
         current = framed.next;
-        setLastFrame({ prose: framed.prose, direction: dir });
+        setLastFrame({ prose: framed.prose, direction: dir, counter: framed.counter });
         const ent = entropyPair(framed.prose);
         const rec = decodeRecord(framed.unpacked.data);
         push({
@@ -281,25 +276,24 @@ export function Bench({
     setBusy(true);
     setError(null);
     try {
-      const opened = await open({
-        key: randomBytes(32),
-        inverse: session.inverse,
+      if (!session.v2) throw new LexisError("这次会话没有 3.0 帧密钥");
+      const view = openV2Honey({
+        keys: deriveV2Keys(randomBytes(32)),
+        counter: lastFrame.counter,
         window: session.window,
-        direction: lastFrame.direction,
+        dir: lastFrame.direction,
         prose: lastFrame.prose,
-        lastSeen: 0,
-        honey: session.honey,
-        program: programFromStored(profile.honeyProgram),
       });
-      const text = isPrintableText(opened.plaintext) ? fromUtf8(opened.plaintext) : hex(opened.plaintext);
+      const note = view.formatValid
+        ? "规范性检查碰巧通过（错误密钥大约 2%–3%）。正文仍不是原文。"
+        : "规范性检查没过。错误密钥大约 97% 会这样。";
       push({
-        title: opened.honey ? "错误密钥落到一句蜜文" : "错误密钥居然拆开了原文",
-        meta: text,
-        bad: !opened.honey,
+        title: "错误密钥没有还原这一帧",
+        meta: `${note} 单靠这一步就能确认候选会话密钥，蜜文挡不住。助记码 ${view.mnemonic.length} 字节，正文 ${view.body.length} 字节。`,
       });
     } catch (err) {
       push({
-        title: "错误密钥被校验挡住",
+        title: "错误密钥没有按预期解开",
         meta: err instanceof Error ? err.message : "拆不开",
         bad: true,
       });
@@ -316,22 +310,25 @@ export function Bench({
     setBusy(true);
     setError(null);
     try {
-      const lex = await sessionLexicon(session.sk, session.window + 1);
-      await open({
-        key: session.sk,
-        inverse: invertLexicon(lex),
+      if (!session.v2) throw new LexisError("这次会话没有 3.0 帧密钥");
+      openV2({
+        keys: session.v2,
+        counter: lastFrame.counter,
         window: session.window + 1,
-        direction: lastFrame.direction,
+        dir: lastFrame.direction,
         prose: lastFrame.prose,
-        lastSeen: 0,
       });
       setError("这一帧居然被下一窗拆开了。不该发生。");
     } catch (err) {
-      push({
-        title: "下一时间窗拒绝了上一帧",
-        meta: err instanceof Error ? err.message : "拆不开",
-        bad: true,
-      });
+      if (err instanceof FrameError || err instanceof LexisError) {
+        push({
+          title: "下一时间窗拒绝了上一帧",
+          meta: err.message,
+          bad: true,
+        });
+      } else {
+        setError(err instanceof Error ? err.message : "拆不开");
+      }
     } finally {
       setBusy(false);
     }
@@ -387,7 +384,7 @@ export function Bench({
                 <dt className="text-mist">派生</dt>
                 <dd className="font-mono text-xs">
                   {session.kdf.memoryKiB} KiB · t{session.kdf.iterations} · p{session.kdf.parallelism} · {session.kdfMs} ms ·{" "}
-                  {session.honey ? "蜜文" : "结构或回放即拒绝"}
+                  {profile.frame.smallFramePolicy === "honey" ? "小帧按蜜文填充" : "小帧优先压膨胀"} · 预算 {profile.frame.maxExpansion}×
                 </dd>
               </div>
               <div>

@@ -81,7 +81,7 @@ export function DownloadPage() {
           <p className="font-mono text-xs text-sage">LEXIS {manifest?.version ?? "1.0.0"}</p>
           <h2 className="mt-2 text-2xl font-bold">三个系统，同一份配置</h2>
           <p className="mt-2 max-w-2xl text-sm text-mist">
-            通信进程安装后留在后台。转发正文和控制台是同一套词表。TLS 和 WebSocket 只做外层。安装包不带 TLS 私钥。握手口令两端相同，至少 16 个字符。中继和出口都要逐个节点打开。NAT 后面的服务用暴露和反向入口；反向入口默认只绑回环。导出的配置带本机私钥，两端要互相放上对方公钥。需要 Node.js 22。
+            通信进程安装后留在后台。转发正文和这条控制台是同一套 3.0 帧。TLS 和 WebSocket 只做外层。安装包不带 TLS 私钥。长期密钥是 X25519，旧的 P-256 身份对不上。握手口令两端相同，至少 128 比特，可以用常驻进程的 --gen-token 生成。中继和出口都要逐个节点打开。NAT 后面的服务用暴露和反向入口；反向入口默认只绑回环。导出的配置带本机私钥，两端要互相放上对方公钥。需要 Node.js 22。两端都要是 3.0.0。
           </p>
         </section>
         <div className="grid gap-3 lg:grid-cols-3">

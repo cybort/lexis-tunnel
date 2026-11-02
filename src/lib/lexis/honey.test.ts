@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { x25519 } from "@noble/curves/ed25519.js";
 import { p256 } from "@noble/curves/nist.js";
 import { hex, randomBytes, utf8 } from "./bytes.ts";
 import { compileBlocks, evalHoney, honeyPhrase, indicesFrom, openIdentityVault, packIndices, privateScalar, sealIdentityVault } from "./honey.ts";
@@ -49,14 +50,13 @@ async function main() {
   const again = await openIdentityVault(vault, "真口令");
   const spare = await openIdentityVault(vault, "备用");
   const third = await openIdentityVault(vault, "另一句");
-  assert.equal(hex(opened.publicRaw), hex(p256.getPublicKey(scalar, false)));
-  assert.equal(hex(spare.publicRaw), hex(p256.getPublicKey(spareScalar, false)));
+  assert.equal(hex(opened.publicRaw), hex(x25519.getPublicKey(scalar)));
+  assert.equal(hex(spare.publicRaw), hex(x25519.getPublicKey(spareScalar)));
   assert.equal(opened.fingerprint, again.fingerprint);
   assert.notEqual(opened.fingerprint, spare.fingerprint);
   assert.notEqual(opened.fingerprint, third.fingerprint);
   assert.notEqual(spare.fingerprint, third.fingerprint);
-  assert.equal(third.publicRaw[0], 0x04);
-  assert.equal(third.publicRaw.length, 65);
+  assert.equal(third.publicRaw.length, 32);
 
   const windowKey = 4;
   const lexReal = await sessionLexicon(privateScalar(opened.privateJwk), windowKey);

@@ -1,0 +1,12 @@
+This repository includes third-party material:
+
+- English word list (src/lib/lexis/v2/vocab-en.ts, bundled into
+  public/agent/lexis-frame.mjs): adapted from FrequencyWords by Hermit Dave,
+  https://github.com/hermitdave/FrequencyWords, licensed CC BY-SA 4.0.
+  Attribution and the list of modifications: src/lib/lexis/v2/vocab-en.NOTICE.md
+  Full license text: src/lib/lexis/v2/vocab-en.LICENSE.txt
+  (copies shipped with the agent: public/agent/NOTICE-vocab.txt,
+   public/agent/LICENSE-vocab-CC-BY-SA-4.0.txt)
+
+- HCTR2 test vectors (src/lib/lexis/v2/vectors/): Apache-2.0,
+  see src/lib/lexis/v2/vectors/README.md.

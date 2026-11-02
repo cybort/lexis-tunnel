@@ -1,7 +1,6 @@
 import { useMemo, useState } from "react";
 import type { LiveSession } from "@/lib/lexis/handshake";
 import { staticLexicon } from "@/lib/lexis/lexicon";
-import { SPEC } from "@/lib/lexis/spec";
 import { Btn, control } from "./ui";
 
 export function LexiconPanel({ session }: { session: LiveSession | null }) {
@@ -40,7 +39,7 @@ export function LexiconPanel({ session }: { session: LiveSession | null }) {
       <section className="rounded-md border border-line bg-panel p-4">
         <h2 className="text-base font-medium">本窗词表</h2>
         <p className="mt-2 text-sm text-mist">
-          {SPEC.lexiconSize} 个可发音词，每个词 12 比特。秘密词表由会话密钥和时间窗号决定；静态词表是公开的，只用来把握手字节写成同样的散文，因为那时候会话密钥还不存在。
+          握手之后这里是这把会话密钥打乱过的英文词序，大约三万词，只在频次接近的词之间换位置。它不是公开的音节表。静态按钮仍会生成旧的握手音节表，只作对照，线上帧不用它。词表来自 FrequencyWords，许可是 CC BY-SA 4.0。
         </p>
         <div className="mt-4 flex flex-wrap gap-2">
           <Btn kind={source === "session" ? "solid" : "ghost"} onClick={() => setSource("session")}>

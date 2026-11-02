@@ -16,7 +16,7 @@ import { createRequire } from "node:module";
 import { platform } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { acceptSession, connectSession, dialOuter, hopCount, listenOuter, nodeFromIdentity, openIdentityVault, parseOpen, pipeMux, programFromStored, startKdfPool, vaultFromStored } from "./lexis-frame.mjs";
+import { acceptSession, connectSession, halfOpen, dialOuter, hopCount, listenOuter, nodeFromIdentity, openIdentityVault, parseOpen, pipeMux, programFromStored, setFrameOptions, startKdfPool, vaultFromStored } from "./lexis-frame.mjs";
 import { serveHttpProxy, classifyFraming, hostsAgree, sanitizeHeaders } from "./lexis-http.mjs";
 import { answerDns, buildDnsQuery, buildTcpPacket, buildUdpPacket, createEngine, createFakeIp, parseIpv4, parseTcp, parseUdp, redirectTcp } from "./lexis-tun.mjs";
 
@@ -250,6 +250,10 @@ function linkOf(config) {
     allowLan: link.allowLan === true,
     handshakeMs: Number.isInteger(Number(link.handshakeMs)) && Number(link.handshakeMs) >= 1000 ? Number(link.handshakeMs) : 10000,
     dialMs: Number.isInteger(Number(link.dialMs)) && Number(link.dialMs) >= 1000 ? Number(link.dialMs) : 10000,
+    udpIdleMs: Number.isInteger(Number(link.udpIdleMs)) && Number(link.udpIdleMs) >= 1000 ? Number(link.udpIdleMs) : 60000,
+    udpMax: Number.isInteger(Number(link.udpMax)) && Number(link.udpMax) >= 4 ? Number(link.udpMax) : 64,
+    maxHalfOpen: Number.isInteger(Number(link.maxHalfOpen)) && Number(link.maxHalfOpen) >= 1 ? Number(link.maxHalfOpen) : 64,
+    maxHalfOpenPerIp: Number.isInteger(Number(link.maxHalfOpenPerIp)) && Number(link.maxHalfOpenPerIp) >= 1 ? Number(link.maxHalfOpenPerIp) : 8,
     maxHandshakes: Number.isInteger(Number(link.maxHandshakes)) && Number(link.maxHandshakes) >= 1 ? Number(link.maxHandshakes) : 2,
   };
 }
@@ -262,10 +266,10 @@ function arm(socket, config) {
   });
 }
 
-function admit(socket, config) {
+function admit(socket, config, opts = {}) {
   if (liveConns >= linkOf(config).maxConns) {
     log("连接数已满");
-    socket.destroy();
+    if (!opts.silent) socket.destroy();
     return false;
   }
   liveConns += 1;
@@ -509,10 +513,32 @@ function ensurePool(config) {
   startKdfPool(linkOf(config).maxHandshakes);
 }
 
+/** v3: tokens must carry >=128 bits of randomness. Reject weak manual tokens. */
 function requireToken(config) {
   const token = linkOf(config).token;
-  if (token.length < 16) throw new Error("握手口令至少 16 个字符");
+  const bits = estimateTokenBits(token);
+  if (bits < 128) {
+    throw new Error(
+      `握手口令熵不足（估约 ${bits} bit，需要至少 128）。请运行：node lexis-agent.mjs --gen-token，把输出写入 link.token。不要用手写短口令。`,
+    );
+  }
   return token;
+}
+function estimateTokenBits(token) {
+  if (!token) return 0;
+  // charset size heuristics; reject short / low-alphabet tokens
+  const s = new Set(token);
+  let alphabet = 0;
+  if (/[a-z]/.test(token)) alphabet += 26;
+  if (/[A-Z]/.test(token)) alphabet += 26;
+  if (/[0-9]/.test(token)) alphabet += 10;
+  if (/[^a-zA-Z0-9]/.test(token)) alphabet += 20;
+  if (alphabet < 10) alphabet = Math.max(s.size, 2);
+  return Math.floor(token.length * Math.log2(alphabet));
+}
+function genToken() {
+  const raw = crypto.getRandomValues(new Uint8Array(16));
+  return Buffer.from(raw).toString("base64url");
 }
 
 function requireRole(config) {
@@ -540,6 +566,9 @@ function lexiconEngine(config, emit) {
     dialUdp: (host, port) => dialUdp(config, host, port),
     emit,
     fakeIp: dnsWanted(config) ? fakeNames : null,
+    log,
+    udpIdleMs: linkOf(config).udpIdleMs,
+    udpMax: linkOf(config).udpMax,
   });
 }
 
@@ -748,17 +777,40 @@ async function exitUdp(stream, host, port) {
     udp.bind(0, () => resolve());
   });
   await stream.accept();
+  // Exit-side idle guard: an edge that never closes its UDP stream must not pin a socket here.
+  const idleMs = 2 * linkOf(activeConfig || {}).udpIdleMs;
+  let seen = Date.now();
+  const idle = setInterval(() => {
+    if (Date.now() - seen > idleMs) {
+      clearInterval(idle);
+      void stream.close().catch(() => undefined);
+    }
+  }, Math.min(10000, idleMs));
+  idle.unref?.();
+  let udpClosed = false;
+  const closeUdp = () => {
+    if (udpClosed) return;
+    udpClosed = true;
+    try {
+      udp.close();
+    } catch {
+      /* already closed */
+    }
+  };
   udp.on("message", (msg) => {
-    void stream.write(msg).catch(() => udp.close());
+    seen = Date.now();
+    void stream.write(msg).catch(closeUdp);
   });
   try {
     for (;;) {
       const chunk = await stream.read();
       if (!chunk) break;
+      seen = Date.now();
       await new Promise((resolve, reject) => udp.send(chunk, port, bare, (err) => (err ? reject(err) : resolve())));
     }
   } finally {
-    udp.close();
+    clearInterval(idle);
+    closeUdp();
     await stream.close().catch(() => undefined);
   }
 }
@@ -932,7 +984,7 @@ function sourceIp(socket) {
   return raw.startsWith("::ffff:") ? raw.slice(7) : raw;
 }
 
-async function acceptTunnel(socket, pipeReady, config) {
+async function acceptTunnel(socket, pipeReady, config, refuse = false) {
   let session = null;
   try {
     config = activeConfig || config;
@@ -952,6 +1004,9 @@ async function acceptTunnel(socket, pipeReady, config) {
       maxStreams: link.maxConns,
       heartbeatMs: Math.max(5, config.heartbeatSec || 15) * 1000,
       handshakeMs: link.handshakeMs,
+      maxHalfOpen: link.maxHalfOpen,
+      maxHalfOpenPerIp: link.maxHalfOpenPerIp,
+      refuse,
       program: programFromStored(config.honeyProgram),
       sourceIp: sourceIp(socket),
       onReady: (ready) => {
@@ -962,7 +1017,7 @@ async function acceptTunnel(socket, pipeReady, config) {
     if (session.peerId) inboundSessions.set(session.peerId, session);
     await session.whenClosed();
   } catch (err) {
-    log(`隧道拒绝 ${err.message || err}`);
+    log(`隧道拒绝 ${err.message || err} (halfOpen=${halfOpen.total} refused=${halfOpen.refused})`);
     socket.destroy();
   } finally {
     if (session?.peerId && inboundSessions.get(session.peerId) === session) inboundSessions.delete(session.peerId);
@@ -1493,6 +1548,15 @@ function ensureTlsMaterial() {
 }
 
 function serveInbound(config, inbound) {
+  if (inbound.protocol === "transparent") {
+    // The transparent port is owned by serveTransparent (redirect/tproxy), which reads
+    // SO_ORIGINAL_DST. Binding it here too caused EADDRINUSE and a generic handler that
+    // routed every redirected connection as ":0".
+    if (config.mode !== "system-forward" || platform() !== "linux" || config.linux?.method === "tun") {
+      log(`${inbound.tag || "transparent"} ${inbound.port} 只在 Linux 系统接管 redirect/tproxy 下监听，已跳过`);
+    }
+    return null;
+  }
   const host = listenHost(config, inbound);
   if (inbound.protocol === "tunnel") {
     const outer = outerOf(config);
@@ -1515,9 +1579,12 @@ function serveInbound(config, inbound) {
       certPath: material.certPath,
       keyPath: material.keyPath,
       onSocket(socket, pipeReady) {
-        if (!admit(socket, config)) return;
+        // D5: on the public tunnel port a full table must not close at once (that is a
+        // distinguishable signal); it takes the same silent handshake-timeout path.
+        socket.on("error", () => socket.destroy());
+        const ok = admit(socket, config, { silent: true });
         arm(socket, config);
-        void acceptTunnel(socket, pipeReady, config);
+        void acceptTunnel(socket, pipeReady, config, !ok);
       },
     });
     void tunnel.listening().then(() => {
@@ -1603,6 +1670,14 @@ function onTransparent(socket, config) {
 }
 
 function serveTransparent(config) {
+  if (config.mode === "system-forward" && platform() === "win32" && config.windows?.method === "windivert") {
+    // Untested at runtime. There is no SO_ORIGINAL_DST equivalent here, so a listener on the
+    // transparent port could not route anything; say so instead of silently black-holing TCP.
+    const message = `WinDivert 模式在 Windows 上没有透明入口：${transparentPort(config)} 不监听，读不到原始目的地址。apply-forward.ps1 不会启动 lexis-windivert.exe。`;
+    state.errors.push(message);
+    log(message);
+    return;
+  }
   if (config.mode !== "system-forward" || platform() !== "linux" || config.linux?.method === "tun") return;
   const port = transparentPort(config);
   const addon = loadSockopt();
@@ -1727,7 +1802,10 @@ function serveTun(config) {
     readFd(opened.fd, buf, 0, buf.length, null, (err, n) => {
       if (err) return;
       metrics.tunPackets += 1;
-      void engine.push(Buffer.from(buf.subarray(0, n))).finally(pull);
+      void engine
+        .push(Buffer.from(buf.subarray(0, n)))
+        .catch((err) => log(`虚拟网卡包处理失败：${err?.message || err}`))
+        .finally(pull);
     });
   };
   pull();
@@ -1761,7 +1839,7 @@ function servePacketBridge(config) {
         const packet = buf.subarray(2, 2 + size);
         buf = buf.subarray(2 + size);
         metrics.tunPackets += 1;
-        void engine.push(packet);
+        void engine.push(packet).catch((err) => log(`包通道处理失败：${err?.message || err}`));
       }
     });
     socket.on("close", () => engine.close());
@@ -1784,13 +1862,16 @@ function forwardScript(config) {
       body: `$port = ${socks}
 $proxy = ${port}
 $gateway = "${gateway}"
+$gates = @(${peerAddrs(config).map((host) => `"${host}"`).join(", ")})
 if ("${winMethod}" -eq "portproxy") {
   netsh interface portproxy add v4tov4 listenaddress=127.0.0.1 listenport=$port connectaddress=127.0.0.1 connectport=$port
   Write-Output "portproxy 只绑 127.0.0.1:$port，不向局域网公布"
 } else {
   $exe = Join-Path $PSScriptRoot "lexis-windivert.exe"
-  if (Test-Path $exe) {
-    Start-Process -FilePath $exe -ArgumentList @("$proxy") -WindowStyle Hidden
+  if (-not (Test-Path (Join-Path $PSScriptRoot "lexis-windivert.ready"))) {
+    Write-Output "WinDivert 重定向没有启动：本进程在 Windows 上还读不到被改写连接的原始目的地址，127.0.0.1:$proxy 没有可用的透明入口，启动会让所有 TCP 断掉。"
+  } elseif (Test-Path $exe) {
+    Start-Process -FilePath $exe -ArgumentList (@("$proxy") + $gates) -WindowStyle Hidden
     Write-Output "已启动 WinDivert 重定向到 127.0.0.1:$proxy。驱动要和程序放在一起。"
   } else {
     Write-Output "没有 lexis-windivert.exe。源码是旁边的 windivert-redirect.c，要用 WinDivert SDK 自己编译。驱动不在安装包里，这次没有改系统流量。"
@@ -1809,7 +1890,10 @@ if ("${winMethod}" -eq "portproxy") {
       packet: "127.0.0.1:17891",
       bypass: (GEOIP.private || []).concat(["127.0.0.0/8", "100.64.0.0/10", "224.0.0.0/4", ...peerAddrs(config).map((ip) => `${ip}/32`)]),
       processes: config.processes || [],
-      note: "LexisVpnService.kt 把 tun 上的 IP 包按 2 字节长度送到 packet。Termux 不能自己弹出 VPN 授权。",
+      // Passed to LexisVpnService as intent extras so the agent's own tunnel dial is not captured.
+      disallowedApps: ["com.termux"],
+      excludeRoutes: peerAddrs(config),
+      note: "LexisVpnService.kt 把 tun 上的 IP 包按 2 字节长度送到 packet。Termux 不能自己弹出 VPN 授权。disallowedApps 和 excludeRoutes 防止本进程连对端的连接被 VPN 收回来。",
     };
     return { file: "vpn-session.json", body: JSON.stringify(session, null, 2) };
   }
@@ -2000,6 +2084,10 @@ function startStatus(config) {
         `lexis_beats ${state.beats}`,
         "# TYPE lexis_live_conns gauge",
         `lexis_live_conns ${liveConns}`,
+        "# TYPE lexis_half_open gauge",
+        `lexis_half_open ${halfOpen.total}`,
+        "# TYPE lexis_half_open_refused counter",
+        `lexis_half_open_refused ${halfOpen.refused}`,
         "# TYPE lexis_http_ok counter",
         `lexis_http_ok ${metrics.httpOk}`,
         "# TYPE lexis_http_reject counter",
@@ -2158,6 +2246,7 @@ function watchConfig() {
       const prevPeers = peerList(activeConfig || {});
       const nextById = new Map(peerList(next).filter((peer) => peer.id).map((peer) => [peer.id, String(peer.publicRawB64 || "")]));
       activeConfig = next;
+      setFrameOptions({ maxExpansion: next?.frame?.maxExpansion, smallFramePolicy: next?.frame?.smallFramePolicy, coalesceTarget: next?.frame?.coalesceTarget });
       state.config = next;
       for (const peer of prevPeers) {
         if (!peer.id) continue;
@@ -2284,9 +2373,16 @@ async function main() {
     selfCheck();
     return;
   }
+  if (process.argv.includes("--gen-token")) {
+    const t = genToken();
+    console.log(t);
+    console.error("# 128-bit token (base64url). Put it in link.token on BOTH ends. Do not reuse across unrelated deployments.");
+    return;
+  }
   const config = await unlockIdentity(loadConfig());
   requireRole(config);
   activeConfig = config;
+  setFrameOptions({ maxExpansion: config?.frame?.maxExpansion, smallFramePolicy: config?.frame?.smallFramePolicy, coalesceTarget: config?.frame?.coalesceTarget });
   state.config = config;
   tighten(configPath);
   tighten(join(dirname(configPath), "lexis.seal.json"));

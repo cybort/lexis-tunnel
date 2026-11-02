@@ -239,9 +239,31 @@ export function answerDns(packet, fakeIp, ttl = 60) {
   return Buffer.concat([header, asked, answer]);
 }
 
-export function createEngine({ dialTcp, dialUdp, emit, fakeIp = null, mss = MSS }) {
+export function createEngine({ dialTcp, dialUdp, emit, fakeIp = null, mss = MSS, log = () => undefined, udpIdleMs = 60000, udpMax = 64 }) {
   const tcpFlows = new Map();
   const udpFlows = new Map();
+  // UDP has no close; without an idle sweep every new source port (each DNS query)
+  // pinned a mux stream here and a UDP socket on the exit forever (128-stream cap).
+  const udpSeen = new Map();
+  // DNS flows are one-shot: short idle. Hard cap with oldest-first eviction keeps
+  // UDP well below the mux stream cap even at high new-flow rates.
+  const udpShort = new Set();
+  const closeUdp = (key) => {
+    const socket = udpFlows.get(key);
+    udpFlows.delete(key);
+    udpSeen.delete(key);
+    udpShort.delete(key);
+    try {
+      socket?.close();
+    } catch {
+      /* already closed */
+    }
+  };
+  const sweep = setInterval(() => {
+    const now = Date.now();
+    for (const [key, seen] of udpSeen) if (now - seen > (udpShort.has(key) ? Math.min(udpIdleMs, 5000) : udpIdleMs)) closeUdp(key);
+  }, Math.max(1000, Math.min(2500, Math.floor(udpIdleMs / 2))));
+  sweep.unref?.();
 
   function emitTcp(flow, seqNo, flags, payload) {
     emit(buildTcpPacket({
@@ -416,14 +438,36 @@ export function createEngine({ dialTcp, dialUdp, emit, fakeIp = null, mss = MSS 
     const key = `${ip.src}:${udp.sport}>${ip.dst}:${udp.dport}`;
     let socket = udpFlows.get(key);
     if (!socket) {
-      socket = await dialUdp(host, udp.dport);
+      try {
+        socket = await dialUdp(host, udp.dport);
+      } catch (err) {
+        // A refused UDP open (no exit, rule reject, stream limit) must not become an
+        // unhandled rejection that kills the agent.
+        log(`udp ${host}:${udp.dport} 失败：${err?.message || err}`);
+        return;
+      }
+      while (udpFlows.size >= udpMax) {
+        let oldest = null;
+        let at = Infinity;
+        for (const [k, t] of udpSeen) if (t < at) { at = t; oldest = k; }
+        if (oldest === null) break;
+        closeUdp(oldest);
+      }
+      if (udp.dport === 53 || udp.dport === 5353) udpShort.add(key);
       udpFlows.set(key, socket);
       socket.on("message", (msg) => {
+        udpSeen.set(key, Date.now());
         emit(buildUdpPacket({ src: ip.dst, dst: ip.src, sport: udp.dport, dport: udp.sport, payload: msg }));
       });
-      socket.on("error", () => udpFlows.delete(key));
+      socket.on("error", () => closeUdp(key));
     }
-    await new Promise((resolve, reject) => socket.send(udp.data, udp.dport, host, (err) => (err ? reject(err) : resolve())));
+    udpSeen.set(key, Date.now());
+    try {
+      await new Promise((resolve, reject) => socket.send(udp.data, udp.dport, host, (err) => (err ? reject(err) : resolve())));
+    } catch (err) {
+      log(`udp ${host}:${udp.dport} 发送失败：${err?.message || err}`);
+      closeUdp(key);
+    }
   }
 
   return {
@@ -443,6 +487,7 @@ export function createEngine({ dialTcp, dialUdp, emit, fakeIp = null, mss = MSS 
       }
     },
     close() {
+      clearInterval(sweep);
       for (const flow of tcpFlows.values()) flow.socket?.destroy();
       for (const socket of udpFlows.values()) {
         try {
@@ -453,6 +498,7 @@ export function createEngine({ dialTcp, dialUdp, emit, fakeIp = null, mss = MSS 
       }
       tcpFlows.clear();
       udpFlows.clear();
+      udpSeen.clear();
     },
   };
 }

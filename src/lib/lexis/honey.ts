@@ -2,6 +2,7 @@
  * One evaluation for every key. Programmed keys fall out of the polynomial;
  * nothing here compares a key against a list.
  */
+import { x25519 } from "@noble/curves/ed25519.js";
 import { p256 } from "@noble/curves/nist.js";
 import { argon2id } from "@noble/hashes/argon2.js";
 import { concat, randomBytes, u32be, utf8, b64, unb64 } from "./bytes";
@@ -201,14 +202,6 @@ export async function honeyPhrase(
   return `the ${lex[idx[0]]} and our ${lex[idx[1]]} that its ${lex[idx[2]]} and the ${lex[idx[3]]}`;
 }
 
-function scalarFromSeed(seed: Uint8Array): Uint8Array {
-  let hex = "";
-  for (const b of seed) hex += b.toString(16).padStart(2, "0");
-  let n = p256.Point.Fn.create(BigInt(`0x${hex}`));
-  if (n === 0n) n = 1n;
-  return p256.Point.Fn.toBytes(n);
-}
-
 function b64url(bytes: Uint8Array): string {
   let s = "";
   for (const b of bytes) s += String.fromCharCode(b);
@@ -262,14 +255,13 @@ export async function openIdentityVault(vault: IdentityVault, passphrase: string
   const joined = new Uint8Array(32);
   joined.set(lo, 0);
   joined.set(hi, 16);
-  const secret = scalarFromSeed(joined);
-  const pub = p256.getPublicKey(secret, false);
-  const x = b64url(pub.subarray(1, 33));
-  const y = b64url(pub.subarray(33, 65));
-  const d = b64url(secret);
+  const seed = joined;
+  const pub = x25519.getPublicKey(seed);
+  const x = b64url(pub);
+  const d = b64url(seed);
   return identityFromJwks(
-    { kty: "EC", crv: "P-256", x, y, ext: true },
-    { kty: "EC", crv: "P-256", x, y, d, ext: true },
+    { kty: "OKP", crv: "X25519", x, ext: true },
+    { kty: "OKP", crv: "X25519", x, d, ext: true },
   );
 }
 

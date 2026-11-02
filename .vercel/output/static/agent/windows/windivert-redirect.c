@@ -6,7 +6,7 @@
  *   cl /W4 windivert-redirect.c WinDivert.lib
  * Then place lexis-windivert.exe next to apply-forward.ps1.
  *
- * The filter keeps the agent's own marked flows out. Replies from 127.0.0.1:proxy
+ * The filter keeps the agent's own gate connections out by destination (argv[2..]). Replies from 127.0.0.1:proxy
  * are restored from a small table. Checksums are recomputed for IPv4 only.
  */
 #define WIN32_LEAN_AND_MEAN
@@ -47,7 +47,20 @@ static int slot(uint32_t client, uint16_t sport) {
 
 int main(int argc, char **argv) {
   int proxy = argc > 1 ? atoi(argv[1]) : 12345;
-  HANDLE handle = WinDivertOpen("outbound and ip and tcp and not loopback", WINDIVERT_LAYER_NETWORK, 0, 0);
+  /*
+   * argv[2..] are IPv4 gate endpoints. The network layer has no process id, so the
+   * agent's own tunnel connection is kept out by destination address; without this
+   * the dial to the gate is diverted back into 127.0.0.1:proxy and loops.
+   */
+  char filter[4096];
+  int used = snprintf(filter, sizeof(filter), "outbound and ip and tcp and not loopback and tcp.DstPort != %d", proxy);
+  for (int a = 2; a < argc && used > 0 && used < (int)sizeof(filter) - 64; a += 1) {
+    int ok = 1;
+    for (const char *c = argv[a]; *c; c += 1) if (!((*c >= '0' && *c <= '9') || *c == '.')) ok = 0;
+    if (!ok) continue;
+    used += snprintf(filter + used, sizeof(filter) - (size_t)used, " and ip.DstAddr != %s", argv[a]);
+  }
+  HANDLE handle = WinDivertOpen(filter, WINDIVERT_LAYER_NETWORK, 0, 0);
   if (handle == INVALID_HANDLE_VALUE) {
     fprintf(stderr, "WinDivertOpen failed %lu\n", GetLastError());
     return 1;

@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { cidrContains, defaultProfile, exportedConfig, importClashRules, importSingBox, matchRoute, normalizeProfile, profileIssues } from "./profile.ts";
+import { cidrContains, defaultProfile, estimateTokenBits, exportedConfig, importClashRules, importSingBox, matchRoute, mintHandshakeToken, normalizeProfile, profileIssues } from "./profile.ts";
 
 const profile = defaultProfile();
 
@@ -86,5 +86,27 @@ assert.equal(normalizeProfile({ statusToken: "abc" }).statusToken, "abc");
 const wide = normalizeProfile({ role: "edge", statusHost: "0.0.0.0" });
 assert.equal(profileIssues(wide).some((item) => item.includes("状态口令")), true);
 assert.equal(profileIssues(normalizeProfile({ role: "edge", statusHost: "0.0.0.0", statusToken: "x" })).some((item) => item.includes("状态口令")), false);
+assert.equal(defaultProfile().frame.maxExpansion, 5);
+assert.equal(defaultProfile().frame.smallFramePolicy, "expansion");
+assert.equal(defaultProfile().frame.coalesceTarget, 1024);
+assert.equal(defaultProfile().link.udpIdleMs, 60000);
+assert.equal(defaultProfile().link.udpMax, 64);
+assert.equal(defaultProfile().link.maxHalfOpen, 64);
+assert.equal(defaultProfile().link.maxHalfOpenPerIp, 8);
+const framed = normalizeProfile({ frame: { maxExpansion: 99, smallFramePolicy: "honey", coalesceTarget: 8 }, link: { udpIdleMs: 50, udpMax: 1 } });
+assert.equal(framed.frame.maxExpansion, 5);
+assert.equal(framed.frame.smallFramePolicy, "honey");
+assert.equal(framed.frame.coalesceTarget, 1024);
+assert.equal(framed.link.udpIdleMs, 60000);
+assert.equal(framed.link.udpMax, 64);
+assert.ok(estimateTokenBits(mintHandshakeToken()) >= 128);
+const weakJoin = normalizeProfile({
+  role: "gate",
+  peers: [{ id: "p", name: "n", endpoint: "203.0.113.8:18443", publicRawB64: "abcdabcdabcdabcd" }],
+  link: { token: "short-token" },
+});
+assert.equal(profileIssues(weakJoin).some((item) => item.includes("128")), true);
+const strongJoin = normalizeProfile({ ...weakJoin, link: { ...weakJoin.link, token: mintHandshakeToken() } });
+assert.equal(profileIssues(strongJoin).some((item) => item.includes("口令")), false);
 
 console.log("profile ok");

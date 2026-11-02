@@ -7,6 +7,8 @@ export const RECORD = {
   close: 4,
   credit: 5,
   rekey: 6,
+  /** v2: authenticated end of session. A close without it is a truncation. */
+  end: 7,
 } as const;
 
 export type DecodedRecord = {

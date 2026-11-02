@@ -14,6 +14,8 @@ import {
   matchRoute,
   profileIssues,
   exportedConfig,
+  estimateTokenBits,
+  mintHandshakeToken,
   type Inbound,
   type LexisProfile,
   type NetPeer,
@@ -182,7 +184,7 @@ export function ConfigPanel() {
           压缩不靠这份配置在对端对齐。明文第一个字节是类型：0 是原文，1 是 zstd 帧。等级决定窗口，窗口写在帧头里，对端解开以后自己读。比原文更大时这一帧会改回类型 0。
         </p>
         <p className="mt-2 text-sm text-mist">
-          蜜文在握手时谈定。打开以后，词不在词表里、正文结构不对、或者计数器回放，都不报错，落成这把密钥和当前时间窗自己的词表里的一句话。关掉时，回放仍会拆掉这条会话。帧尾是随机字节，不是会话密钥的校验：猜中会话密钥的人和猜错的人，比对这段尾部都对不上。握手确认也不再拿会话密钥来算。词表仍由会话密钥导出，对得上词表本身仍说明这把密钥是对的。换一把密钥，或换一个时间窗，词表格式不变、用词不同。备用明文写进同一条求值，不会为某一把密钥另开判断。线上没有「这是蜜文」的位。这一版和 1.7 及更早的对端对不上。
+          蜜文只挡对长期私钥和口令的暴力猜测。它不挡已经拿到候选会话密钥的人：一帧词重编码回去，对的密钥对得上，错的密钥大约只有 2%–3% 对得上。握手确认用临时密钥的共享秘密来算。两端的蜜文开关要写成一样，它会进入会话密钥；帧本身不再把坏帧落成另一句词。封面系数仍按旧的句式封存，3.0 的线上帧不用这句式。长期私钥的封存在节点页。这一版和 2.0 及更早的对端对不上。
         </p>
         <div className="mt-4 grid gap-3 sm:grid-cols-3">
           <Field label="Argon2 内存 KiB">
@@ -241,7 +243,7 @@ export function ConfigPanel() {
         </div>
         <div className="mt-4 grid gap-3">
           <p className="text-sm text-mist">
-            封面按会话密钥封进同一条求值。密钥写成 64 位十六进制，词序是四个 0 到 {SPEC.lexiconSize - 1} 的整数。封存之后只留系数。拆开时每一把密钥都走这一条，没有单独的判断。对得上的用你写的词序，对不上的仍是同一句式，词从那把密钥和当时的时间窗里取。
+            封面系数按旧的四词句式封存。3.0 的线上帧不再读这句式。密钥写成 64 位十六进制。封存之后只留系数。长期私钥的封存在节点页，任意口令都会解开一把合法的 X25519 私钥。
           </p>
           <Field label="密钥">
             <input className={control} value={coverKey} autoComplete="off" spellCheck={false} placeholder="64 位十六进制" aria-label="封面密钥" onChange={(e) => setCoverKey(e.target.value)} />
@@ -292,7 +294,7 @@ export function ConfigPanel() {
       <section className="rounded-md border border-line bg-panel p-4">
         <h2 className="text-base font-medium">链路</h2>
         <p className="mt-2 text-sm text-mist">
-          常驻进程和这条控制台用同一套词表。握手仍是两次 ECDH 加 Argon2id，正文是密钥、计数器和秘密词表。TCP、TLS、WebSocket 只负责协议和头，用来过 CDN。路径默认 /lexis。CDN 若自己终结 TLS，源站可以听 WebSocket。
+          常驻进程和这条控制台用同一套 3.0 帧。握手是 X25519，问候用临时密钥和闸门长期公钥的共享秘密加密。TCP、TLS、WebSocket 只负责协议和头，用来过 CDN。路径默认 /lexis。CDN 若自己终结 TLS，源站可以听 WebSocket。
         </p>
         <p className="mt-2 text-sm text-mist">
           一条会话上可以开多路。打开写成 tcp 主机 端口、udp 主机 端口、relay 节点 再接后面的命令，或 expose 服务名。中继和出口都要逐个节点打开。暴露不能经中继绕过去。跳数到 4 就停。慢的那一路只堵住自己。SOCKS 的用户名和密码留空就是不认证，HTTP 代理共用这一对。
@@ -308,12 +310,20 @@ export function ConfigPanel() {
           <Field label="握手口令">
             <input
               className={control}
-              type="password"
               autoComplete="off"
+              spellCheck={false}
               value={profile.link.token}
               onChange={(e) => patch({ link: { ...profile.link, token: e.target.value } })}
             />
           </Field>
+          <div>
+            <p className="text-sm text-mist">口令</p>
+            <div className="mt-2">
+              <Btn kind="ghost" onClick={() => patch({ link: { ...profile.link, token: mintHandshakeToken() } })}>
+                生成 128 bit 口令
+              </Btn>
+            </div>
+          </div>
           <Field label="同时握手数">
             <input
               className={control}
@@ -358,8 +368,42 @@ export function ConfigPanel() {
           <Field label="SOCKS 密码">
             <input className={control} type="password" autoComplete="off" value={profile.socksAuth.pass} onChange={(e) => patch({ socksAuth: { ...profile.socksAuth, pass: e.target.value } })} />
           </Field>
+          <Field label="半开上限">
+            <input
+              className={control}
+              inputMode="numeric"
+              value={profile.link.maxHalfOpen}
+              onChange={(e) => patch({ link: { ...profile.link, maxHalfOpen: Number(e.target.value) } })}
+            />
+          </Field>
+          <Field label="每地址半开">
+            <input
+              className={control}
+              inputMode="numeric"
+              value={profile.link.maxHalfOpenPerIp}
+              onChange={(e) => patch({ link: { ...profile.link, maxHalfOpenPerIp: Number(e.target.value) } })}
+            />
+          </Field>
+          <Field label="UDP 空闲（秒）">
+            <input
+              className={control}
+              inputMode="numeric"
+              value={Math.round(profile.link.udpIdleMs / 1000)}
+              onChange={(e) => patch({ link: { ...profile.link, udpIdleMs: Math.round(Number(e.target.value) * 1000) } })}
+            />
+          </Field>
+          <Field label="UDP 路数">
+            <input
+              className={control}
+              inputMode="numeric"
+              value={profile.link.udpMax}
+              onChange={(e) => patch({ link: { ...profile.link, udpMax: Number(e.target.value) } })}
+            />
+          </Field>
         </div>
-        <p className="mt-2 text-sm text-mist">握手口令在 Argon2 之前校验，用来挡伪造问候，不是词表密钥。两端要写成同一个，至少 16 个字符。校验关掉时，外层 TLS 认不出对端，正式部署请换自己的证书。</p>
+        <p className="mt-2 text-sm text-mist">
+          握手口令在 Argon2 之前参与问候。估约 {estimateTokenBits(profile.link.token.trim())} bit，需要至少 128。两端写成同一个。手写短口令会被常驻进程拒绝。半开超限的连接和坏问候一样，等到握手超时再关，外面看不出差别。校验关掉时，外层 TLS 认不出对端，正式部署请换自己的证书。
+        </p>
         <div className="mt-4 rounded-sm bg-panel-2 p-3">
           <p className="text-sm text-mist">本机身份</p>
           <p className="mt-2 break-all font-mono text-xs text-fg">{profile.identity?.fingerprint || "还没有"}</p>
@@ -477,6 +521,53 @@ export function ConfigPanel() {
           </Field>
         </div>
         <p className="mt-2 text-sm text-mist">状态页离开回环时，指标和页面要带这句口令。健康检查不带。没有口令又没有允许局域网时，状态页改绑回环。</p>
+      </section>
+
+      <section className="rounded-md border border-line bg-panel p-4">
+        <h2 className="text-base font-medium">帧</h2>
+        <p className="mt-2 text-sm text-mist">
+          膨胀预算是线上字节相对压缩后正文的倍数，默认 5，范围 1 到 16。大约 256 字节以下的单发帧仍会超过这个倍数，常驻进程把同一时刻的小记录并进一帧。合并阈值默认 1024 字节，只给常驻进程；浏览器里每次封装单独成帧。
+        </p>
+        <p className="mt-2 text-sm text-mist">
+          小帧策略默认「压膨胀」：预算内才填充，短帧常常不填。改成「蜜文填充」后，短帧也在 0 到 255 字节里取填充，填充占比更接近一把错误密钥解出来的样子，短帧会胀得更大。这是发送端的选择，两端可以不一样。
+        </p>
+        <div className="mt-4 grid gap-3 sm:grid-cols-2">
+          <Field label="线上膨胀预算">
+            <select
+              className={control}
+              value={profile.frame.maxExpansion}
+              onChange={(e) => patch({ frame: { ...profile.frame, maxExpansion: Number(e.target.value) } })}
+            >
+              {[1, 2, 3, 4, 5, 8, 12, 16].map((n) => (
+                <option key={n} value={n}>
+                  {n}×
+                </option>
+              ))}
+            </select>
+          </Field>
+          <Field label="合并阈值（字节）">
+            <input
+              className={control}
+              inputMode="numeric"
+              value={profile.frame.coalesceTarget}
+              onChange={(e) => patch({ frame: { ...profile.frame, coalesceTarget: Number(e.target.value) } })}
+            />
+          </Field>
+        </div>
+        <div className="mt-4 flex flex-wrap gap-2">
+          <Btn
+            kind={profile.frame.smallFramePolicy === "expansion" ? "solid" : "ghost"}
+            onClick={() => patch({ frame: { ...profile.frame, smallFramePolicy: "expansion" } })}
+          >
+            小帧压膨胀
+          </Btn>
+          <Btn
+            kind={profile.frame.smallFramePolicy === "honey" ? "solid" : "ghost"}
+            onClick={() => patch({ frame: { ...profile.frame, smallFramePolicy: "honey" } })}
+          >
+            小帧蜜文填充
+          </Btn>
+        </div>
       </section>
 
       <section className="rounded-md border border-line bg-panel p-4">

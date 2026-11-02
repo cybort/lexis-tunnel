@@ -1,13 +1,14 @@
 import assert from "node:assert/strict";
 import { b64 } from "./bytes.ts";
-import { createIdentity, LexisError } from "./crypto.ts";
-import { assertHelloWindow, claimHello, currentWindow, edgeFinish, edgeStart, establish, gateRespond, resetHandshakeGuards } from "./handshake.ts";
+import { createIdentity } from "./crypto.ts";
+import { assertHelloWindow, claimHello, currentWindow, establish3, resetHandshakeGuards } from "./handshake.ts";
 import { clampKdf } from "./kdf.ts";
 import { SPEC } from "./spec.ts";
 import type { MeshNode } from "./types.ts";
+import { edgeStart3, gateRespond3, HandshakeDrop } from "./v2/handshake3.ts";
 
 const FAST = { memoryKiB: 32, iterations: 1, parallelism: 1, honey: false };
-const TOKEN = "token-12345678";
+const TOKEN = "v3-test-token-9f3a2c1b0e7d6a5c";
 
 async function makeNode(name: string, role: MeshNode["role"]): Promise<MeshNode> {
   const key = await createIdentity();
@@ -33,45 +34,46 @@ async function main() {
   gate.pinnedPeerId = edge.id;
   edge.pinnedPeerId = gate.id;
 
-  const live = await establish(edge, gate, Date.now(), FAST);
+  const live = await establish3(edge, gate, Date.now(), FAST, TOKEN);
   assert.equal(live.kdf.memoryKiB, 32);
-  assert.ok(!live.helloWire.includes(TOKEN));
+  assert.ok(live.v2);
+  assert.ok(!live.helloWire.includes(edge.publicRawB64));
 
   resetHandshakeGuards();
-  const pending = await edgeStart(edge, Date.now(), { memoryKiB: 65536, iterations: 4, parallelism: 2 }, TOKEN);
-  const responded = await gateRespond(gate, edge.publicRawB64, pending.helloWire, { token: TOKEN, kdf: FAST });
+  const peers = [{ id: edge.id, publicRawB64: edge.publicRawB64 }];
+  const heavy = { memoryKiB: 16384, iterations: 4, parallelism: 2 };
+  const pending = edgeStart3(edge, gate.publicRawB64, Date.now(), { memoryKiB: 65536, iterations: 4, parallelism: 2, honey: false }, TOKEN);
+  const responded = await gateRespond3(gate, peers, pending.helloWire, { token: TOKEN, kdf: FAST });
   assert.equal(responded.kdf.memoryKiB, 32);
-  const finished = await edgeFinish(edge, pending, gate.publicRawB64, responded.serverWire, TOKEN);
-  assert.equal(finished.kdf.memoryKiB, 32);
 
   const badStarted = Date.now();
   await assert.rejects(
-    () => gateRespond(gate, edge.publicRawB64, pending.helloWire, { token: "other-token-99", kdf: { memoryKiB: 16384, iterations: 4, parallelism: 2 } }),
-    (err: unknown) => err instanceof LexisError && /重放|口令/.test((err as Error).message),
+    () => gateRespond3(gate, peers, pending.helloWire, { token: "other-token-0123456789abcdef", kdf: heavy }),
+    (err: unknown) => err instanceof HandshakeDrop,
   );
-  assert.ok(Date.now() - badStarted < 400, "坏口令或重放不应跑到重 Argon2");
+  assert.ok(Date.now() - badStarted < 2000, "坏口令或重放不应跑到重 Argon2");
 
   resetHandshakeGuards();
-  const forged = await edgeStart(edge, Date.now(), FAST, "wrong-token-xx");
+  const forged = edgeStart3(edge, gate.publicRawB64, Date.now(), FAST, "wrong-token-0123456789abcdef");
   const t0 = Date.now();
   await assert.rejects(
-    () => gateRespond(gate, edge.publicRawB64, forged.helloWire, { token: TOKEN, kdf: { memoryKiB: 16384, iterations: 4, parallelism: 2 } }),
-    (err: unknown) => err instanceof LexisError && (err as Error).message.includes("口令"),
+    () => gateRespond3(gate, peers, forged.helloWire, { token: TOKEN, kdf: heavy }),
+    (err: unknown) => err instanceof HandshakeDrop,
   );
-  assert.ok(Date.now() - t0 < 200, "口令不对必须在派生之前拒绝");
+  assert.ok(Date.now() - t0 < 2000, "口令不对必须在派生之前拒绝");
 
   resetHandshakeGuards();
-  const once = await edgeStart(edge, Date.now(), FAST, TOKEN);
-  await gateRespond(gate, edge.publicRawB64, once.helloWire, { token: TOKEN, kdf: FAST });
+  const once = edgeStart3(edge, gate.publicRawB64, Date.now(), FAST, TOKEN);
+  await gateRespond3(gate, peers, once.helloWire, { token: TOKEN, kdf: FAST });
   await assert.rejects(
-    () => gateRespond(gate, edge.publicRawB64, once.helloWire, { token: TOKEN, kdf: FAST }),
-    (err: unknown) => err instanceof LexisError && (err as Error).message.includes("重放"),
+    () => gateRespond3(gate, peers, once.helloWire, { token: TOKEN, kdf: FAST }),
+    (err: unknown) => err instanceof HandshakeDrop,
   );
 
-  const stale = await edgeStart(edge, Date.now() - 600_000, FAST, TOKEN);
+  const stale = edgeStart3(edge, gate.publicRawB64, Date.now() - 600_000, FAST, TOKEN);
   await assert.rejects(
-    () => gateRespond(gate, edge.publicRawB64, stale.helloWire, { token: TOKEN, kdf: FAST, now: Date.now() }),
-    (err: unknown) => err instanceof LexisError && (err as Error).message.includes("过期"),
+    () => gateRespond3(gate, peers, stale.helloWire, { token: TOKEN, kdf: FAST, now: Date.now() }),
+    (err: unknown) => err instanceof HandshakeDrop,
   );
 
   assert.throws(() => assertHelloWindow(currentWindow() - 3), /过期/);

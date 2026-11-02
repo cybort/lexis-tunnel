@@ -91,6 +91,10 @@ export function sanitizeHeaders(lines) {
   });
 }
 
+function withoutLength(lines) {
+  return lines.filter((line) => headerName(line) !== "content-length");
+}
+
 function hasBareLf(text) {
   return /(?:^|[^\r])\n/.test(text);
 }
@@ -326,7 +330,8 @@ export async function serveHttpProxy(socket, options) {
       const port = Number(url.port || 80);
       if (!hostsAgree(url.hostname, port, headerValue(lines, "host"), 80)) return fail(400, "Bad Request");
       if (framing.mode === "none" && !noBody(method)) return fail(411, "Length Required");
-      const kept = sanitizeHeaders(lines.slice(1));
+      // Framing is re-emitted from classifyFraming below; drop the original so it is not sent twice.
+      const kept = withoutLength(sanitizeHeaders(lines.slice(1)));
       const path = `${url.pathname || "/"}${url.search || ""}`;
       const extra = framing.mode === "chunked" ? "Transfer-Encoding: chunked\r\n" : framing.mode === "length" ? `Content-Length: ${framing.length}\r\n` : "";
       const upstream = await options.openUpstream(url.hostname, port);
@@ -368,10 +373,9 @@ export async function serveHttpProxy(socket, options) {
         count("smuggle");
         return fail(502, "Bad Gateway", "smuggle");
       }
-      const respKept = sanitizeHeaders(respLines.slice(1)).filter((line) => {
+      const respKept = withoutLength(sanitizeHeaders(respLines.slice(1))).filter((line) => {
         if (carriesBody(method, statusCode)) return true;
-        const name = headerName(line);
-        return name !== "content-length" && name !== "transfer-encoding";
+        return headerName(line) !== "transfer-encoding";
       });
       const respExtra = !carriesBody(method, statusCode)
         ? ""

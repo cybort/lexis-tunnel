@@ -114,6 +114,12 @@ export type LexisProfile = {
   /** Long-term key coefficients. Exported config drops this and the scalar. */
   seal: StoredVault | null;
   zstd: { enabled: boolean; level: number };
+  /** Wire budget and sender-only pad policy. Exported for the resident agent. */
+  frame: {
+    maxExpansion: number;
+    smallFramePolicy: "expansion" | "honey";
+    coalesceTarget: number;
+  };
   link: {
     token: string;
     idleMs: number;
@@ -123,6 +129,10 @@ export type LexisProfile = {
     handshakeMs: number;
     dialMs: number;
     maxHandshakes: number;
+    udpIdleMs: number;
+    udpMax: number;
+    maxHalfOpen: number;
+    maxHalfOpenPerIp: number;
   };
   egress: { blockPrivate: boolean; allow: string[] };
   outer: { transport: OuterTransport; wsPath: string; tlsVerify: boolean };
@@ -223,7 +233,21 @@ export function defaultProfile(): LexisProfile {
     honeyProgram: null,
     seal: null,
     zstd: { enabled: false, level: 3 },
-    link: { token: "", idleMs: 120000, maxConns: 128, headerBytes: 8192, allowLan: false, handshakeMs: 10000, dialMs: 10000, maxHandshakes: 2 },
+    frame: { maxExpansion: 5, smallFramePolicy: "expansion", coalesceTarget: 1024 },
+    link: {
+      token: "",
+      idleMs: 120000,
+      maxConns: 128,
+      headerBytes: 8192,
+      allowLan: false,
+      handshakeMs: 10000,
+      dialMs: 10000,
+      maxHandshakes: 2,
+      udpIdleMs: 60000,
+      udpMax: 64,
+      maxHalfOpen: 64,
+      maxHalfOpenPerIp: 8,
+    },
     egress: { blockPrivate: true, allow: [] },
     outer: { transport: "tcp", wsPath: "/lexis", tlsVerify: true },
     socksAuth: { user: "", pass: "" },
@@ -293,6 +317,7 @@ export function normalizeProfile(input: unknown): LexisProfile {
       enabled: Boolean(raw.zstd && raw.zstd.enabled),
       level: clampNum(raw.zstd?.level, 1, 19, base.zstd.level),
     },
+    frame: frameOf(base.frame, raw.frame),
     link: {
       token: typeof raw.link?.token === "string" ? raw.link.token : "",
       idleMs: clampNum(raw.link?.idleMs, 1000, 600000, base.link.idleMs),
@@ -302,6 +327,10 @@ export function normalizeProfile(input: unknown): LexisProfile {
       handshakeMs: clampNum(raw.link?.handshakeMs, 1000, 60000, base.link.handshakeMs),
       dialMs: clampNum(raw.link?.dialMs, 1000, 60000, base.link.dialMs),
       maxHandshakes: clampNum(raw.link?.maxHandshakes, 1, 8, base.link.maxHandshakes),
+      udpIdleMs: clampNum(raw.link?.udpIdleMs, 1000, 600000, base.link.udpIdleMs),
+      udpMax: clampNum(raw.link?.udpMax, 4, 4096, base.link.udpMax),
+      maxHalfOpen: clampNum(raw.link?.maxHalfOpen, 1, 10000, base.link.maxHalfOpen),
+      maxHalfOpenPerIp: clampNum(raw.link?.maxHalfOpenPerIp, 1, 1024, base.link.maxHalfOpenPerIp),
     },
     egress: {
       blockPrivate: raw.egress?.blockPrivate !== false,
@@ -633,6 +662,36 @@ function mapAction(value: string): RuleAction {
   return ACTION_ALIAS[value] ?? ACTION_ALIAS[value.toUpperCase()] ?? "proxy";
 }
 
+function frameOf(base: LexisProfile["frame"], raw?: Partial<LexisProfile["frame"]> | null): LexisProfile["frame"] {
+  const policy = raw?.smallFramePolicy === "honey" ? "honey" : raw?.smallFramePolicy === "expansion" ? "expansion" : base.smallFramePolicy;
+  return {
+    maxExpansion: clampNum(raw?.maxExpansion, 1, 16, base.maxExpansion),
+    smallFramePolicy: policy,
+    coalesceTarget: clampNum(raw?.coalesceTarget, 64, 4096, base.coalesceTarget),
+  };
+}
+
+/** Same charset heuristic as the resident agent. Not a cryptographic entropy estimate. */
+export function estimateTokenBits(token: string): number {
+  if (!token) return 0;
+  const seen = new Set(token);
+  let alphabet = 0;
+  if (/[a-z]/.test(token)) alphabet += 26;
+  if (/[A-Z]/.test(token)) alphabet += 26;
+  if (/[0-9]/.test(token)) alphabet += 10;
+  if (/[^a-zA-Z0-9]/.test(token)) alphabet += 20;
+  if (alphabet < 10) alphabet = Math.max(seen.size, 2);
+  return Math.floor(token.length * Math.log2(alphabet));
+}
+
+/** 16 random bytes, base64url. Matches `lexis-agent --gen-token`. */
+export function mintHandshakeToken(): string {
+  const raw = crypto.getRandomValues(new Uint8Array(16));
+  let s = "";
+  for (const b of raw) s += String.fromCharCode(b);
+  return btoa(s).replaceAll("+", "-").replaceAll("/", "_").replace(/=+$/g, "");
+}
+
 export function profileIssues(profile: LexisProfile): string[] {
   const issues: string[] = [];
   if (profile.role !== "edge" && profile.role !== "gate") {
@@ -667,8 +726,8 @@ export function profileIssues(profile: LexisProfile): string[] {
   if ((joined || profile.role === "gate" || profile.peerEndpoint) && !profile.identity) {
     issues.push("常驻转发要有本机身份。在节点页把一把密钥写成常驻身份");
   }
-  if (joined && profile.link.token.trim().length < 16) {
-    issues.push("常驻握手要有至少 16 个字符的口令，用来在 Argon2 之前挡掉伪造问候");
+  if (joined && estimateTokenBits(profile.link.token.trim()) < 128) {
+    issues.push("常驻握手口令熵不足（需要至少 128 bit）。用「生成 128 bit 口令」，两端写成同一个。不要用手写短口令");
   }
   if (!profile.outer.tlsVerify) issues.push("没有校验证书。正式部署请换成自己的证书并打开校验");
   if (profile.inbounds.some((item) => item.protocol === "tunnel") && profile.peers.length === 0) {

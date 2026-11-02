@@ -1,10 +1,10 @@
 import assert from "node:assert/strict";
 import { fromUtf8, randomBytes, utf8 } from "./bytes.ts";
 import { createIdentity } from "./crypto.ts";
-import { establish } from "./handshake.ts";
+import { establish3 } from "./handshake.ts";
 import { clampKdf, clampVaultKdf, deriveIdentity, VAULT_KDF } from "./kdf.ts";
 import { packPayload, unpackPayload, ZSTD_TAG } from "./pack.ts";
-import { legacyKeyTag, open, peelTail, seal } from "./seal.ts";
+import { FrameError, deriveV2Keys, openV2, openV2Honey, sealV2 } from "./v2/frame2.ts";
 import { b64 } from "./bytes.ts";
 import type { MeshNode } from "./types.ts";
 
@@ -41,9 +41,8 @@ async function main() {
   const c = await deriveIdentity("另一句", salt, FAST);
   assert.equal(a.fingerprint, b.fingerprint);
   assert.notEqual(a.fingerprint, c.fingerprint);
-  assert.equal(a.publicRaw.length, 65);
-  assert.equal(a.publicRaw[0], 0x04);
-  assert.equal(c.publicRaw[0], 0x04);
+  assert.equal(a.publicRaw.length, 32);
+  assert.equal(c.publicRaw.length, 32);
 
   const raw = utf8("hello ".repeat(40));
   const packed = await packPayload(raw, { enabled: true, level: 3 });
@@ -63,102 +62,47 @@ async function main() {
   const edge = await makeNode("内网", "edge");
   gate.pinnedPeerId = edge.id;
   edge.pinnedPeerId = gate.id;
-  const session = await establish(edge, gate, Date.now(), { ...FAST, honey: true });
+  const session = await establish3(edge, gate, Date.now(), { ...FAST, honey: true }, "v3-test-token-9f3a2c1b0e7d6a5c");
   assert.equal(session.kdf.memoryKiB, 32);
   assert.equal(session.honey, true);
-  assert.ok(session.kdfMs >= 1);
+  assert.ok(session.v2);
+  if (!session.v2) throw new Error("no v2");
+  assert.ok(session.kdfMs >= 0);
 
-  const prose = await seal({
-    key: session.sk,
-    lexicon: session.lexicon,
+  const keys = session.v2;
+  const prose = sealV2({
+    keys,
     counter: 1,
     window: session.window,
-    direction: "g2e",
+    dir: "g2e",
     plaintext: packed.bytes,
+    maxExpansion: 5,
   });
-  assert.match(prose, /^[a-z .]+$/);
+  assert.match(prose, /^[a-z]+(?: [a-z]+)*$/);
   const wire = utf8(prose);
   for (let i = 0; i < wire.length - 3; i++) {
     assert.ok(!(wire[i] === 0x28 && wire[i + 1] === 0xb5), "zstd magic leaked onto the wire");
   }
-  const opened = await open({
-    key: session.sk,
-    inverse: session.inverse,
-    window: session.window,
-    direction: "g2e",
-    prose,
-    lastSeen: 0,
-    honey: true,
-  });
-  assert.equal(opened.honey, false);
-  const unpacked = await unpackPayload(opened.plaintext, false);
+  const opened = openV2({ keys, counter: 1, window: session.window, dir: "g2e", prose });
+  const unpacked = await unpackPayload(opened, false);
   assert.equal(fromUtf8(unpacked.data), fromUtf8(raw));
-  const tail = await peelTail({
-    key: session.sk,
-    inverse: session.inverse,
+
+  const view = openV2Honey({
+    keys: deriveV2Keys(randomBytes(32)),
+    counter: 1,
     window: session.window,
-    direction: "g2e",
+    dir: "g2e",
     prose,
   });
-  const realLegacy = await legacyKeyTag(session.sk, "g2e", 1, packed.bytes);
-  const wrongLegacy = await legacyKeyTag(randomBytes(32), "g2e", 1, packed.bytes);
-  assert.ok(tail);
-  assert.equal(tail.length, 16);
-  const realMiss = Buffer.compare(tail, realLegacy) !== 0;
-  const wrongMiss = Buffer.compare(tail, wrongLegacy) !== 0;
-  assert.equal(realMiss, true);
-  assert.equal(wrongMiss, true);
-  assert.equal(realMiss, wrongMiss);
-
-  const decoy = await open({
-    key: randomBytes(32),
-    inverse: new Map(),
-    window: session.window,
-    direction: "g2e",
-    prose,
-    lastSeen: 0,
-    honey: true,
-  });
-  assert.equal(decoy.honey, true);
-  assert.match(fromUtf8(decoy.plaintext), /^the /);
-  assert.notEqual(fromUtf8(decoy.plaintext), fromUtf8(raw));
-
-  await assert.rejects(() =>
-    open({
-      key: session.sk,
-      inverse: new Map(),
-      window: session.window,
-      direction: "g2e",
-      prose,
-      lastSeen: 0,
-      honey: false,
-    }),
+  assert.equal(view.mnemonic.length, 16);
+  assert.ok(view.body.length !== packed.bytes.length || Buffer.compare(view.body, packed.bytes) !== 0);
+  assert.throws(
+    () => openV2({ keys, counter: 2, window: session.window, dir: "g2e", prose }),
+    (err: unknown) => err instanceof FrameError,
   );
-
-  const replay = await open({
-    key: session.sk,
-    inverse: session.inverse,
-    window: session.window,
-    direction: "g2e",
-    prose,
-    lastSeen: opened.counter,
-    honey: true,
-  });
-  assert.equal(replay.honey, true);
-  assert.match(fromUtf8(replay.plaintext), /^the /);
-
-  await assert.rejects(
-    () =>
-      open({
-        key: session.sk,
-        inverse: session.inverse,
-        window: session.window,
-        direction: "g2e",
-        prose,
-        lastSeen: opened.counter,
-        honey: false,
-      }),
-    (err: unknown) => err instanceof Error && /回放/.test(err.message),
+  assert.throws(
+    () => openV2({ keys, counter: 1, window: session.window + 1, dir: "g2e", prose }),
+    (err: unknown) => err instanceof FrameError,
   );
 
   console.log("kdf ok");

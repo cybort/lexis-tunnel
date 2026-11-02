@@ -1,11 +1,9 @@
-import { useEffect, useRef, useState } from "react";
+import { useRef, useState } from "react";
 import { Download, Trash2 } from "lucide-react";
 import { b64, randomBytes } from "@/lib/lexis/bytes";
-import { identityFromJwks, fingerprintOf, LexisError } from "@/lib/lexis/crypto";
-import { currentWindow } from "@/lib/lexis/handshake";
-import { freshScalar, openIdentityVault, privateScalar, sealIdentityVault, vaultFromStored, vaultToStored } from "@/lib/lexis/honey";
+import { identityFromJwks, fingerprintOf, LexisError, x25519PubFromJwk } from "@/lib/lexis/crypto";
+import { freshScalar, openIdentityVault, sealIdentityVault, vaultFromStored, vaultToStored } from "@/lib/lexis/honey";
 import { clampVaultKdf, VAULT_KDF } from "@/lib/lexis/kdf";
-import { sessionLexicon } from "@/lib/lexis/lexicon";
 import { useProfile } from "@/lib/lexis/profile-store";
 import type { NetPeer } from "@/lib/lexis/profile";
 import { SPEC } from "@/lib/lexis/spec";
@@ -34,15 +32,14 @@ async function materialFromSidecar(data: Record<string, unknown>) {
   const publicJwk = data.publicJwk as JsonWebKey;
   const privateJwk = data.privateJwk as JsonWebKey | undefined;
   if (privateJwk?.d) return identityFromJwks(publicJwk, privateJwk);
-  if (!publicJwk || publicJwk.kty !== "EC" || publicJwk.crv !== "P-256" || !publicJwk.x || !publicJwk.y) {
-    throw new LexisError("侧车里没有 P-256 公钥");
+  if (!publicJwk || publicJwk.kty !== "OKP" || publicJwk.crv !== "X25519" || !publicJwk.x) {
+    throw new LexisError("侧车里没有 X25519 公钥。旧的 P-256 侧车不能迁移");
   }
-  const pub = await crypto.subtle.importKey("jwk", publicJwk, { name: "ECDH", namedCurve: "P-256" }, true, []);
-  const publicRaw = new Uint8Array(await crypto.subtle.exportKey("raw", pub));
+  const publicRaw = x25519PubFromJwk(publicJwk);
   const fingerprint = typeof data.fingerprint === "string" && data.fingerprint ? data.fingerprint : await fingerprintOf(publicRaw);
   return {
     publicJwk,
-    privateJwk: { kty: "EC", crv: "P-256", x: publicJwk.x, y: publicJwk.y, ext: true } as JsonWebKey,
+    privateJwk: { kty: "OKP", crv: "X25519", x: publicJwk.x, ext: true } as JsonWebKey,
     publicRaw,
     fingerprint,
   };
@@ -215,7 +212,7 @@ export function NodesPanel() {
       </div>
       {error ? <p className="text-sm text-ember">{error}</p> : null}
       <p className="text-sm text-mist">
-        封存用自己的 Argon2id：65536 KiB、3 次迭代，不跟握手那一档的 16 MiB 上限。点下去这页会卡几秒，那是在算。每次封存换一把随机私钥，口令只负责打开它。任意一句口令都会解开一把合法私钥，不会提示哪一句是当初那句。解开之后，卡片上的指纹换成这句口令对应的那把。对端对不上时说绑定不一致，不说口令错误。侧车和配置不写标量，也不写系数。系数单独是 lexis.seal.json。两边都拿到的人仍可以离线试口令，只是更慢。
+        长期密钥是 X25519。旧的 P-256 侧车读不进来，两端要一起换新身份。封存用自己的 Argon2id：65536 KiB、3 次迭代，不跟握手那一档的 16 MiB 上限。点下去这页会卡几秒，那是在算。每次封存换一把随机私钥，口令只负责打开它。任意一句口令都会解开一把合法私钥，不会提示哪一句是当初那句。解开之后，卡片上的指纹换成这句口令对应的那把。对端对不上时说绑定不一致，不说口令错误。侧车和配置不写标量，也不写系数。系数单独是 lexis.seal.json。两边都拿到的人仍可以离线试口令，只是更慢。会话词序在隧道页握手之后才有，不由这把长期私钥单独决定。
       </p>
       <div className="grid gap-3 lg:grid-cols-2">
         {nodes.map((node) => (
@@ -316,27 +313,8 @@ function NodeCard({
   const [passphrase, setPassphrase] = useState("");
   const [spare, setSpare] = useState("");
   const [deriving, setDeriving] = useState(false);
-  const [words, setWords] = useState("");
   const sealed = Boolean(node.vault);
   const unlocked = Boolean(node.privateJwk.d);
-
-  useEffect(() => {
-    let cancel = false;
-    if (!node.privateJwk.d) {
-      setWords("");
-      return;
-    }
-    void sessionLexicon(privateScalar(node.privateJwk), currentWindow())
-      .then((lex) => {
-        if (!cancel) setWords(`${lex[0]} · ${lex[1]} · ${lex[2]} · ${lex[3]}`);
-      })
-      .catch(() => {
-        if (!cancel) setWords("");
-      });
-    return () => {
-      cancel = true;
-    };
-  }, [node.privateJwk.d, node.fingerprint]);
 
   return (
     <article className="rounded-md border border-line bg-panel p-4">
@@ -369,7 +347,6 @@ function NodeCard({
         <p className="mt-2 text-sm text-mist">这把私钥是随机生成的，还没有用口令派生。</p>
       )}
       {sealed && !unlocked ? <p className="mt-2 text-sm text-mist">标量不在这台浏览器里。输入任意口令都会解开一把合法私钥。</p> : null}
-      {words ? <p className="mt-2 text-sm text-mist">本窗词表开头：{words}</p> : null}
       <div className="mt-3 flex flex-col gap-2 sm:flex-row">
         <Field label="绑定到">
           <select

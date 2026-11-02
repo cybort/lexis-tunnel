@@ -18,11 +18,29 @@ import { currentWindow, edgeFinish, edgeStart, gateAccept, gateRespond, openSess
 import { deriveSessionKey, honeyFromFeatures, setSessionKeyDeriver, type ArgonParams, type SessionOffer } from "../lib/lexis/kdf";
 import { invertLexicon, sessionLexicon } from "../lib/lexis/lexicon";
 import { decodeRecord, encodeRecord, heartbeatPayload, RECORD } from "../lib/lexis/records";
-import { open, seal } from "../lib/lexis/seal";
+import { deriveV2Keys, nextSessionKey, openV2, packBatch, Reassembler, sealV2, SEG_COMPLETE, SEG_HEADER, SEG_LAST, SEG_MORE, unpackBatch, type Segment } from "../lib/lexis/v2/frame2";
+import { edgeFinish3, edgeStart3, gateAccept3, gateRespond3 } from "../lib/lexis/v2/handshake3";
 import type { MeshNode } from "../lib/lexis/types";
 
 export { createIdentity };
 export { openIdentityVault, programFromStored, vaultFromStored } from "../lib/lexis/honey";
+
+/** frame.maxExpansion: padding budget over the compressed size (T19/D1). Default 5. */
+let frameMaxExpansion = 5;
+/** frame.smallFramePolicy: "expansion" (default) | "honey". See frame2.padLength and docs/design/frame-v2-tradeoffs.md. */
+let frameSmallPolicy: "expansion" | "honey" = "expansion";
+export const frameStats = { truncated: 0, ended: 0, integrity: 0, frames: 0, records: 0, fragments: 0 };
+/** D1: one sealed frame carries at most this many payload bytes; bigger records are split. */
+const MAX_FRAME_PAYLOAD = 4096;
+/** D1: flush a coalesced frame once this many record bytes are queued. Default 1024. */
+let COALESCE_TARGET = 1024;
+export function setFrameOptions(opts: { maxExpansion?: number; smallFramePolicy?: string; coalesceTarget?: number }) {
+  frameSmallPolicy = opts.smallFramePolicy === "honey" ? "honey" : "expansion";
+  const m = Number(opts.maxExpansion);
+  if (Number.isFinite(m) && m >= 1 && m <= 16) frameMaxExpansion = m;
+  const c = Number(opts.coalesceTarget);
+  if (Number.isInteger(c) && c >= 1 && c <= MAX_FRAME_PAYLOAD) COALESCE_TARGET = c;
+}
 
 export type ZstdPref = { enabled: boolean; level: number };
 export type OuterName = "tcp" | "tls" | "ws" | "wss";
@@ -683,13 +701,18 @@ export class LexSession {
     return new Promise<void>((resolve) => this.closeWaiters.push(resolve));
   }
 
-  shutdown() {
+  private peerEnded = false;
+  private reasm = new Reassembler();
+
+  /** graceful: send the authenticated END frame first (bounded to 500 ms). */
+  shutdown(graceful = true) {
     if (this.closed) return;
+    const end = graceful && !this.peerEnded ? this.writeRecord(RECORD.end, 0, 0, new Uint8Array(0)).catch(() => undefined) : Promise.resolve();
     this.closed = true;
     if (this.heart) clearInterval(this.heart);
     if (this.rekeyTimer) clearInterval(this.rekeyTimer);
     for (const stream of this.streams.values()) stream.finish();
-    this.pipe.close();
+    void Promise.race([end, new Promise((r) => setTimeout(r, 500))]).then(() => this.pipe.close());
     while (this.closeWaiters.length) this.closeWaiters.shift()?.();
   }
 
@@ -703,25 +726,125 @@ export class LexSession {
   }
 
   sendRecord(type: number, conn: number, seq: number, payload: Uint8Array, rekeyNonce?: Uint8Array) {
-    return this.enqueue(async () => {
-      if (this.closed) throw new Error("会话已关闭");
-      const live = this.sendLive;
-      const packed = await packRecord(encodeRecord(type, conn, seq, payload), this.zstd);
-      const dir = this.initiator ? "e2g" : "g2e";
-      const counter = live.counters[dir] + 1;
-      const prose = await seal({
-        key: live.sk,
-        lexicon: live.lexicon,
-        counter,
-        window: live.window,
-        direction: dir,
-        plaintext: packed,
-      });
-      live.counters[dir] = counter;
-      await this.pipe.write(prose);
-      if (rekeyNonce) this.sendLive = await this.deriveNext(live, rekeyNonce);
-      else this.kickRekey();
+    if (this.closed) return Promise.reject(new Error("会话已关闭"));
+    return this.writeRecord(type, conn, seq, payload, rekeyNonce);
+  }
+
+  /* D1: records are packed in call order (enqueue keeps that order) into an outbox;
+   * one drainer turns the outbox into as few sealed frames as possible (coalescing
+   * small records, splitting large ones). Rekey and END go out in a frame of their
+   * own so the generation switch stays on a frame boundary. The batch is the SPRP
+   * plaintext, so coalescing/splitting is encrypted and authenticated. */
+  private outbox: Array<{ packed: Uint8Array; urgent: boolean; rekeyNonce?: Uint8Array; resolve: () => void; reject: (e: unknown) => void }> = [];
+  private draining = false;
+  private drainScheduled = false;
+
+  private writeRecord(type: number, conn: number, seq: number, payload: Uint8Array, rekeyNonce?: Uint8Array) {
+    return new Promise<void>((resolve, reject) => {
+      void this.enqueue(async () => {
+        if (this.closed && type !== RECORD.end) throw new Error("会话已关闭");
+        const packed = await packRecord(encodeRecord(type, conn, seq, payload), this.zstd);
+        this.outbox.push({ packed, urgent: !!rekeyNonce || type === RECORD.end, rekeyNonce, resolve, reject });
+        this.kickDrain();
+      }).catch(reject);
     });
+  }
+
+  private kickDrain() {
+    if (this.draining) return;
+    let bytes = 0;
+    let urgent = false;
+    for (const it of this.outbox) {
+      bytes += it.packed.length;
+      if (it.urgent) urgent = true;
+    }
+    if (urgent || bytes >= COALESCE_TARGET) {
+      void this.drain();
+    } else if (!this.drainScheduled) {
+      this.drainScheduled = true;
+      // setImmediate, not a microtask: records written in the same tick are packed
+      // asynchronously (packRecord), so a microtask drain fired after the FIRST record and
+      // never coalesced anything (measured: 1.00 frames per write in an 8-write burst).
+      setImmediate(() => {
+        this.drainScheduled = false;
+        void this.drain();
+      });
+    }
+  }
+
+  private async drain() {
+    if (this.draining) return;
+    this.draining = true;
+    try {
+      while (this.outbox.length) {
+        const head = this.outbox[0];
+        if (head.urgent) {
+          this.outbox.shift();
+          try {
+            await this.sendFrame([{ flag: SEG_COMPLETE, data: head.packed }], head.rekeyNonce);
+            head.resolve();
+          } catch (err) {
+            head.reject(err);
+          }
+          continue;
+        }
+        if (head.packed.length + SEG_HEADER > MAX_FRAME_PAYLOAD) {
+          this.outbox.shift();
+          try {
+            await this.sendSplit(head.packed);
+            head.resolve();
+          } catch (err) {
+            head.reject(err);
+          }
+          continue;
+        }
+        const batch: typeof this.outbox = [];
+        let size = 0;
+        while (this.outbox.length) {
+          const it = this.outbox[0];
+          if (it.urgent || it.packed.length + SEG_HEADER > MAX_FRAME_PAYLOAD) break;
+          if (batch.length && size + SEG_HEADER + it.packed.length > MAX_FRAME_PAYLOAD) break;
+          batch.push(it);
+          size += SEG_HEADER + it.packed.length;
+          this.outbox.shift();
+        }
+        try {
+          await this.sendFrame(batch.map((it) => ({ flag: SEG_COMPLETE, data: it.packed })));
+          for (const it of batch) it.resolve();
+        } catch (err) {
+          for (const it of batch) it.reject(err);
+        }
+      }
+    } finally {
+      this.draining = false;
+    }
+    if (this.outbox.length) this.kickDrain();
+  }
+
+  private async sendSplit(packed: Uint8Array) {
+    const step = MAX_FRAME_PAYLOAD - SEG_HEADER;
+    for (let o = 0; o < packed.length; o += step) {
+      const end = Math.min(packed.length, o + step);
+      await this.sendFrame([{ flag: end >= packed.length ? SEG_LAST : SEG_MORE, data: packed.subarray(o, end) }]);
+      frameStats.fragments++;
+    }
+  }
+
+  private async sendFrame(segs: Segment[], rekeyNonce?: Uint8Array) {
+    if (this.closed && !segs.length) return;
+    const live = this.sendLive;
+    const dir = this.initiator ? "e2g" : "g2e";
+    const counter = live.counters[dir] + 1;
+    if (!live.v2) throw new Error("缺少 v2 帧密钥");
+    const prose = sealV2({ keys: live.v2, counter, window: live.window, dir, plaintext: packBatch(segs), maxExpansion: frameMaxExpansion, smallFramePolicy: frameSmallPolicy });
+    live.counters[dir] = counter;
+    // The rekey frame is sealed under the OLD generation, but we must already be able to
+    // read the peer's next-generation frames when it reacts, so switch before writing.
+    if (rekeyNonce) this.sendLive = await this.deriveNext(live, rekeyNonce);
+    await this.pipe.write(prose);
+    frameStats.frames++;
+    frameStats.records += segs.filter((x) => x.flag !== SEG_MORE).length;
+    if (!rekeyNonce) this.kickRekey();
   }
 
   private kickRekey() {
@@ -742,33 +865,31 @@ export class LexSession {
     if (payload.length < 20) throw new Error("换钥报文太短");
     const nonce = payload.subarray(0, 16);
     const window = readU32(payload, 16);
-    const sk = await hkdf(base.sk, nonce, utf8("lexis-rekey-v1"), 32);
-    const lexicon = await sessionLexicon(sk, window);
+    void nonce;
+    // v2 rekey: same rules as the first key (separate HKDF keys per generation);
+    // counters stay strictly consecutive across generations.
+    const sk = nextSessionKey(base.sk, payload.subarray(0, 20));
+    const gen = (base.v2?.gen ?? 0) + 1;
     return {
       ...base,
       sk,
       window,
-      lexicon,
-      inverse: invertLexicon(lexicon),
-      counters: { e2g: 0, g2e: 0 },
-      seen: { e2g: 0, g2e: 0 },
+      v2: deriveV2Keys(sk, gen, base.v2MnemonicBase ?? null),
+      // One strictly consecutive sequence per direction across all generations: share the
+      // same objects (copying them lost frames still in flight under the old generation).
+      counters: base.counters,
+      seen: base.seen,
     };
   }
 
   private async openLive(live: LiveSession, prose: string, honey = live.honey) {
+    void honey;
     const dir = this.initiator ? "g2e" : "e2g";
-    const opened = await open({
-      key: live.sk,
-      inverse: live.inverse,
-      window: live.window,
-      direction: dir,
-      prose,
-      lastSeen: live.seen[dir],
-      honey,
-      program: live.program ?? null,
-    });
-    if (!opened.honey) live.seen[dir] = opened.counter;
-    return opened;
+    if (!live.v2) throw new Error("缺少 v2 帧密钥");
+    const counter = live.seen[dir] + 1;
+    const plaintext = openV2({ keys: live.v2, counter, window: live.window, dir, prose });
+    live.seen[dir] = counter;
+    return { plaintext, counter, honey: false };
   }
 
   async sendChunks(stream: MuxStream, chunk: Uint8Array) {
@@ -796,6 +917,12 @@ export class LexSession {
 
   private async onRecord(type: number, conn: number, payload: Uint8Array) {
     if (type === RECORD.heartbeat) return;
+    if (type === RECORD.end) {
+      this.peerEnded = true;
+      frameStats.ended++;
+      this.shutdown(false);
+      return;
+    }
     if (type === RECORD.credit) {
       const n = payload.length >= 2 ? readU16(payload, 0) : 1;
       this.streams.get(conn)?.grant(n);
@@ -847,34 +974,46 @@ export class LexSession {
         const pending = this.sendLive !== this.recvLive;
         let opened;
         try {
-          opened = await this.openLive(this.recvLive, prose, pending ? false : this.recvLive.honey);
+          opened = await this.openLive(this.recvLive, prose, false);
         } catch (err) {
-          if (!pending) throw err;
+          if (!pending) {
+            frameStats.integrity++;
+            throw err;
+          }
           try {
             opened = await this.openLive(this.sendLive, prose, false);
             this.recvLive = this.sendLive;
             this.live = this.sendLive;
             this.rekeyBusy = false;
           } catch (err2) {
-            if (this.sendLive.honey || this.recvLive.honey) continue;
+            frameStats.integrity++;
             throw err2;
           }
         }
         if (opened.honey) continue;
         this.lastRx = Date.now();
-        let rec;
-        try {
-          const raw = await unpackRecord(opened.plaintext);
-          rec = decodeRecord(raw);
-        } catch {
-          continue;
+        // The frame already passed the mnemonic check, so a malformed batch can only come
+        // from a broken peer, not from tampering: treat it as fatal (feed throws ->
+        // outer catch closes the session) rather than desync the reassembler.
+        const packedRecords = this.reasm.feed(unpackBatch(opened.plaintext));
+        for (const packed of packedRecords) {
+          let rec;
+          try {
+            rec = decodeRecord(await unpackRecord(packed));
+          } catch {
+            continue; // unknown/garbled inner record: skip it, as 1.8.0 did
+          }
+          await this.onRecord(rec.type, rec.conn, rec.payload);
+          if (this.closed) break;
         }
-        await this.onRecord(rec.type, rec.conn, rec.payload);
       }
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
-      if (!this.closed && message !== "连接关闭") console.error("词隙会话结束", message);
-      this.shutdown();
+      if (!this.closed && !this.peerEnded && message === "连接关闭") {
+        frameStats.truncated++;
+        console.error("词隙会话被截断：对端没有发送结束帧");
+      } else if (!this.closed && message !== "连接关闭") console.error("词隙会话结束", message);
+      this.shutdown(false);
     }
   }
 }
@@ -919,10 +1058,10 @@ export async function connectSession(opts: {
   const self = { ...opts.self, role: "edge" as const };
   const token = opts.token || "";
   const wait = opts.handshakeMs ?? 10000;
-  const pending = await edgeStart(self, Date.now(), opts.offer, token);
+  const pending = edgeStart3(self, opts.peerRawB64, Date.now(), opts.offer, token);
   await opts.pipe.write(pending.helloWire);
   const serverWire = await opts.pipe.read(wait);
-  const finished = await edgeFinish(self, pending, opts.peerRawB64, serverWire, token);
+  const finished = await edgeFinish3(self, pending, opts.peerRawB64, serverWire);
   await opts.pipe.write(finished.finishWire);
   const live = await openSession({
     edge: self,
@@ -933,10 +1072,12 @@ export async function connectSession(opts: {
     serverWire,
     finishWire: finished.finishWire,
     kdf: finished.kdf,
-    honey: finished.honey,
+    honey: false,
     kdfMs: finished.kdfMs,
     program: opts.program ?? null,
   });
+  live.v2 = finished.keys;
+  live.v2MnemonicBase = finished.mnemonicBase;
   return sessionFrom(
     opts.pipe,
     live,
@@ -963,38 +1104,80 @@ export async function acceptSession(opts: {
   handshakeMs?: number;
   rekeyAt?: number;
   sourceIp?: string;
+  maxHalfOpen?: number;
+  maxHalfOpenPerIp?: number;
+  /** D5: caller already decided to refuse (e.g. maxConns); take the silent path. */
+  refuse?: boolean;
   program?: LiveSession["program"];
   onReady?: (session: LexSession) => void;
   onStream?: (stream: MuxStream) => void;
 }) {
   const self = { ...opts.self, role: "gate" as const };
   const wait = opts.handshakeMs ?? 10000;
-  const helloWire = await opts.pipe.read(wait);
-  let pending: GatePending | null = null;
-  let matched = "";
-  let last = "没有匹配的节点公钥";
-  for (const peer of opts.peers) {
-    if (!peer.publicRawB64) continue;
+  const ip = opts.sourceIp || "";
+  // D5: half-open caps. Over a cap we never parse anything; we read and discard until the
+  // same deadline, then close -- identical from outside to a bad or missing hello.
+  const overCap =
+    opts.refuse === true ||
+    (opts.maxHalfOpen !== undefined && halfOpen.total >= opts.maxHalfOpen) ||
+    (opts.maxHalfOpenPerIp !== undefined && (halfOpen.perIp.get(ip) || 0) >= opts.maxHalfOpenPerIp);
+  if (overCap) {
+    halfOpen.refused += 1;
+    const until = Date.now() + wait;
     try {
-      pending = await gateRespond(self, peer.publicRawB64, helloWire, {
-        token: opts.token,
-        kdf: opts.kdf,
-        sourceIp: opts.sourceIp,
-        peerId: peer.id || "",
-      });
-      matched = peer.id || "";
-      break;
-    } catch (err) {
-      const message = err instanceof Error ? err.message : String(err);
-      last = message;
-      if (!message.includes("绑定不一致")) throw err;
+      for (;;) {
+        const rest = until - Date.now();
+        if (rest <= 0) break;
+        await opts.pipe.read(rest);
+      }
+    } catch {
+      const rest = until - Date.now();
+      if (rest > 0) await new Promise((r) => setTimeout(r, rest));
     }
+    throw new Error("握手超时");
   }
-  if (!pending) throw new Error(last);
-  await opts.pipe.write(pending.serverWire);
-  const finishWire = await opts.pipe.read(wait);
-  await gateAccept(pending, finishWire);
-  const honey = honeyFromFeatures(pending.features);
+  halfOpen.total += 1;
+  halfOpen.perIp.set(ip, (halfOpen.perIp.get(ip) || 0) + 1);
+  let released = false;
+  const release = () => {
+    if (released) return;
+    released = true;
+    halfOpen.total -= 1;
+    const n = (halfOpen.perIp.get(ip) || 1) - 1;
+    if (n <= 0) halfOpen.perIp.delete(ip);
+    else halfOpen.perIp.set(ip, n);
+  };
+  try {
+    return await acceptSessionInner(opts, self, wait);
+  } finally {
+    release();
+  }
+}
+
+/** D5: live half-open handshake counters (exported for metrics/tests). */
+export const halfOpen = { total: 0, refused: 0, perIp: new Map<string, number>() };
+
+async function acceptSessionInner(opts: Parameters<typeof acceptSession>[0], self: MeshNode & { role: "gate" }, wait: number) {
+  // T21: every failure (no hello, unparsable, wrong token, unknown peer, replay, bad
+  // finish) looks the same from outside: nothing is written and the pipe is closed
+  // when the handshake deadline expires.
+  const deadline = Date.now() + wait;
+  let helloWire = "";
+  let pending: Awaited<ReturnType<typeof gateRespond3>>;
+  let finishWire = "";
+  let accepted: ReturnType<typeof gateAccept3>;
+  try {
+    helloWire = await opts.pipe.read(wait);
+    pending = await gateRespond3(self, opts.peers, helloWire, { token: opts.token, kdf: opts.kdf, sourceIp: opts.sourceIp });
+    await opts.pipe.write(pending.serverWire);
+    finishWire = await opts.pipe.read(Math.max(1, deadline - Date.now()));
+    accepted = gateAccept3(pending, finishWire);
+  } catch {
+    const rest = deadline - Date.now();
+    if (rest > 0) await new Promise((r) => setTimeout(r, rest));
+    throw new Error("握手超时");
+  }
+  const matched = pending.peerId;
   const live = await openSession({
     edge: { ...self, id: matched || "peer", name: "对端", role: "edge", publicRawB64: b64(pending.ltC) },
     gate: self,
@@ -1004,10 +1187,14 @@ export async function acceptSession(opts: {
     serverWire: pending.serverWire,
     finishWire,
     kdf: pending.kdf,
-    honey,
+    honey: false,
     kdfMs: 0,
     program: opts.program ?? null,
   });
+  live.v2 = accepted.keys;
+  live.v2MnemonicBase = accepted.mnemonicBase;
+  // drop the handshake-only secrets
+  pending.ssE.fill(0);
   return sessionFrom(
     opts.pipe,
     live,
