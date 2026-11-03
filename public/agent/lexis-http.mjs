@@ -282,6 +282,26 @@ function carriesBody(method, status) {
   return true;
 }
 
+function connectionTokens(lines) {
+  const tokens = new Set();
+  for (const line of lines) {
+    if (headerName(line) !== "connection") continue;
+    for (const token of line.slice(line.indexOf(":") + 1).split(",")) {
+      const name = token.trim().toLowerCase();
+      if (name) tokens.add(name);
+    }
+  }
+  return tokens;
+}
+
+// Close the client side if the client asked for it, or an HTTP/1.0 client did not opt into keep-alive.
+// Upstream Connection is hop-by-hop: each request opens its own upstream, so it does not affect the client.
+export function mustClose(reqLines) {
+  const req = connectionTokens(reqLines.slice(1));
+  if (req.has("close")) return true;
+  return /\sHTTP\/1\.0$/i.test(reqLines[0] || "") && !req.has("keep-alive");
+}
+
 export async function serveHttpProxy(socket, options) {
   const cap = options.headerCap || 8192;
   const count = options.count || (() => undefined);
@@ -384,7 +404,7 @@ export async function serveHttpProxy(socket, options) {
           : respFrame.mode === "length"
             ? `Content-Length: ${respFrame.length}\r\n`
             : "";
-      const keep = carriesBody(method, statusCode) && respFrame.mode !== "none" ? "keep-alive" : "close";
+      const keep = carriesBody(method, statusCode) && respFrame.mode !== "none" && !mustClose(lines) ? "keep-alive" : "close";
       await writeAll(socket, Buffer.from(`${respLines[0]}\r\n${respKept.length ? `${respKept.join("\r\n")}\r\n` : ""}${respExtra}Connection: ${keep}\r\n\r\n`));
       if (!carriesBody(method, statusCode)) {
         upstream.destroy();
@@ -410,8 +430,7 @@ export async function serveHttpProxy(socket, options) {
       }
       upstream.destroy();
       count("httpOk");
-      const connection = headerValue(lines, "connection").toLowerCase();
-      if (connection === "close" || /HTTP\/1\.0/i.test(lines[0] || "")) {
+      if (keep === "close") {
         socket.end();
         return;
       }

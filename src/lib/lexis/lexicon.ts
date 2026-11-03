@@ -39,28 +39,41 @@ export async function buildLexicon(seed: Uint8Array): Promise<string[]> {
   const seen = new Set<string>();
   const words: string[] = [];
   const limit = Math.floor(65536 / SPACE) * SPACE;
+  // Pools are HKDF output blocks (async WebCrypto); fetch the next one only when the current one
+  // runs out, and draw indices synchronously (was one Promise per 16-bit draw).
   let round = 0;
   let pool: Uint8Array = new Uint8Array(0);
   let pos = 0;
-
   const pull = async () => {
     pool = await hkdfStream(seed, utf8(`LEXIS-LEX-STREAM-${round}`), "idx", 16000);
     round += 1;
     pos = 0;
   };
-
-  const next16 = async () => {
-    if (pos + 2 > pool.length) await pull();
+  /** Next 16-bit draw, or -1 when the pool is exhausted (caller pulls and retries). */
+  const next16 = (): number => {
+    if (pos + 2 > pool.length) return -1;
     const v = (pool[pos] << 8) | pool[pos + 1];
     pos += 2;
+    return v;
+  };
+  const draw16 = async (): Promise<number> => {
+    let v = next16();
+    while (v < 0) {
+      await pull();
+      v = next16();
+    }
     return v;
   };
 
   let guard = 0;
   while (words.length < SPEC.lexiconSize) {
     if (guard++ > SPACE * 4) throw new Error("词表生成失败");
-    let draw = await next16();
-    while (draw >= limit) draw = await next16();
+    let draw = next16();
+    if (draw < 0) draw = await draw16();
+    while (draw >= limit) {
+      draw = next16();
+      if (draw < 0) draw = await draw16();
+    }
     const n = draw % SPACE;
     if (used[n]) continue;
     used[n] = 1;

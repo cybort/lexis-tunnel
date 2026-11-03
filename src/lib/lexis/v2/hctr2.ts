@@ -4,12 +4,12 @@
  * AES block function and POLYVAL; checked against google/hctr2 official vectors
  * (hctr2.test.ts). Minimum message length is one block (16 bytes).
  */
-import { unsafe } from "@noble/ciphers/aes.js";
+import { aes256Block, type AesBlock } from "../native";
 import { polyval } from "@noble/ciphers/_polyval.js";
 
 const BLOCK = 16;
 
-export type Hctr2Key = { enc: Uint32Array; dec: Uint32Array; h: Uint8Array; L: Uint8Array };
+export type Hctr2Key = { aes: AesBlock; h: Uint8Array; L: Uint8Array };
 
 function block(src?: Uint8Array): Uint8Array {
   const out = new Uint8Array(BLOCK);
@@ -18,18 +18,16 @@ function block(src?: Uint8Array): Uint8Array {
 }
 
 function aesEnc(k: Hctr2Key, input: Uint8Array): Uint8Array {
-  return unsafe.encryptBlock(k.enc, block(input));
+  return k.aes.enc(block(input));
 }
 
 function aesDec(k: Hctr2Key, input: Uint8Array): Uint8Array {
-  return unsafe.decryptBlock(k.dec, block(input));
+  return k.aes.dec(block(input));
 }
 
 export function hctr2Key(key: Uint8Array): Hctr2Key {
   if (key.length !== 32) throw new Error("HCTR2 needs a 32-byte AES-256 key");
-  const enc = unsafe.expandKeyLE(key);
-  const dec = unsafe.expandKeyDecLE(key);
-  const k: Hctr2Key = { enc, dec, h: new Uint8Array(BLOCK) as Uint8Array, L: new Uint8Array(BLOCK) as Uint8Array };
+  const k: Hctr2Key = { aes: aes256Block(key), h: new Uint8Array(BLOCK) as Uint8Array, L: new Uint8Array(BLOCK) as Uint8Array };
   k.h = aesEnc(k, new Uint8Array(BLOCK)); // h = E_K(0^128)
   const one = new Uint8Array(BLOCK);
   one[0] = 1;
@@ -82,11 +80,11 @@ function xor(a: Uint8Array, b: Uint8Array): Uint8Array {
 /** XCTR: block i (from 1) = E_K(S xor LE128(i)). */
 function xctr(k: Hctr2Key, s: Uint8Array, data: Uint8Array): Uint8Array {
   const out = new Uint8Array(data.length);
-  for (let off = 0, i = 1; off < data.length; off += BLOCK, i++) {
-    const ks = aesEnc(k, xor(s, le128(i)));
-    const n = Math.min(BLOCK, data.length - off);
-    for (let j = 0; j < n; j++) out[off + j] = data[off + j] ^ ks[j];
-  }
+  const nb = Math.ceil(data.length / BLOCK);
+  const ctrs = new Uint8Array(nb * BLOCK);
+  for (let i = 1; i <= nb; i++) ctrs.set(xor(s, le128(i)), (i - 1) * BLOCK);
+  const ks = nb ? k.aes.enc(ctrs) : ctrs;
+  for (let j = 0; j < data.length; j++) out[j] = data[j] ^ ks[j];
   return out;
 }
 

@@ -721,11 +721,15 @@ export function ConfigPanel() {
           {profile.mode === "system-forward" ? "客户端启动时会按当前系统写出并尝试执行。" : "现在走固定端口。这些参数会跟着配置走，切到系统接管才生效。"}
         </p>
         <div className="mt-4 grid gap-3 lg:grid-cols-3">
-          <Platform title="Linux" body="redirect、tproxy 或虚拟网卡。需要 root 才会改规则，并读取原始目的地址。">
+          <Platform title="Linux" body="redirect、tproxy 或虚拟网卡。需要 root 才会改规则。虚拟网卡只认 IPv4。公网 IPv6 默认不可达，回环、链路本地、ULA 和组播仍走原来的路由。选「不动」则不改 IPv6，那些流量不进隧道。没有在这台机器上证明规则已经接住流量。">
             <select className={control} value={profile.linux.method} onChange={(e) => patch({ linux: { ...profile.linux, method: e.target.value as LexisProfile["linux"]["method"] } })}>
               <option value="redirect">redirect</option>
               <option value="tproxy">tproxy</option>
               <option value="tun">虚拟网卡</option>
+            </select>
+            <select className={control} aria-label="公网 IPv6" value={profile.linux.ipv6 === "off" ? "off" : "block"} onChange={(e) => patch({ linux: { ...profile.linux, ipv6: e.target.value === "off" ? "off" : "block" } })}>
+              <option value="block">公网 IPv6 不可达</option>
+              <option value="off">不动 IPv6</option>
             </select>
             <input className={control} aria-label="fwmark" inputMode="numeric" value={profile.linux.mark} onChange={(e) => patch({ linux: { ...profile.linux, mark: Number(e.target.value) } })} />
           </Platform>

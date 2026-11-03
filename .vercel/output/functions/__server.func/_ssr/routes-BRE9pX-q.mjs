@@ -1,16 +1,134 @@
-import { i as __toESM } from "../_runtime.mjs";
+import { i as __toESM, n as __exportAll } from "../_runtime.mjs";
 import { q as require_react, x as require_jsx_runtime, y as Link } from "../_libs/@tanstack/react-router+[...].mjs";
 import { a as Radio, c as ArrowRight, n as Trash2, s as Download } from "../_libs/lucide-react.mjs";
-import { n as persist, r as create, t as createJSONStorage } from "../_libs/zustand.mjs";
 import { r as x25519, t as ed25519 } from "../_libs/noble__curves+noble__hashes.mjs";
-import { i as argon2id, n as hkdf, r as hmac, t as sha256 } from "../_libs/noble__hashes.mjs";
 import { n as unsafe, r as polyval, t as ctr } from "../_libs/noble__ciphers.mjs";
+import { n as persist, r as create, t as createJSONStorage } from "../_libs/zustand.mjs";
+import { i as argon2id, n as hkdf, r as hmac, t as sha256 } from "../_libs/noble__hashes.mjs";
 import { t as require_index_node } from "../_libs/bokuweb__zstd-wasm.mjs";
 import { a as Cell, i as Bar, n as YAxis, o as ResponsiveContainer, r as XAxis, s as Tooltip, t as BarChart } from "../_libs/recharts+[...].mjs";
-//#region node_modules/.nitro/vite/services/ssr/assets/routes-JRFnRHoy.js
+//#region node_modules/.nitro/vite/services/ssr/assets/routes-BRE9pX-q.js
+var routes_BRE9pX_q_exports = /* @__PURE__ */ __exportAll({
+	component: () => Home,
+	n: () => aesCtrKeystream,
+	r: () => x25519PublicKey,
+	t: () => aes256Block
+});
 var import_react = /* @__PURE__ */ __toESM(require_react());
 var import_jsx_runtime = require_jsx_runtime();
 var import_index_node = require_index_node();
+/**
+* fix/gate-alloc: native (OpenSSL via node:crypto) X25519 public-key derivation and AES-256
+* (CTR keystream, raw block encrypt/decrypt), with the @noble pure-JS code as fallback where
+* node:crypto is unavailable (browser). Each native path is self-tested against noble once
+* at load; on any mismatch the noble path is used. Outputs are byte-identical (RFC 7748 X25519,
+* FIPS-197 AES, SP 800-38A CTR with a 128-bit big-endian counter); see native.test.ts.
+*/
+var PKCS8$1 = Uint8Array.from([
+	48,
+	46,
+	2,
+	1,
+	0,
+	48,
+	5,
+	6,
+	3,
+	43,
+	101,
+	110,
+	4,
+	34,
+	4,
+	32
+]);
+function getNode() {
+	try {
+		const c = globalThis.process?.getBuiltinModule?.("node:crypto");
+		if (!c || typeof c.createCipheriv !== "function" || typeof c.createPrivateKey !== "function") return null;
+		return c;
+	} catch {
+		return null;
+	}
+}
+var node = getNode();
+var eq = (a, b) => a.length === b.length && a.every((v, i) => v === b[i]);
+function nodeX25519Pub(c, seed) {
+	const priv = c.createPrivateKey({
+		key: Buffer.concat([PKCS8$1, seed]),
+		format: "der",
+		type: "pkcs8"
+	});
+	const spki = c.createPublicKey(priv).export({
+		format: "der",
+		type: "spki"
+	});
+	return new Uint8Array(spki.subarray(spki.length - 32));
+}
+function nodeCtr(c, key, nonce, len) {
+	const ci = c.createCipheriv("aes-256-ctr", key, nonce);
+	const out = ci.update(new Uint8Array(len));
+	ci.final();
+	return new Uint8Array(out.buffer, out.byteOffset, out.byteLength);
+}
+var useNodeX = (() => {
+	if (!node) return false;
+	try {
+		const s = (/* @__PURE__ */ new Uint8Array(32)).map((_, i) => i * 7 + 1);
+		return eq(nodeX25519Pub(node, s), x25519.getPublicKey(s));
+	} catch {
+		return false;
+	}
+})();
+var useNodeAes = (() => {
+	if (!node) return false;
+	try {
+		const k = (/* @__PURE__ */ new Uint8Array(32)).map((_, i) => i * 13 + 5);
+		const n = (/* @__PURE__ */ new Uint8Array(16)).fill(255);
+		return eq(nodeCtr(node, k, n, 100), ctr(k, n).encrypt(/* @__PURE__ */ new Uint8Array(100)));
+	} catch {
+		return false;
+	}
+})();
+/** RFC 7748 X25519(seed, 9): public key for a 32-byte secret (clamped internally). */
+function x25519PublicKey(seed) {
+	if (seed.length !== 32) throw new Error("x25519 seed must be 32 bytes");
+	return useNodeX ? nodeX25519Pub(node, seed) : x25519.getPublicKey(seed);
+}
+/** AES-256-CTR keystream of `len` bytes starting at counter block `nonce` (16 bytes, big-endian increment). */
+function aesCtrKeystream(key, nonce, len) {
+	return useNodeAes ? nodeCtr(node, key, nonce, len) : ctr(key, nonce).encrypt(new Uint8Array(len));
+}
+/** Raw AES-256 block cipher (ECB on whole blocks, no padding). Input length must be a multiple of 16. */
+function aes256Block(key) {
+	if (key.length !== 32) throw new Error("AES-256 needs a 32-byte key");
+	if (useNodeAes) {
+		const c = node;
+		const e = c.createCipheriv("aes-256-ecb", key, null).setAutoPadding(false);
+		const d = c.createDecipheriv("aes-256-ecb", key, null).setAutoPadding(false);
+		const run = (x, b) => {
+			if (b.length % 16) throw new Error("AES block input must be whole blocks");
+			const o = x.update(b);
+			return new Uint8Array(o.buffer, o.byteOffset, o.byteLength);
+		};
+		return {
+			enc: (b) => run(e, b),
+			dec: (b) => run(d, b)
+		};
+	}
+	const ek = unsafe.expandKeyLE(key);
+	const dk = unsafe.expandKeyDecLE(key);
+	const each = (b, f, k) => {
+		if (b.length % 16) throw new Error("AES block input must be whole blocks");
+		const out = new Uint8Array(b.length);
+		for (let o = 0; o < b.length; o += 16) out.set(f(k, b.slice(o, o + 16)), o);
+		return out;
+	};
+	return {
+		enc: (b) => each(b, unsafe.encryptBlock, ek),
+		dec: (b) => each(b, unsafe.decryptBlock, dk)
+	};
+}
 function concat(...parts) {
 	let n = 0;
 	for (const p of parts) n += p.length;
@@ -195,8 +313,8 @@ async function identityFromJwks(publicJwk, privateJwk) {
 	if (privateJwk.kty !== "OKP" || privateJwk.crv !== "X25519" || !privateJwk.d) throw new LexisError("侧车里的私钥不是 X25519");
 	const publicRaw = jwkOkpToRaw(publicJwk);
 	const seed = b64urlDecode(privateJwk.d);
-	const { x25519 } = await import("../_libs/noble__curves+noble__hashes.mjs").then((n) => n.n);
-	const expect = x25519.getPublicKey(seed);
+	const { x25519PublicKey } = await import("./native-lpghMd2f.mjs");
+	const expect = x25519PublicKey(seed);
 	if (publicRaw.length !== 32 || !expect.every((b, i) => b === publicRaw[i])) throw new LexisError("侧车里的私钥和公钥不是一对");
 	return {
 		publicJwk,
@@ -597,17 +715,30 @@ async function buildLexicon(seed) {
 		round += 1;
 		pos = 0;
 	};
-	const next16 = async () => {
-		if (pos + 2 > pool.length) await pull();
+	/** Next 16-bit draw, or -1 when the pool is exhausted (caller pulls and retries). */
+	const next16 = () => {
+		if (pos + 2 > pool.length) return -1;
 		const v = pool[pos] << 8 | pool[pos + 1];
 		pos += 2;
+		return v;
+	};
+	const draw16 = async () => {
+		let v = next16();
+		while (v < 0) {
+			await pull();
+			v = next16();
+		}
 		return v;
 	};
 	let guard = 0;
 	while (words.length < SPEC.lexiconSize) {
 		if (guard++ > SPACE * 4) throw new Error("词表生成失败");
-		let draw = await next16();
-		while (draw >= limit) draw = await next16();
+		let draw = next16();
+		if (draw < 0) draw = await draw16();
+		while (draw >= limit) {
+			draw = next16();
+			if (draw < 0) draw = await draw16();
+		}
 		const n = draw % SPACE;
 		if (used[n]) continue;
 		used[n] = 1;
@@ -875,7 +1006,7 @@ async function openIdentityVault(vault, passphrase) {
 	joined.set(lo, 0);
 	joined.set(hi, 16);
 	const seed = joined;
-	const x = b64url(x25519.getPublicKey(seed));
+	const x = b64url(x25519PublicKey(seed));
 	const d = b64url(seed);
 	return identityFromJwks({
 		kty: "OKP",
@@ -1108,7 +1239,8 @@ function defaultProfile() {
 			method: "redirect",
 			mark: 255,
 			table: 100,
-			dnsRedirect: true
+			dnsRedirect: true,
+			ipv6: "block"
 		},
 		windows: {
 			method: "portproxy",
@@ -1189,7 +1321,8 @@ function linuxOf(base, raw) {
 		method,
 		mark: clampNum(raw?.mark, 1, 255, base.mark),
 		table: clampNum(raw?.table, 1, 65535, base.table),
-		dnsRedirect: raw?.dnsRedirect !== false
+		dnsRedirect: raw?.dnsRedirect !== false,
+		ipv6: raw?.ipv6 === "off" ? "off" : "block"
 	};
 }
 function normalizeProfile(input) {
@@ -1904,16 +2037,15 @@ function block(src) {
 	return out;
 }
 function aesEnc(k, input) {
-	return unsafe.encryptBlock(k.enc, block(input));
+	return k.aes.enc(block(input));
 }
 function aesDec(k, input) {
-	return unsafe.decryptBlock(k.dec, block(input));
+	return k.aes.dec(block(input));
 }
 function hctr2Key(key) {
 	if (key.length !== 32) throw new Error("HCTR2 needs a 32-byte AES-256 key");
 	const k = {
-		enc: unsafe.expandKeyLE(key),
-		dec: unsafe.expandKeyDecLE(key),
+		aes: aes256Block(key),
 		h: new Uint8Array(BLOCK),
 		L: new Uint8Array(BLOCK)
 	};
@@ -1964,11 +2096,11 @@ function xor(a, b) {
 /** XCTR: block i (from 1) = E_K(S xor LE128(i)). */
 function xctr(k, s, data) {
 	const out = new Uint8Array(data.length);
-	for (let off = 0, i = 1; off < data.length; off += BLOCK, i++) {
-		const ks = aesEnc(k, xor(s, le128(i)));
-		const n = Math.min(BLOCK, data.length - off);
-		for (let j = 0; j < n; j++) out[off + j] = data[off + j] ^ ks[j];
-	}
+	const nb = Math.ceil(data.length / BLOCK);
+	const ctrs = new Uint8Array(nb * BLOCK);
+	for (let i = 1; i <= nb; i++) ctrs.set(xor(s, le128(i)), (i - 1) * BLOCK);
+	const ks = nb ? k.aes.enc(ctrs) : ctrs;
+	for (let j = 0; j < data.length; j++) out[j] = data[j] ^ ks[j];
 	return out;
 }
 function hctr2Encrypt(k, tweak, plaintext) {
@@ -2034,7 +2166,7 @@ var KeyStream = class {
 			nonce[i] = b % 256;
 			b = Math.floor(b / 256);
 		}
-		this.buf = ctr(this.key, nonce).encrypt(/* @__PURE__ */ new Uint8Array(4096));
+		this.buf = new Uint8Array(aesCtrKeystream(this.key, nonce, 4096));
 		this.pos = 0;
 	}
 	byte() {
@@ -2122,6 +2254,44 @@ function huffmanLengths(freq) {
 	for (let k = 0; k < n; k++) lens[order[k]] = depth[k];
 	return lens;
 }
+/** Numeric prefix-code key: code < 2^40 and len < 64, so code * 64 + len is an exact safe integer. */
+function treeKey(len, code) {
+	return code * 64 + len;
+}
+/** Canonical prefix code (lengths, codes, decode map) for a weight table. */
+function canonicalCode(w) {
+	const len = huffmanLengths(w);
+	const syms = Array.from({ length: w.length }, (_, i) => i).sort((a, b) => len[a] - len[b] || a - b);
+	const code = new Uint32Array(w.length);
+	const tree = /* @__PURE__ */ new Map();
+	let c = 0;
+	let prev = len[syms[0]];
+	for (const s of syms) {
+		c <<= len[s] - prev;
+		prev = len[s];
+		code[s] = c;
+		tree.set(treeKey(len[s], c), s);
+		c++;
+	}
+	return {
+		len,
+		code,
+		tree,
+		maxLen: prev
+	};
+}
+var corpusCode = null;
+function corpusTables() {
+	if (corpusCode) return corpusCode;
+	const freq = FREQ_BY_RANK;
+	const cum = new Uint32Array(freq.length + 1);
+	for (let i = 0; i < freq.length; i++) cum[i + 1] = cum[i] + freq[i];
+	corpusCode = {
+		cum,
+		pc: canonicalCode(freq)
+	};
+	return corpusCode;
+}
 function buildModel(lexKey, padKey) {
 	const id = hexOf(lexKey) + hexOf(padKey);
 	const hit = modelCache$1.get(id);
@@ -2136,31 +2306,16 @@ function buildModel(lexKey, padKey) {
 	}
 	const index = /* @__PURE__ */ new Map();
 	words.forEach((w, i) => index.set(w, i));
-	const freq = FREQ_BY_RANK;
-	const cum = new Uint32Array(freq.length + 1);
-	for (let i = 0; i < freq.length; i++) cum[i + 1] = cum[i] + freq[i];
-	const codeLen = huffmanLengths(freq);
-	const syms = Array.from({ length: freq.length }, (_, i) => i).sort((a, b) => codeLen[a] - codeLen[b] || a - b);
-	const code = new Uint32Array(freq.length);
-	const decodeTree = /* @__PURE__ */ new Map();
-	let c = 0;
-	let prevLen = codeLen[syms[0]];
-	for (const s of syms) {
-		c <<= codeLen[s] - prevLen;
-		prevLen = codeLen[s];
-		code[s] = c;
-		decodeTree.set(`${codeLen[s]}:${c}`, s);
-		c++;
-	}
+	const { cum, pc } = corpusTables();
 	const model = {
 		words,
 		index,
-		freq,
+		freq: FREQ_BY_RANK,
 		cum,
-		codeLen,
-		code,
-		decodeTree,
-		maxLen: prevLen,
+		codeLen: pc.len,
+		code: pc.code,
+		decodeTree: pc.tree,
+		maxLen: pc.maxLen,
 		padKey
 	};
 	modelCache$1.set(id, model);
@@ -2174,25 +2329,7 @@ function stateCoder() {
 	const bin = atob(STATE_WEIGHTS);
 	const raw = new Uint8Array(bin.length);
 	for (let i = 0; i < bin.length; i++) raw[i] = bin.charCodeAt(i);
-	const w = new Uint32Array(raw.buffer, raw.byteOffset, raw.byteLength >>> 2);
-	const len = huffmanLengths(w);
-	const syms = Array.from({ length: w.length }, (_, i) => i).sort((a, b) => len[a] - len[b] || a - b);
-	const code = new Uint32Array(w.length);
-	const tree = /* @__PURE__ */ new Map();
-	let c = 0;
-	let prev = len[syms[0]];
-	for (const s of syms) {
-		c <<= len[s] - prev;
-		prev = len[s];
-		code[s] = c;
-		tree.set(`${len[s]}:${c}`, s);
-		c++;
-	}
-	stateCode = {
-		len,
-		code,
-		tree
-	};
+	stateCode = canonicalCode(new Uint32Array(raw.buffer, raw.byteOffset, raw.byteLength >>> 2));
 	return stateCode;
 }
 function findSym(model, slot) {
@@ -2236,7 +2373,7 @@ function bytesToWords(model, data, padSeed) {
 	let i = 0;
 	while (i < bits.length) {
 		acc += pull(i++);
-		const s = model.decodeTree.get(`${acc.length}:${parseInt(acc, 2)}`);
+		const s = model.decodeTree.get(treeKey(acc.length, parseInt(acc, 2)));
 		if (s !== void 0) {
 			head.push(s);
 			acc = "";
@@ -2244,7 +2381,7 @@ function bytesToWords(model, data, padSeed) {
 	}
 	while (acc.length > 0) {
 		acc += pull(i++);
-		const s = model.decodeTree.get(`${acc.length}:${parseInt(acc, 2)}`);
+		const s = model.decodeTree.get(treeKey(acc.length, parseInt(acc, 2)));
 		if (s !== void 0) {
 			head.push(s);
 			acc = "";
@@ -2263,7 +2400,7 @@ function wordsToBytes(model, words) {
 	let used = 0;
 	while (k < syms.length) {
 		if (hs < 0) for (let n = 1; n <= bits.length && n <= 40; n++) {
-			const v = sc.tree.get(`${n}:${parseInt(bits.slice(0, n), 2)}`);
+			const v = sc.tree.get(treeKey(n, parseInt(bits.slice(0, n), 2)));
 			if (v !== void 0) {
 				hs = v;
 				used = n;
@@ -2275,7 +2412,7 @@ function wordsToBytes(model, words) {
 		bits += model.code[s].toString(2).padStart(model.codeLen[s], "0");
 	}
 	if (hs < 0) for (let n = 1; n <= bits.length && n <= 40; n++) {
-		const v = sc.tree.get(`${n}:${parseInt(bits.slice(0, n), 2)}`);
+		const v = sc.tree.get(treeKey(n, parseInt(bits.slice(0, n), 2)));
 		if (v !== void 0) {
 			hs = v;
 			used = n;
@@ -4912,38 +5049,57 @@ function ConfigPanel() {
 						children: [
 							/* @__PURE__ */ (0, import_jsx_runtime.jsxs)(Platform, {
 								title: "Linux",
-								body: "redirect、tproxy 或虚拟网卡。需要 root 才会改规则，并读取原始目的地址。",
-								children: [/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("select", {
-									className: control,
-									value: profile.linux.method,
-									onChange: (e) => patch({ linux: {
-										...profile.linux,
-										method: e.target.value
-									} }),
-									children: [
-										/* @__PURE__ */ (0, import_jsx_runtime.jsx)("option", {
-											value: "redirect",
-											children: "redirect"
-										}),
-										/* @__PURE__ */ (0, import_jsx_runtime.jsx)("option", {
-											value: "tproxy",
-											children: "tproxy"
-										}),
-										/* @__PURE__ */ (0, import_jsx_runtime.jsx)("option", {
-											value: "tun",
-											children: "虚拟网卡"
-										})
-									]
-								}), /* @__PURE__ */ (0, import_jsx_runtime.jsx)("input", {
-									className: control,
-									"aria-label": "fwmark",
-									inputMode: "numeric",
-									value: profile.linux.mark,
-									onChange: (e) => patch({ linux: {
-										...profile.linux,
-										mark: Number(e.target.value)
-									} })
-								})]
+								body: "redirect、tproxy 或虚拟网卡。需要 root 才会改规则。虚拟网卡只认 IPv4。公网 IPv6 默认不可达，回环、链路本地、ULA 和组播仍走原来的路由。选「不动」则不改 IPv6，那些流量不进隧道。没有在这台机器上证明规则已经接住流量。",
+								children: [
+									/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("select", {
+										className: control,
+										value: profile.linux.method,
+										onChange: (e) => patch({ linux: {
+											...profile.linux,
+											method: e.target.value
+										} }),
+										children: [
+											/* @__PURE__ */ (0, import_jsx_runtime.jsx)("option", {
+												value: "redirect",
+												children: "redirect"
+											}),
+											/* @__PURE__ */ (0, import_jsx_runtime.jsx)("option", {
+												value: "tproxy",
+												children: "tproxy"
+											}),
+											/* @__PURE__ */ (0, import_jsx_runtime.jsx)("option", {
+												value: "tun",
+												children: "虚拟网卡"
+											})
+										]
+									}),
+									/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("select", {
+										className: control,
+										"aria-label": "公网 IPv6",
+										value: profile.linux.ipv6 === "off" ? "off" : "block",
+										onChange: (e) => patch({ linux: {
+											...profile.linux,
+											ipv6: e.target.value === "off" ? "off" : "block"
+										} }),
+										children: [/* @__PURE__ */ (0, import_jsx_runtime.jsx)("option", {
+											value: "block",
+											children: "公网 IPv6 不可达"
+										}), /* @__PURE__ */ (0, import_jsx_runtime.jsx)("option", {
+											value: "off",
+											children: "不动 IPv6"
+										})]
+									}),
+									/* @__PURE__ */ (0, import_jsx_runtime.jsx)("input", {
+										className: control,
+										"aria-label": "fwmark",
+										inputMode: "numeric",
+										value: profile.linux.mark,
+										onChange: (e) => patch({ linux: {
+											...profile.linux,
+											mark: Number(e.target.value)
+										} })
+									})
+								]
 							}),
 							/* @__PURE__ */ (0, import_jsx_runtime.jsxs)(Platform, {
 								title: "Windows",
@@ -6204,7 +6360,7 @@ var STEPS = [
 	{
 		n: "02",
 		title: "临时密钥握出会话密钥",
-		body: "内网端主动连出。问候用临时密钥和闸门长期公钥算出的共享秘密来加密，只拿口令和闸门公钥解不出里面的长期公钥。会话密钥还混入两把临时密钥的共享秘密，再交给 Argon2id。握手确认用这个临时秘密来算，不再是公开的转录。这一层不是 TLS。帧仍是这一版。安装包是 3.0.2，和 3.0.0 的帧对得上。"
+		body: "内网端主动连出。问候用临时密钥和闸门长期公钥算出的共享秘密来加密，只拿口令和闸门公钥解不出里面的长期公钥。会话密钥还混入两把临时密钥的共享秘密，再交给 Argon2id。握手确认用这个临时秘密来算，不再是公开的转录。这一层不是 TLS。帧仍是这一版。安装包是 3.0.3，和 3.0.0 的帧对得上。"
 	},
 	{
 		n: "03",
@@ -6277,7 +6433,7 @@ function Overview({ onOpen }) {
 					}, title))
 				}), /* @__PURE__ */ (0, import_jsx_runtime.jsx)("p", {
 					className: "mt-4 text-sm text-mist",
-					children: "浏览器里不能守一个真正的 TCP 端口。这条控制台把握手和封装按 3.0 跑完，和下载的常驻进程是同一套帧。安装包是 3.0.2，和 3.0.0 的帧对得上。口令至少 128 比特，长期密钥都是 X25519。闸门半开按网段计，默认全局 512、每段 8，连接上限默认 1024。坏问候会马上让出名额，连接仍静默到握手超时；一个字节都不到，两秒后也会让出名额。静默连接堆过 1024 才会马上关掉。这不是系统层的建连限速，也不是 gVisor。TLS 和 WebSocket 只包在外面，方便过 CDN。安装包不再附带 TLS 私钥。时钟对不齐时，时间窗两边各留 120 秒。HTTP 代理按每个请求重写，去掉代理认证，并拒绝长度和分块写在一起。状态页在回环上可以看指标；离开回环要状态口令，健康检查仍然公开。Linux 上的用户态栈会切段、重传、暂存一段乱序，并按对端窗口停发。系统接管时，53 端口的查询答成 198.18.0.0/15 里的假地址，再映射回域名，假地址本身不会被拨出去。没有在这台机器上证明虚拟网卡或透明代理已经接住流量。Windows 的 WinDivert 只有源码，驱动不在包里。Android 只带 VpnService 源码和本机包通道，没有装好的系统 VPN。中继默认关闭。缺了角色的配置不会被当成边缘。"
+					children: "浏览器里不能守一个真正的 TCP 端口。这条控制台把握手和封装按 3.0 跑完，和下载的常驻进程是同一套帧。安装包是 3.0.3，和 3.0.0 的帧对得上。口令至少 128 比特，长期密钥都是 X25519。闸门半开按网段计，默认全局 512、每段 8，连接上限默认 1024。坏问候会马上让出名额，连接仍静默到握手超时；一个字节都不到，两秒后也会让出名额。静默连接堆过 1024 才会马上关掉。这不是系统层的建连限速，也不是 gVisor。TLS 和 WebSocket 只包在外面，方便过 CDN。安装包不再附带 TLS 私钥。时钟对不齐时，时间窗两边各留 120 秒。HTTP 代理按每个请求重写，去掉代理认证，并拒绝长度和分块写在一起。客户端要求关闭，或 HTTP/1.0 没声明保持连接时，响应后会关掉这条连接。状态页在回环上可以看指标；离开回环要状态口令，健康检查仍然公开。Linux 上的用户态栈会切段、暂存一段乱序，并按对端窗口停发。未确认的段可以重发，常驻进程没有定时去调。虚拟网卡按流排队：同一条流顺序不变，慢的一条不会卡住别的流，单条流排队超过 64 个就丢后面的。发往对端、却掉进虚拟网卡的包会丢掉。虚拟网卡只认 IPv4。公网 IPv6 默认不可达，回环、链路本地、ULA 和组播仍走原来的路由；写成 off 则不改 IPv6，那些流量不进隧道。ICMP 不转发。系统接管时，53 端口的查询答成 198.18.0.0/15 里的假地址，再映射回域名，假地址本身不会被拨出去。没有在这台机器上证明虚拟网卡或透明代理已经接住流量。Windows 的 WinDivert 只有源码，驱动不在包里。Android 只带 VpnService 源码和本机包通道，没有装好的系统 VPN。中继默认关闭。缺了角色的配置不会被当成边缘。"
 				})]
 			}),
 			/* @__PURE__ */ (0, import_jsx_runtime.jsx)("div", {
@@ -6464,4 +6620,4 @@ function Home() {
 	return /* @__PURE__ */ (0, import_jsx_runtime.jsx)(Console, {});
 }
 //#endregion
-export { Home as component };
+export { Home as component, routes_BRE9pX_q_exports as i, aesCtrKeystream as n, x25519PublicKey as r, aes256Block as t };

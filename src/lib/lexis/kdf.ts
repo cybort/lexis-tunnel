@@ -1,4 +1,4 @@
-import { x25519 } from "@noble/curves/ed25519.js";
+import { x25519PublicKey } from "./native";
 import { argon2id } from "@noble/hashes/argon2.js";
 import { concat, u32be, utf8 } from "./bytes";
 import { identityFromJwks, type KeyMaterial } from "./crypto";
@@ -112,7 +112,7 @@ export async function deriveIdentity(
     dkLen: 32,
   });
   const secret = dk;
-  const pub = x25519.getPublicKey(secret);
+  const pub = x25519PublicKey(secret);
   const x = b64url(pub);
   const d = b64url(secret);
   return identityFromJwks(

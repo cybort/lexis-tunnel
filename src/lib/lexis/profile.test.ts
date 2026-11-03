@@ -124,3 +124,9 @@ console.log("profile ok");
   assert.equal(profileIssues(defaultProfile()).some((item) => item.includes("连接上限")), false);
   console.log("profile half-open fields ok");
 }
+
+// 3.0.3 linux.ipv6: default block, only the literal "off" disables it
+assert.equal(defaultProfile().linux.ipv6, "block");
+assert.equal(normalizeProfile({ linux: { method: "tun" } }).linux.ipv6, "block");
+assert.equal(normalizeProfile({ linux: { method: "tun", ipv6: "off" } }).linux.ipv6, "off");
+assert.equal(normalizeProfile({ linux: { method: "tun", ipv6: "yes" } as never }).linux.ipv6, "block");

@@ -104,7 +104,7 @@ export type LexisProfile = {
   /** Required before /metrics or the status page leaves loopback. /health stays open. */
   statusToken: string;
   heartbeatSec: number;
-  linux: { method: "tproxy" | "redirect" | "tun"; mark: number; table: number; dnsRedirect: boolean };
+  linux: { method: "tproxy" | "redirect" | "tun"; mark: number; table: number; dnsRedirect: boolean; ipv6: "block" | "off" };
   windows: { method: "windivert" | "portproxy"; gateway: string };
   android: { method: "vpn"; mtu: number; address: string; dns: string };
   kdf: ArgonParams;
@@ -232,7 +232,7 @@ export function defaultProfile(): LexisProfile {
     statusPort: 17890,
     statusToken: "",
     heartbeatSec: 15,
-    linux: { method: "redirect", mark: 255, table: 100, dnsRedirect: true },
+    linux: { method: "redirect", mark: 255, table: 100, dnsRedirect: true, ipv6: "block" },
     windows: { method: "portproxy", gateway: "10.7.0.1" },
     android: { method: "vpn", mtu: 1500, address: "10.7.0.2/32", dns: "1.1.1.1" },
     kdf: { ...DEFAULT_KDF },
@@ -295,6 +295,8 @@ function linuxOf(base: LexisProfile["linux"], raw?: Partial<LexisProfile["linux"
     mark: clampNum(raw?.mark, 1, 255, base.mark),
     table: clampNum(raw?.table, 1, 65535, base.table),
     dnsRedirect: raw?.dnsRedirect !== false,
+    // tun mode: "block" (default) makes public IPv6 unreachable so it cannot bypass the tunnel; "off" leaves IPv6 routing alone.
+    ipv6: raw?.ipv6 === "off" ? "off" : "block",
   };
 }
 

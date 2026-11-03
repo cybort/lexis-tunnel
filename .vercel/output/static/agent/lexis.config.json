@@ -77,7 +77,8 @@
     "method": "redirect",
     "mark": 255,
     "table": 100,
-    "dnsRedirect": true
+    "dnsRedirect": true,
+    "ipv6": "block"
   },
   "windows": {
     "method": "portproxy",

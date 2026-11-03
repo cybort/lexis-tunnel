@@ -18,7 +18,7 @@ import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { acceptSession, connectSession, halfOpen, dialOuter, hopCount, listenOuter, nodeFromIdentity, openIdentityVault, parseOpen, pipeMux, programFromStored, setFrameOptions, startKdfPool, vaultFromStored } from "./lexis-frame.mjs";
 import { serveHttpProxy, classifyFraming, hostsAgree, sanitizeHeaders } from "./lexis-http.mjs";
-import { answerDns, buildDnsQuery, buildTcpPacket, buildUdpPacket, createEngine, createFakeIp, parseIpv4, parseTcp, parseUdp, redirectTcp } from "./lexis-tun.mjs";
+import { answerDns, buildDnsQuery, buildTcpPacket, buildUdpPacket, createEngine, createFakeIp, createFlowQueue, parseIpv4, parseTcp, parseUdp, redirectTcp } from "./lexis-tun.mjs";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const configPath = process.argv.includes("--config")
@@ -49,6 +49,9 @@ const state = {
 };
 const metrics = { httpOk: 0, httpReject: 0, smuggle: 0, transparent: 0, tunPackets: 0 };
 let tunStalls = 0;
+let tunLoopDrops = 0;
+let udpRebuildRetries = 0;
+let tunFlowDrops = 0;
 let remoteGeosite = "";
 let remoteGeoip = "";
 let liveConns = 0;
@@ -580,6 +583,11 @@ function lexiconEngine(config, emit) {
     log,
     udpIdleMs: linkOf(config).udpIdleMs,
     udpMax: linkOf(config).udpMax,
+    loopGuard: peerAddrs(config),
+    onLoopDrop: (ip) => {
+      tunLoopDrops += 1;
+      if (tunLoopDrops === 1 || tunLoopDrops % 100 === 0) log(`发往对端 ${ip.dst} 的包进了虚拟网卡（路由回落），已丢弃，共 ${tunLoopDrops} 个`);
+    },
   });
 }
 
@@ -785,19 +793,11 @@ async function exitUdp(stream, host, port) {
   const udp = createUdp(bare.includes(":") ? "udp6" : "udp4");
   await new Promise((resolve, reject) => {
     udp.once("error", reject);
-    udp.bind(0, () => resolve());
+    udp.bind(0, () => {
+      udp.removeListener("error", reject);
+      resolve();
+    });
   });
-  await stream.accept();
-  // Exit-side idle guard: an edge that never closes its UDP stream must not pin a socket here.
-  const idleMs = 2 * linkOf(activeConfig || {}).udpIdleMs;
-  let seen = Date.now();
-  const idle = setInterval(() => {
-    if (Date.now() - seen > idleMs) {
-      clearInterval(idle);
-      void stream.close().catch(() => undefined);
-    }
-  }, Math.min(10000, idleMs));
-  idle.unref?.();
   let udpClosed = false;
   const closeUdp = () => {
     if (udpClosed) return;
@@ -808,6 +808,25 @@ async function exitUdp(stream, host, port) {
       /* already closed */
     }
   };
+  // 3.0.3: a permanent listener, so a later async socket error closes once instead of
+  // becoming an unhandled 'error' event that takes the whole gate down.
+  udp.on("error", closeUdp);
+  try {
+    await stream.accept();
+  } catch (err) {
+    closeUdp();
+    throw err;
+  }
+  // Exit-side idle guard: an edge that never closes its UDP stream must not pin a socket here.
+  const idleMs = 2 * linkOf(activeConfig || {}).udpIdleMs;
+  let seen = Date.now();
+  const idle = setInterval(() => {
+    if (Date.now() - seen > idleMs) {
+      clearInterval(idle);
+      void stream.close().catch(() => undefined);
+    }
+  }, Math.min(10000, idleMs));
+  idle.unref?.();
   udp.on("message", (msg) => {
     seen = Date.now();
     void stream.write(msg).catch(closeUdp);
@@ -815,7 +834,7 @@ async function exitUdp(stream, host, port) {
   try {
     for (;;) {
       const chunk = await stream.read();
-      if (!chunk) break;
+      if (!chunk || udpClosed) break;
       seen = Date.now();
       await new Promise((resolve, reject) => udp.send(chunk, port, bare, (err) => (err ? reject(err) : resolve())));
     }
@@ -1465,6 +1484,36 @@ function dialTcp(config, host, port) {
   });
 }
 
+// 3.0.3: a UDP open that hits a session which is closing (or closes while the open is in
+// flight) used to fail outright ("连接关闭"/"打开超时"), so every DNS query during a
+// session rebuild was lost. Wait for the rebuilt session (bounded) and retry once.
+const REBUILD_WAIT_MS = 3000;
+async function openAcrossRebuild(config, peer, command, { open = sessionFor, waitMs = REBUILD_WAIT_MS } = {}) {
+  const first = await open(config, peer);
+  try {
+    return await first.open(command);
+  } catch (err) {
+    if (!first.closed) throw err;
+    const deadline = Date.now() + waitMs;
+    for (;;) {
+      const left = deadline - Date.now();
+      if (left <= 0) throw err;
+      let timer;
+      const next = await Promise.race([
+        open(config, peer),
+        new Promise((_, reject) => {
+          timer = setTimeout(() => reject(err), left);
+        }),
+      ]).finally(() => clearTimeout(timer));
+      if (next !== first && !next.closed) {
+        udpRebuildRetries += 1;
+        return await next.open(command);
+      }
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    }
+  }
+}
+
 async function dialUdp(config, host, port) {
   const live = activeConfig || config;
   const name = translateHost(live, host);
@@ -1473,8 +1522,7 @@ async function dialUdp(config, host, port) {
   if (decision.action === "proxy") {
     const peer = choosePeer(live);
     if (!peer) throw new Error("没有加入的节点");
-    const session = await sessionFor(live, peer);
-    const stream = await session.open(`udp ${name} ${port}`);
+    const stream = await openAcrossRebuild(live, peer, `udp ${name} ${port}`);
     const events = new EventTarget();
     const socket = {
       send(data, _port, _host, cb) {
@@ -1816,26 +1864,26 @@ function serveTun(config) {
   }
   const engine = lexiconEngine(config, (packet) => writeFd(opened.fd, packet, () => undefined));
   const buf = Buffer.alloc(65535);
+  // 3.0.3: packets are dispatched per flow (in order within a flow, flows independent), so
+  // a slow open on one flow no longer stalls the whole reader (see createFlowQueue).
+  const queue = createFlowQueue({
+    push: (packet) => engine.push(packet),
+    capMs: linkOf(activeConfig || config).dialMs + 2000,
+    onStall: () => {
+      tunStalls += 1;
+      log("虚拟网卡包处理过慢，先继续读后面的包");
+    },
+    onError: (err) => log(`虚拟网卡包处理失败：${err?.message || err}`),
+    onDrop: () => {
+      tunFlowDrops += 1;
+    },
+  });
   const pull = () => {
     readFd(opened.fd, buf, 0, buf.length, null, (err, n) => {
       if (err) return;
       metrics.tunPackets += 1;
-      // 3.0.3: one packet's processing (e.g. a dial) must never stall the whole tun reader.
-      // Packets stay in order while push settles quickly; a push slower than the cap keeps
-      // running in the background and reading resumes.
-      let capTimer;
-      const cap = new Promise((resolve) => {
-        capTimer = setTimeout(() => {
-          tunStalls += 1;
-          log("虚拟网卡包处理过慢，先继续读后面的包");
-          resolve();
-        }, linkOf(activeConfig || config).dialMs + 2000);
-      });
-      const work = engine.push(Buffer.from(buf.subarray(0, n))).catch((err) => log(`虚拟网卡包处理失败：${err?.message || err}`));
-      void Promise.race([work, cap]).finally(() => {
-        clearTimeout(capTimer);
-        pull();
-      });
+      void queue.dispatch(Buffer.from(buf.subarray(0, n)));
+      void queue.ready().then(pull);
     });
   };
   pull();
@@ -1944,6 +1992,8 @@ TABLE=${table}
 METHOD=${method}
 PEERS="${peers}"
 NETS="${nets}"
+IPV6=${config.linux?.ipv6 === "off" ? "off" : "block"}
+NETS6="::1/128 fe80::/10 fc00::/7 ff00::/8"
 if [ "$(id -u)" -ne 0 ]; then
   echo "没有 root，规则留在本文件，未改系统转发"
   exit 0
@@ -1969,9 +2019,32 @@ if [ "$METHOD" = "tun" ]; then
     ip rule del fwmark "$MARK" lookup main priority 100 2>/dev/null || true
     ip rule add fwmark "$MARK" lookup main priority 100
     keep_main
+    # 3.0.3: if the main route to a peer disappears (link down), fail fast instead of
+    # falling through to the tun table (which would loop the tunnel into itself).
+    prio=150
+    for ip in $PEERS; do
+      ip rule del to "$ip/32" unreachable priority "$prio" 2>/dev/null || true
+      ip rule add to "$ip/32" unreachable priority "$prio"
+      prio=$((prio + 1))
+    done
     ip route replace default dev lexis0 table "$TABLE"
     ip rule del lookup "$TABLE" priority 200 2>/dev/null || true
     ip rule add lookup "$TABLE" priority 200
+    # 3.0.3 linux.ipv6 (default "block"): the tun engine only speaks IPv4, so public IPv6
+    # would leave outside the tunnel. Make it unreachable; loopback, link-local, ULA and
+    # multicast keep the main table. "off" leaves IPv6 alone.
+    if [ "$IPV6" = "block" ] && ip -6 route show >/dev/null 2>&1; then
+      prio=40
+      for net in $NETS6; do
+        ip -6 rule del to "$net" lookup main priority "$prio" 2>/dev/null || true
+        ip -6 rule add to "$net" lookup main priority "$prio"
+        prio=$((prio + 1))
+      done
+      ip -6 route replace unreachable default table "$TABLE"
+      ip -6 rule del lookup "$TABLE" priority 200 2>/dev/null || true
+      ip -6 rule add lookup "$TABLE" priority 200
+      echo "公网 IPv6 已设为不可达（linux.ipv6=block），避免绕过隧道。"
+    fi
     echo "虚拟网卡 lexis0 已起来。私网和对端地址走原来的路由。本进程出站要带 fwmark $MARK，否则会绕回去。"
   else
     echo "没有 ip 命令。进程仍会尝试打开 lexis0。"
@@ -2138,6 +2211,14 @@ function startStatus(config) {
         `lexis_tun_packets ${metrics.tunPackets}`,
         "# TYPE lexis_tun_stalls counter",
         `lexis_tun_stalls ${tunStalls}`,
+        "# TYPE lexis_unhandled counter",
+        `lexis_unhandled ${unhandledCount}`,
+        "# TYPE lexis_udp_rebuild_retries counter",
+        `lexis_udp_rebuild_retries ${udpRebuildRetries}`,
+        "# TYPE lexis_tun_flow_drops counter",
+        `lexis_tun_flow_drops ${tunFlowDrops}`,
+        "# TYPE lexis_tun_loop_drops counter",
+        `lexis_tun_loop_drops ${tunLoopDrops}`,
       ];
       res.writeHead(200, { "content-type": "text/plain; version=0.0.4; charset=utf-8" });
       res.end(`${lines.join("\n")}\n`);
@@ -2408,6 +2489,18 @@ function selfCheck() {
   console.log("lexis-agent check ok");
 }
 
+let unhandledCount = 0;
+// 3.0.3 backstop: a stray rejection in a packet/stream path must not kill a long-running
+// edge or gate. It is logged and counted (lexis_unhandled) so it stays visible.
+function installUnhandledGuard() {
+  if (installUnhandledGuard.done) return;
+  installUnhandledGuard.done = true;
+  process.on("unhandledRejection", (reason) => {
+    unhandledCount += 1;
+    log(`未处理的异步错误（已拦下，进程继续）：${reason?.stack || reason?.message || reason}`);
+  });
+}
+
 async function main() {
   if (process.argv.includes("--check")) {
     selfCheck();
@@ -2419,6 +2512,7 @@ async function main() {
     console.error("# 128-bit token (base64url). Put it in link.token on BOTH ends. Do not reuse across unrelated deployments.");
     return;
   }
+  installUnhandledGuard();
   const config = await unlockIdentity(loadConfig());
   requireRole(config);
   activeConfig = config;
@@ -2433,7 +2527,7 @@ async function main() {
   }
   try {
     requireToken(config);
-    { const l = linkOf(config); if (l.maxConns < l.maxHalfOpen) log(`提示：link.maxConns=${l.maxConns} 小于 link.maxHalfOpen=${l.maxHalfOpen}，半开中的连接也占 maxConns，实际半开上限会被它截住；建议 maxConns ≥ maxHalfOpen + 平时会话数（3.0.2 默认 1024 / 512）`); }
+    { const l = linkOf(config); if (l.maxConns < l.maxHalfOpen) log(`提示：link.maxConns=${l.maxConns} 小于 link.maxHalfOpen=${l.maxHalfOpen}，半开中的连接也占 maxConns，实际半开上限会被它截住；建议 maxConns ≥ maxHalfOpen + 平时会话数（默认 1024 / 512）`); }
   } catch (err) {
     console.error(err.message || err);
     process.exit(1);

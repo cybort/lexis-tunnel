@@ -2,7 +2,7 @@
  * One evaluation for every key. Programmed keys fall out of the polynomial;
  * nothing here compares a key against a list.
  */
-import { x25519 } from "@noble/curves/ed25519.js";
+import { x25519PublicKey } from "./native";
 import { argon2id } from "@noble/hashes/argon2.js";
 import { concat, randomBytes, u32be, utf8, b64, unb64 } from "./bytes";
 import { hkdf, hmac, identityFromJwks, type KeyMaterial } from "./crypto";
@@ -255,7 +255,7 @@ export async function openIdentityVault(vault: IdentityVault, passphrase: string
   joined.set(lo, 0);
   joined.set(hi, 16);
   const seed = joined;
-  const pub = x25519.getPublicKey(seed);
+  const pub = x25519PublicKey(seed);
   const x = b64url(pub);
   const d = b64url(seed);
   return identityFromJwks(

@@ -33,8 +33,6 @@
   "brandWarnings": [],
   "authWarnings": [],
   "verdictFile": "/workspace/screenshots/app-builder-built.json",
-  "divergesFromBaseline": true,
-  "baselineReasons": [
-    "mobile: body text collapsed (1402 -> 62 chars)"
-  ]
+  "divergesFromBaseline": false,
+  "baselineReasons": []
 }

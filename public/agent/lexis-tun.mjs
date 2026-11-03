@@ -239,7 +239,14 @@ export function answerDns(packet, fakeIp, ttl = 60) {
   return Buffer.concat([header, asked, answer]);
 }
 
-export function createEngine({ dialTcp, dialUdp, emit, fakeIp = null, mss = MSS, log = () => undefined, udpIdleMs = 60000, udpMax = 64 }) {
+export function createEngine({ dialTcp, dialUdp, emit, fakeIp = null, mss = MSS, log = () => undefined, udpIdleMs = 60000, udpMax = 64, timeWaitMs = 2000, finLingerMs = 60000, loopGuard = [], onLoopDrop = () => undefined }) {
+  // 3.0.3 loop guard: packets addressed to our own peers (gates) must never be tunnelled;
+  // they only show up here when the route to the peer fell back to the tun table.
+  const guarded = new Set(loopGuard);
+  // Flows used to be removed only on RST/error, so every gracefully closed TCP
+  // connection stayed in tcpFlows (with its socket and buffers) for the life of the
+  // engine. Now: both FINs exchanged and ours acked -> short TIME_WAIT, then drop;
+  // a half-closed flow that never completes is reset after finLingerMs.
   const tcpFlows = new Map();
   const udpFlows = new Map();
   // UDP has no close; without an idle sweep every new source port (each DNS query)
@@ -303,6 +310,33 @@ export function createEngine({ dialTcp, dialUdp, emit, fakeIp = null, mss = MSS,
     if (!seqBefore(ack, flow.sndUna) && !seqBefore(flow.sndNxt, ack)) flow.sndUna = ack >>> 0;
   }
 
+  function dropFlow(flow) {
+    if (flow.timer) clearTimeout(flow.timer);
+    flow.timer = null;
+    if (tcpFlows.get(flow.key) === flow) tcpFlows.delete(flow.key);
+  }
+
+  function checkClosed(flow) {
+    if (flow.timeWait) return;
+    if (flow.finSent && flow.finRcvd && flow.sndUna === flow.sndNxt) {
+      // Both directions closed and our FIN acked: linger briefly so a retransmitted
+      // peer FIN still gets an ACK, then forget the flow.
+      flow.timeWait = true;
+      flow.socket?.destroy();
+      if (flow.timer) clearTimeout(flow.timer);
+      flow.timer = setTimeout(() => dropFlow(flow), timeWaitMs);
+      flow.timer.unref?.();
+      return;
+    }
+    if ((flow.finSent || flow.finRcvd) && !flow.timer) {
+      flow.timer = setTimeout(() => {
+        flow.timer = null;
+        if (tcpFlows.get(flow.key) === flow) resetFlow(flow.key, flow);
+      }, finLingerMs);
+      flow.timer.unref?.();
+    }
+  }
+
   function pump(flow) {
     if (!flow.socket) return;
     while (flow.pending.length) {
@@ -343,6 +377,7 @@ export function createEngine({ dialTcp, dialUdp, emit, fakeIp = null, mss = MSS,
     }
     if (flags & FIN) {
       flow.rcvNxt = (flow.rcvNxt + 1) >>> 0;
+      flow.finRcvd = true;
       flow.hold = null;
       flow.socket.end();
       return true;
@@ -358,13 +393,17 @@ export function createEngine({ dialTcp, dialUdp, emit, fakeIp = null, mss = MSS,
   function resetFlow(key, flow) {
     emitTcp(flow, flow.sndNxt, RST | ACK, Buffer.alloc(0));
     flow.socket?.destroy();
+    if (flow.timer) clearTimeout(flow.timer);
+    flow.timer = null;
     tcpFlows.delete(key);
   }
 
   async function onTcp(ip, tcp) {
     const key = `${ip.src}:${tcp.sport}>${ip.dst}:${tcp.dport}`;
     if (tcp.flags & RST) {
-      tcpFlows.get(key)?.socket?.destroy();
+      const gone = tcpFlows.get(key);
+      gone?.socket?.destroy();
+      if (gone?.timer) clearTimeout(gone.timer);
       tcpFlows.delete(key);
       return;
     }
@@ -372,6 +411,7 @@ export function createEngine({ dialTcp, dialUdp, emit, fakeIp = null, mss = MSS,
       if (tcpFlows.has(key)) return;
       const iss = seq();
       const flow = {
+        key,
         src: ip.src,
         dst: ip.dst,
         sport: tcp.sport,
@@ -387,6 +427,9 @@ export function createEngine({ dialTcp, dialUdp, emit, fakeIp = null, mss = MSS,
         paused: false,
         finPending: false,
         finSent: false,
+        finRcvd: false,
+        timeWait: false,
+        timer: null,
       };
       tcpFlows.set(key, flow);
       const host = fakeIp?.lookup(ip.dst) || ip.dst;
@@ -421,7 +464,9 @@ export function createEngine({ dialTcp, dialUdp, emit, fakeIp = null, mss = MSS,
     if (tcp.flags & ACK) noteAck(flow, tcp.ack);
     const accepted = tcp.data.length || (tcp.flags & FIN) ? takePayload(flow, tcp.seq, tcp.data, tcp.flags) : false;
     if (accepted || tcp.data.length || (tcp.flags & ACK)) ackOnly(flow);
+    if (flow.timeWait) return;
     pump(flow);
+    checkClosed(flow);
   }
 
   async function onUdp(ip) {
@@ -474,6 +519,10 @@ export function createEngine({ dialTcp, dialUdp, emit, fakeIp = null, mss = MSS,
     async push(packet) {
       const ip = parseIpv4(packet);
       if (!ip) return;
+      if (guarded.has(ip.dst)) {
+        onLoopDrop(ip);
+        return;
+      }
       if (ip.proto === 6) {
         const tcp = parseTcp(ip.payload);
         if (tcp) await onTcp(ip, tcp);
@@ -488,7 +537,10 @@ export function createEngine({ dialTcp, dialUdp, emit, fakeIp = null, mss = MSS,
     },
     close() {
       clearInterval(sweep);
-      for (const flow of tcpFlows.values()) flow.socket?.destroy();
+      for (const flow of tcpFlows.values()) {
+        if (flow.timer) clearTimeout(flow.timer);
+        flow.socket?.destroy();
+      }
       for (const socket of udpFlows.values()) {
         try {
           socket.close();
@@ -534,4 +586,87 @@ export function redirectTcp(packet, table, proxyPort) {
     flags: tcp.flags,
     payload: tcp.data,
   });
+}
+
+/**
+ * 3.0.3: per-flow packet dispatcher for the tun reader. Packets of one flow (protocol +
+ * both endpoints) are pushed strictly in order, one at a time; different flows no longer
+ * wait for each other, so one slow open (a dial or a UDP open during an outage) cannot
+ * hold up every other packet. Order inside a flow is never broken: a push slower than
+ * capMs is only reported (onStall); later packets of that flow keep waiting behind it.
+ * Bounds: at most perFlowMax packets queued per flow (newer ones are dropped and counted,
+ * TCP retransmits them, UDP may lose them), and the reader pauses (ready()) while
+ * maxInflight packets are queued or running.
+ */
+export function flowKeyOf(packet) {
+  const buf = packet;
+  if (buf.length < 20 || buf[0] >> 4 !== 4) return "other";
+  const ihl = (buf[0] & 0x0f) * 4;
+  const proto = buf[9];
+  const src = buf.readUInt32BE(12);
+  const dst = buf.readUInt32BE(16);
+  if ((proto === 6 || proto === 17) && buf.length >= ihl + 4) {
+    return `${proto}:${src}:${buf.readUInt16BE(ihl)}:${dst}:${buf.readUInt16BE(ihl + 2)}`;
+  }
+  return `${proto}:${src}:${dst}`;
+}
+
+export function createFlowQueue({ push, capMs, onStall = () => undefined, onError = () => undefined, onDrop = () => undefined, maxInflight = 256, perFlowMax = 64 }) {
+  const flows = new Map(); // key -> { tail, depth }
+  let inflight = 0;
+  let waiters = [];
+  const wake = () => {
+    if (inflight >= maxInflight) return;
+    const list = waiters;
+    waiters = [];
+    for (const fn of list) fn();
+  };
+  const run = (key, packet) => {
+    let timer = setTimeout(() => {
+      timer = null;
+      onStall(key);
+    }, capMs);
+    timer.unref?.();
+    return Promise.resolve()
+      .then(() => push(packet))
+      .catch(onError)
+      .finally(() => {
+        if (timer) clearTimeout(timer);
+      });
+  };
+  return {
+    dispatch(packet) {
+      const key = flowKeyOf(packet);
+      let flow = flows.get(key);
+      if (!flow) {
+        flow = { tail: Promise.resolve(), depth: 0 };
+        flows.set(key, flow);
+      }
+      if (flow.depth >= perFlowMax) {
+        onDrop(key);
+        return flow.tail;
+      }
+      flow.depth += 1;
+      inflight += 1;
+      const tail = flow.tail.then(() => run(key, packet));
+      flow.tail = tail;
+      void tail.finally(() => {
+        flow.depth -= 1;
+        inflight -= 1;
+        if (flow.depth === 0 && flows.get(key) === flow) flows.delete(key);
+        wake();
+      });
+      return tail;
+    },
+    ready() {
+      if (inflight < maxInflight) return Promise.resolve();
+      return new Promise((resolve) => waiters.push(resolve));
+    },
+    get inflight() {
+      return inflight;
+    },
+    get flows() {
+      return flows.size;
+    },
+  };
 }

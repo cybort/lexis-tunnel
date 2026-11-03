@@ -17,7 +17,7 @@
  * through a keyed affine map in GF(2^14) to one of 16384 words. Dense, but every word
  * is equally likely, so it fails the Zipf requirement.
  */
-import { ctr } from "@noble/ciphers/aes.js";
+import { aesCtrKeystream } from "../native";
 import { STATE_WEIGHTS } from "./state-table";
 import { VOCAB_COUNTS, VOCAB_WORDS } from "./vocab-en";
 
@@ -46,7 +46,7 @@ export class KeyStream {
       nonce[i] = b % 256;
       b = Math.floor(b / 256);
     }
-    this.buf = ctr(this.key, nonce).encrypt(new Uint8Array(4096));
+    this.buf = new Uint8Array(aesCtrKeystream(this.key, nonce, 4096));
     this.pos = 0;
   }
   byte(): number {
@@ -111,7 +111,7 @@ export type WordModel = {
   cum: Uint32Array; // cum[s] = sum freq[<s]
   codeLen: Uint8Array; // canonical Huffman lengths for the header
   code: Uint32Array;
-  decodeTree: Map<string, number>; // "len:code" -> symbol
+  decodeTree: Map<number, number>; // treeKey(len, code) -> symbol (shared by every model)
   maxLen: number;
   padKey: Uint8Array;
 };
@@ -156,6 +156,44 @@ function huffmanLengths(freq: Uint32Array): Uint8Array {
   return lens;
 }
 
+/** Numeric prefix-code key: code < 2^40 and len < 64, so code * 64 + len is an exact safe integer. */
+function treeKey(len: number, code: number): number {
+  return code * 64 + len;
+}
+
+type PrefixCode = { len: Uint8Array; code: Uint32Array; tree: Map<number, number>; maxLen: number };
+
+/** Canonical prefix code (lengths, codes, decode map) for a weight table. */
+function canonicalCode(w: Uint32Array): PrefixCode {
+  const len = huffmanLengths(w);
+  const syms = Array.from({ length: w.length }, (_, i) => i).sort((a, b) => len[a] - len[b] || a - b);
+  const code = new Uint32Array(w.length);
+  const tree = new Map<number, number>();
+  let c = 0;
+  let prev = len[syms[0]];
+  for (const s of syms) {
+    c <<= len[s] - prev;
+    prev = len[s];
+    code[s] = c;
+    tree.set(treeKey(len[s], c), s);
+    c++;
+  }
+  return { len, code, tree, maxLen: prev };
+}
+
+/* Frequencies, cumulative table and the header Huffman code depend only on the corpus
+ * (FREQ_BY_RANK), never on the session key, so they are built once per process and shared
+ * read-only by every model (they used to be rebuilt on every handshake, ~2.3 MB each). */
+let corpusCode: { cum: Uint32Array; pc: PrefixCode } | null = null;
+function corpusTables() {
+  if (corpusCode) return corpusCode;
+  const freq = FREQ_BY_RANK;
+  const cum = new Uint32Array(freq.length + 1);
+  for (let i = 0; i < freq.length; i++) cum[i + 1] = cum[i] + freq[i];
+  corpusCode = { cum, pc: canonicalCode(freq) };
+  return corpusCode;
+}
+
 export function buildModel(lexKey: Uint8Array, padKey: Uint8Array): WordModel {
   const id = hexOf(lexKey) + hexOf(padKey);
   const hit = modelCache.get(id);
@@ -172,24 +210,8 @@ export function buildModel(lexKey: Uint8Array, padKey: Uint8Array): WordModel {
   }
   const index = new Map<string, number>();
   words.forEach((w, i) => index.set(w, i));
-  const freq = FREQ_BY_RANK;
-  const cum = new Uint32Array(freq.length + 1);
-  for (let i = 0; i < freq.length; i++) cum[i + 1] = cum[i] + freq[i];
-  const codeLen = huffmanLengths(freq);
-  // Canonical codes.
-  const syms = Array.from({ length: freq.length }, (_, i) => i).sort((a, b) => codeLen[a] - codeLen[b] || a - b);
-  const code = new Uint32Array(freq.length);
-  const decodeTree = new Map<string, number>();
-  let c = 0;
-  let prevLen = codeLen[syms[0]];
-  for (const s of syms) {
-    c <<= codeLen[s] - prevLen;
-    prevLen = codeLen[s];
-    code[s] = c;
-    decodeTree.set(`${codeLen[s]}:${c}`, s);
-    c++;
-  }
-  const model: WordModel = { words, index, freq, cum, codeLen, code, decodeTree, maxLen: prevLen, padKey };
+  const { cum, pc } = corpusTables();
+  const model: WordModel = { words, index, freq: FREQ_BY_RANK, cum, codeLen: pc.len, code: pc.code, decodeTree: pc.tree, maxLen: pc.maxLen, padKey };
   modelCache.set(id, model);
   if (modelCache.size > 16) modelCache.delete(modelCache.keys().next().value as string);
   return model;
@@ -202,27 +224,13 @@ export function buildModel(lexKey: Uint8Array, padKey: Uint8Array): WordModel {
  * built from the measured distribution (state-table.ts), which turns it into
  * near-uniform bits; the low 28 bits are close to uniform already. */
 const LOW_BITS = 28;
-let stateCode: { len: Uint8Array; code: Uint32Array; tree: Map<string, number> } | null = null;
-function stateCoder() {
+let stateCode: PrefixCode | null = null;
+function stateCoder(): PrefixCode {
   if (stateCode) return stateCode;
   const bin = atob(STATE_WEIGHTS);
   const raw = new Uint8Array(bin.length);
   for (let i = 0; i < bin.length; i++) raw[i] = bin.charCodeAt(i);
-  const w = new Uint32Array(raw.buffer, raw.byteOffset, raw.byteLength >>> 2);
-  const len = huffmanLengths(w);
-  const syms = Array.from({ length: w.length }, (_, i) => i).sort((a, b) => len[a] - len[b] || a - b);
-  const code = new Uint32Array(w.length);
-  const tree = new Map<string, number>();
-  let c = 0;
-  let prev = len[syms[0]];
-  for (const s of syms) {
-    c <<= len[s] - prev;
-    prev = len[s];
-    code[s] = c;
-    tree.set(`${len[s]}:${c}`, s);
-    c++;
-  }
-  stateCode = { len, code, tree };
+  stateCode = canonicalCode(new Uint32Array(raw.buffer, raw.byteOffset, raw.byteLength >>> 2));
   return stateCode;
 }
 
@@ -273,7 +281,7 @@ export function bytesToWords(model: WordModel, data: Uint8Array, padSeed: number
   let i = 0;
   while (i < bits.length) {
     acc += pull(i++);
-    const s = model.decodeTree.get(`${acc.length}:${parseInt(acc, 2)}`);
+    const s = model.decodeTree.get(treeKey(acc.length, parseInt(acc, 2)));
     if (s !== undefined) {
       head.push(s);
       acc = "";
@@ -281,7 +289,7 @@ export function bytesToWords(model: WordModel, data: Uint8Array, padSeed: number
   }
   while (acc.length > 0) {
     acc += pull(i++);
-    const s = model.decodeTree.get(`${acc.length}:${parseInt(acc, 2)}`);
+    const s = model.decodeTree.get(treeKey(acc.length, parseInt(acc, 2)));
     if (s !== undefined) {
       head.push(s);
       acc = "";
@@ -302,7 +310,7 @@ export function wordsToBytes(model: WordModel, words: string[]): Uint8Array {
   while (k < syms.length) {
     if (hs < 0) {
       for (let n = 1; n <= bits.length && n <= 40; n++) {
-        const v = sc.tree.get(`${n}:${parseInt(bits.slice(0, n), 2)}`);
+        const v = sc.tree.get(treeKey(n, parseInt(bits.slice(0, n), 2)));
         if (v !== undefined) {
           hs = v;
           used = n;
@@ -316,7 +324,7 @@ export function wordsToBytes(model: WordModel, words: string[]): Uint8Array {
   }
   if (hs < 0) {
     for (let n = 1; n <= bits.length && n <= 40; n++) {
-      const v = sc.tree.get(`${n}:${parseInt(bits.slice(0, n), 2)}`);
+      const v = sc.tree.get(treeKey(n, parseInt(bits.slice(0, n), 2)));
       if (v !== undefined) {
         hs = v;
         used = n;

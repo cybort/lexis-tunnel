@@ -167,8 +167,8 @@ export async function identityFromJwks(
   }
   const publicRaw = jwkOkpToRaw(publicJwk);
   const seed = b64urlDecode(privateJwk.d);
-  const { x25519 } = await import("@noble/curves/ed25519.js");
-  const expect = x25519.getPublicKey(seed);
+  const { x25519PublicKey } = await import("./native");
+  const expect = x25519PublicKey(seed);
   if (publicRaw.length !== 32 || !expect.every((b, i) => b === publicRaw[i])) {
     throw new LexisError("侧车里的私钥和公钥不是一对");
   }
