@@ -574,8 +574,24 @@ function translateHost(config, host) {
   return name || host;
 }
 
+// tun user-space TCP knobs (config.tun). mtu sets the MSS announced in SYN|ACK (mtu - 40);
+// the out-of-order queue caps bound memory per flow and engine-wide.
+function tunOf(config) {
+  const tun = config.tun || {};
+  const int = (v, min, max, dflt) => (Number.isInteger(Number(v)) && Number(v) >= min && Number(v) <= max ? Number(v) : dflt);
+  const fallbackMtu = platform() === "android" ? int(config.android?.mtu, 576, 65535, 1500) : 1500;
+  return {
+    mtu: int(tun.mtu, 576, 65535, fallbackMtu),
+    mss: int(tun.mss, 88, 65495, null),
+    oooMaxBytes: int(tun.oooMaxBytes, 0, 65535, 65535),
+    oooMaxSegs: int(tun.oooMaxSegs, 0, 4096, 64),
+    oooTotalBytes: int(tun.oooTotalBytes, 0, 1 << 30, 8 << 20),
+  };
+}
+
 function lexiconEngine(config, emit) {
   return createEngine({
+    ...tunOf(config),
     dialTcp: (host, port) => dialTcp(config, host, port),
     dialUdp: (host, port) => dialUdp(config, host, port),
     emit,

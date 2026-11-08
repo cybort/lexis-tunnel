@@ -84,6 +84,12 @@
     "method": "portproxy",
     "gateway": "10.7.0.1"
   },
+  "tun": {
+    "mtu": 1500,
+    "oooMaxBytes": 65535,
+    "oooMaxSegs": 64,
+    "oooTotalBytes": 8388608
+  },
   "android": {
     "method": "vpn",
     "mtu": 1500,

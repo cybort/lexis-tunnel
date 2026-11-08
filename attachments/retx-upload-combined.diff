@@ -1,0 +1,1155 @@
+diff --git a/public/agent/lexis-agent.mjs b/public/agent/lexis-agent.mjs
+index 9621607..18dd515 100644
+--- a/public/agent/lexis-agent.mjs
++++ b/public/agent/lexis-agent.mjs
+@@ -574,8 +574,24 @@ function translateHost(config, host) {
+   return name || host;
+ }
+ 
++// tun user-space TCP knobs (config.tun). mtu sets the MSS announced in SYN|ACK (mtu - 40);
++// the out-of-order queue caps bound memory per flow and engine-wide.
++function tunOf(config) {
++  const tun = config.tun || {};
++  const int = (v, min, max, dflt) => (Number.isInteger(Number(v)) && Number(v) >= min && Number(v) <= max ? Number(v) : dflt);
++  const fallbackMtu = platform() === "android" ? int(config.android?.mtu, 576, 65535, 1500) : 1500;
++  return {
++    mtu: int(tun.mtu, 576, 65535, fallbackMtu),
++    mss: int(tun.mss, 88, 65495, null),
++    oooMaxBytes: int(tun.oooMaxBytes, 0, 65535, 65535),
++    oooMaxSegs: int(tun.oooMaxSegs, 0, 4096, 64),
++    oooTotalBytes: int(tun.oooTotalBytes, 0, 1 << 30, 8 << 20),
++  };
++}
++
+ function lexiconEngine(config, emit) {
+   return createEngine({
++    ...tunOf(config),
+     dialTcp: (host, port) => dialTcp(config, host, port),
+     dialUdp: (host, port) => dialUdp(config, host, port),
+     emit,
+diff --git a/public/agent/lexis-tun.mjs b/public/agent/lexis-tun.mjs
+index 6181229..f132f8c 100644
+--- a/public/agent/lexis-tun.mjs
++++ b/public/agent/lexis-tun.mjs
+@@ -47,10 +47,33 @@ export function parseTcp(payload) {
+     ack: buf.readUInt32BE(8),
+     flags: buf[13],
+     window: buf.readUInt16BE(14),
++    mss: tcpMssOption(buf.subarray(20, off)),
+     data: buf.subarray(off),
+   };
+ }
+ 
++/** MSS option (kind 2, len 4) from a TCP options block, or null when absent/malformed. */
++export function tcpMssOption(opts) {
++  let i = 0;
++  while (i < opts.length) {
++    const kind = opts[i];
++    if (kind === 0) break;
++    if (kind === 1) {
++      i += 1;
++      continue;
++    }
++    if (i + 1 >= opts.length) break;
++    const len = opts[i + 1];
++    if (len < 2 || i + len > opts.length) break;
++    if (kind === 2 && len === 4) {
++      const v = opts.readUInt16BE(i + 2);
++      return v > 0 ? v : null;
++    }
++    i += len;
++  }
++  return null;
++}
++
+ export function parseUdp(payload) {
+   const buf = Buffer.from(payload);
+   if (buf.length < 8) return null;
+@@ -70,17 +93,24 @@ function ipv4(src, dst, proto, payload) {
+   return packet;
+ }
+ 
+-export function buildTcpPacket({ src, dst, sport, dport, seq, ack, flags, payload = Buffer.alloc(0), window = 65535 }) {
++export function buildTcpPacket({ src, dst, sport, dport, seq, ack, flags, payload = Buffer.alloc(0), window = 65535, mss = null }) {
+   const body = Buffer.from(payload);
+-  const tcp = Buffer.alloc(20 + body.length);
++  // Only the MSS option is ever written (SYN segments); 4 bytes keeps the header 32-bit aligned.
++  const optLen = mss ? 4 : 0;
++  const tcp = Buffer.alloc(20 + optLen + body.length);
+   tcp.writeUInt16BE(sport, 0);
+   tcp.writeUInt16BE(dport, 2);
+   tcp.writeUInt32BE(seq >>> 0, 4);
+   tcp.writeUInt32BE(ack >>> 0, 8);
+-  tcp[12] = 5 << 4;
++  tcp[12] = ((20 + optLen) / 4) << 4;
+   tcp[13] = flags;
+   tcp.writeUInt16BE(window, 14);
+-  body.copy(tcp, 20);
++  if (optLen) {
++    tcp[20] = 2;
++    tcp[21] = 4;
++    tcp.writeUInt16BE(Math.max(1, Math.min(65535, mss | 0)), 22);
++  }
++  body.copy(tcp, 20 + optLen);
+   const pseudo = Buffer.alloc(12);
+   writeIp(pseudo, 0, src);
+   writeIp(pseudo, 4, dst);
+@@ -110,7 +140,12 @@ function seq() {
+   return crypto.getRandomValues(new Uint32Array(1))[0];
+ }
+ 
+-const MSS = 1200;
++// RFC 9293 3.7.1: without an MSS option the peer must be assumed to take 536.
++const DEFAULT_PEER_MSS = 536;
++const TUN_MTU = 1500;
++// The engine advertises a fixed 65535-byte window (no window scaling), so nothing
++// beyond rcvNxt + RCV_WND is ever accepted into the out-of-order queue.
++const RCV_WND = 65535;
+ 
+ function seqBefore(left, right) {
+   return ((left - right) | 0) < 0;
+@@ -239,10 +274,17 @@ export function answerDns(packet, fakeIp, ttl = 60) {
+   return Buffer.concat([header, asked, answer]);
+ }
+ 
+-export function createEngine({ dialTcp, dialUdp, emit, fakeIp = null, mss = MSS, log = () => undefined, udpIdleMs = 60000, udpMax = 64, timeWaitMs = 2000, finLingerMs = 60000, loopGuard = [], onLoopDrop = () => undefined }) {
++export function createEngine({ dialTcp, dialUdp, emit, fakeIp = null, mtu = TUN_MTU, mss = null, oooMaxBytes = RCV_WND, oooMaxSegs = 64, oooTotalBytes = 8 << 20, log = () => undefined, udpIdleMs = 60000, udpMax = 64, timeWaitMs = 2000, finLingerMs = 60000, rtoMs = 1000, rtoMinMs = 200, rtoMaxMs = 60000, maxRetries = 7, giveUpMs = 180000, synRtoMs = 3000, dupAckThresh = 3, loopGuard = [], onLoopDrop = () => undefined }) {
+   // 3.0.3 loop guard: packets addressed to our own peers (gates) must never be tunnelled;
+   // they only show up here when the route to the peer fell back to the tun table.
+   const guarded = new Set(loopGuard);
++  // MSS we announce in SYN|ACK: what fits one tun MTU (IPv4 + TCP headers without options
++  // = 40 bytes), unless `mss` overrides it. The send MSS of a flow is min(this, peer's MSS).
++  const localMss = Math.max(88, Math.min(65495, Number(mss) > 0 ? Number(mss) : (Number(mtu) || TUN_MTU) - 40));
++  const oooBytesCap = Math.max(0, Math.min(RCV_WND, Number(oooMaxBytes) || 0));
++  const oooSegsCap = Math.max(0, Number(oooMaxSegs) | 0);
++  const oooTotalCap = Math.max(0, Number(oooTotalBytes) || 0);
++  const oooStats = { bytes: 0, segs: 0, dropped: 0, droppedBytes: 0, outOfWindow: 0 };
+   // Flows used to be removed only on RST/error, so every gracefully closed TCP
+   // connection stayed in tcpFlows (with its socket and buffers) for the life of the
+   // engine. Now: both FINs exchanged and ours acked -> short TIME_WAIT, then drop;
+@@ -282,18 +324,76 @@ export function createEngine({ dialTcp, dialUdp, emit, fakeIp = null, mss = MSS,
+       ack: flow.rcvNxt,
+       flags,
+       payload,
+-      window: 65535,
++      window: RCV_WND,
++      mss: flags & SYN ? localMss : null,
+     }));
+   }
+ 
++  // Retransmission timeout (RFC 6298): flow.unacked holds the in-flight segments.
++  // While any are outstanding one timer runs. RTO starts at rtoMs, then follows
++  // SRTT/RTTVAR from ACKs of segments sent once (Karn), floored at rtoMinMs.
++  // On expiry only the oldest unacked segment is resent and the timeout doubles
++  // (capped at rtoMaxMs) and stays doubled until a new RTT sample; until the ACK passes the point reached when the timer
++  // fired, each partial ACK resends the new oldest segment (it was sent at least
++  // one RTO earlier, so it is lost, not in flight). An ACK that advances sndUna
++  // resets the retry count. The flow is reset (RST) and dropped only when both
++  // maxRetries consecutive expiries and giveUpMs (3 min) passed without ACK progress. Duplicate-ACK fast retransmit: see noteDupAck.
++  const rtoFloor = Math.min(rtoMinMs, rtoMs);
++
++  function stopRto(flow) {
++    if (flow.rtoTimer) clearTimeout(flow.rtoTimer);
++    flow.rtoTimer = null;
++  }
++
++  function resendSeg(flow, seg) {
++    seg.tx += 1;
++    seg.sentAt = Date.now();
++    flow.lastRetxAt = seg.sentAt;
++    emitTcp(flow, seg.seq, seg.flags, seg.payload);
++  }
++
++  function armRto(flow) {
++    stopRto(flow);
++    if (!flow.unacked.length) return;
++    const wait = flow.rto;
++    flow.rtoTimer = setTimeout(() => {
++      flow.rtoTimer = null;
++      if (tcpFlows.get(flow.key) !== flow || !flow.unacked.length) return;
++      if (flow.retries >= maxRetries && Date.now() - flow.progressAt >= giveUpMs) {
++        log(`tcp ${flow.key} 重传 ${flow.retries} 次仍无确认，重置`);
++        resetFlow(flow.key, flow);
++        return;
++      }
++      flow.retries += 1;
++      // Backed-off RTO persists until a fresh RTT sample (RFC 6298 5.5/5.7).
++      flow.rto = Math.min(rtoMaxMs, flow.rto * 2);
++      flow.recover = flow.sndNxt;
++      resendSeg(flow, flow.unacked[0]);
++      armRto(flow);
++    }, wait);
++    flow.rtoTimer.unref?.();
++  }
++
++  function sampleRtt(flow, r) {
++    if (!flow.srtt) {
++      flow.srtt = r;
++      flow.rttvar = r / 2;
++    } else {
++      flow.rttvar = 0.75 * flow.rttvar + 0.25 * Math.abs(flow.srtt - r);
++      flow.srtt = 0.875 * flow.srtt + 0.125 * r;
++    }
++    flow.rto = Math.min(rtoMaxMs, Math.max(rtoFloor, flow.srtt + Math.max(10, 4 * flow.rttvar)));
++  }
++
+   function sendTcp(flow, flags, payload = Buffer.alloc(0)) {
+     const body = Buffer.from(payload);
+     const seqNo = flow.sndNxt;
+     emitTcp(flow, seqNo, flags, body);
+     const len = body.length + ((flags & (SYN | FIN)) ? 1 : 0);
+     if (len && (flags & RST) === 0) {
+-      flow.unacked.push({ seq: seqNo, flags, payload: body, len });
++      flow.unacked.push({ seq: seqNo, flags, payload: body, len, sentAt: Date.now(), tx: 1 });
+       flow.sndNxt = (flow.sndNxt + len) >>> 0;
++      if (!flow.rtoTimer) armRto(flow);
+     }
+   }
+ 
+@@ -305,12 +405,96 @@ export function createEngine({ dialTcp, dialUdp, emit, fakeIp = null, mss = MSS,
+     return (flow.sndNxt - flow.sndUna) >>> 0;
+   }
+ 
++  // Fast retransmit (RFC 5681 3.2 / RFC 6582 NewReno, no SACK): dupAckThresh pure
++  // duplicate ACKs (no data, no SYN/FIN, same window, ack == sndUna, data outstanding)
++  // resend the oldest unacked segment once and enter recovery with recover = sndNxt.
++  // Reordering guard (RACK-style time check, RFC 8985 6.2): the oldest segment is only
++  // treated as lost once it is older than lateMs = SRTT + max(2 ms, SRTT/4); a younger
++  // one may just be reordered, so the decision is deferred to that age and dropped if
++  // the ACK advances meanwhile. While sndUna is below recover further duplicates are
++  // ignored (no repeat trigger); a partial ACK resends the new oldest segment only if it
++  // is also older than lateMs (shared with RTO recovery); an ACK reaching recover ends
++  // recovery. A fast retransmit does not change RTO backoff (the timer is restarted).
++  // The engine has no cwnd (bounded by peerWnd), so no window halving/inflation.
++  function lateMs(flow) {
++    // No RTT sample yet: use the current RTO, so the guard is not disabled (age 0).
++    return flow.srtt ? flow.srtt + Math.max(2, flow.srtt / 4) : flow.rto;
++  }
++
++  function stopReo(flow) {
++    if (flow.reoTimer) clearTimeout(flow.reoTimer);
++    flow.reoTimer = null;
++  }
++
++  function inRecovery(flow) {
++    return flow.recover !== null && seqBefore(flow.sndUna, flow.recover);
++  }
++
++  function fastRetransmit(flow) {
++    if (tcpFlows.get(flow.key) !== flow || !flow.unacked.length || inRecovery(flow)) return;
++    if (flow.dupAcks < dupAckThresh) return;
++    const wait = lateMs(flow) - (Date.now() - flow.unacked[0].sentAt);
++    if (wait > 0) {
++      if (!flow.reoTimer) {
++        flow.reoTimer = setTimeout(() => {
++          flow.reoTimer = null;
++          fastRetransmit(flow);
++        }, Math.ceil(wait));
++        flow.reoTimer.unref?.();
++      }
++      return;
++    }
++    flow.recover = flow.sndNxt;
++    flow.fastRetx += 1;
++    resendSeg(flow, flow.unacked[0]);
++    armRto(flow);
++  }
++
++  function noteDupAck(flow) {
++    if (!flow.unacked.length) return;
++    flow.dupAcks += 1;
++    fastRetransmit(flow);
++  }
++
+   function noteAck(flow, ack) {
+-    flow.unacked = flow.unacked.filter((seg) => seqBefore(ack, (seg.seq + seg.len) >>> 0));
+-    if (!seqBefore(ack, flow.sndUna) && !seqBefore(flow.sndNxt, ack)) flow.sndUna = ack >>> 0;
++    let sample = 0;
++    let synRetx = false;
++    flow.unacked = flow.unacked.filter((seg) => {
++      if (seqBefore(ack, (seg.seq + seg.len) >>> 0)) return true;
++      // Karn: only segments sent once AND first sent after the last retransmission.
++      // Segments sent before a retransmission sat behind the hole it repairs, so their
++      // "RTT" includes the recovery time (inflated SRTT/RTO to tens of seconds at 5%
++      // loss); segments sent after it are timed normally.
++      if (seg.tx === 1 && seg.sentAt > flow.lastRetxAt) sample = Date.now() - seg.sentAt;
++      if ((seg.flags & SYN) && seg.tx > 1) synRetx = true;
++      return false;
++    });
++    // RFC 6298 5.7: SYN-ACK was retransmitted and the handshake gave no RTT sample ->
++    // data starts with RTO = synRtoMs (3 s), not the backed-off value (which can sit at
++    // ~RTT and fire spuriously, e.g. 2000 ms RTT after a 1 s initial RTO).
++    if (synRetx && !flow.srtt && !sample) flow.rto = Math.min(rtoMaxMs, Math.max(flow.rto, synRtoMs));
++    if (!seqBefore(ack, flow.sndUna) && !seqBefore(flow.sndNxt, ack) && (ack >>> 0) !== flow.sndUna) {
++      flow.sndUna = ack >>> 0;
++      flow.progressAt = Date.now();
++      if (sample) sampleRtt(flow, Math.max(1, sample));
++      flow.retries = 0;
++      flow.dupAcks = 0;
++      stopReo(flow);
++      if (flow.recover !== null && seqBefore(flow.sndUna, flow.recover) && flow.unacked.length) {
++        const head = flow.unacked[0];
++        if (seqBefore(head.seq, flow.recover) && Date.now() - head.sentAt >= lateMs(flow)) resendSeg(flow, head);
++      } else {
++        flow.recover = null;
++      }
++      armRto(flow);
++    }
++    if (!flow.unacked.length) stopRto(flow);
+   }
+ 
+   function dropFlow(flow) {
++    oooClear(flow);
++    stopRto(flow);
++    stopReo(flow);
+     if (flow.timer) clearTimeout(flow.timer);
+     flow.timer = null;
+     if (tcpFlows.get(flow.key) === flow) tcpFlows.delete(flow.key);
+@@ -331,7 +515,11 @@ export function createEngine({ dialTcp, dialUdp, emit, fakeIp = null, mss = MSS,
+     if ((flow.finSent || flow.finRcvd) && !flow.timer) {
+       flow.timer = setTimeout(() => {
+         flow.timer = null;
+-        if (tcpFlows.get(flow.key) === flow) resetFlow(flow.key, flow);
++        if (tcpFlows.get(flow.key) !== flow) return;
++        // Our data is still in RTO recovery (backoff can reach rtoMaxMs, longer than
++        // finLingerMs): keep lingering; the RTO give-up (maxRetries) bounds this flow.
++        if (flow.unacked.length && flow.rtoTimer) return checkClosed(flow);
++        resetFlow(flow.key, flow);
+       }, finLingerMs);
+       flow.timer.unref?.();
+     }
+@@ -346,7 +534,7 @@ export function createEngine({ dialTcp, dialUdp, emit, fakeIp = null, mss = MSS,
+         flow.socket.pause?.();
+         return;
+       }
+-      const take = Math.min(mss, room, flow.pending[0].length);
++      const take = Math.min(flow.sndMss, room, flow.pending[0].length);
+       const chunk = flow.pending[0].subarray(0, take);
+       flow.pending[0] = flow.pending[0].subarray(take);
+       if (!flow.pending[0].length) flow.pending.shift();
+@@ -362,35 +550,136 @@ export function createEngine({ dialTcp, dialUdp, emit, fakeIp = null, mss = MSS,
+     }
+   }
+ 
++  // Out-of-order queue: flow.ooo is sorted by sequence, non-overlapping, adjacent pieces
++  // coalesced. Bounded per flow (oooMaxBytes / oooMaxSegs, bytes never above the 65535
++  // receive window) and engine-wide (oooTotalBytes). Over a cap the piece farthest from
++  // rcvNxt is dropped first (the nearest ones are what fills the hole; the sender will
++  // retransmit the rest). Freed when the hole fills, and on FIN/RST/reset/flow drop.
++  const rel = (flow, sq) => (sq - flow.rcvNxt) >>> 0;
++
++  function oooClear(flow) {
++    if (!flow.ooo?.length) return;
++    for (const seg of flow.ooo) oooStats.bytes -= seg.data.length;
++    oooStats.segs -= flow.ooo.length;
++    flow.oooBytes = 0;
++    flow.ooo = [];
++    flow.oooFin = null;
++  }
++
++  function oooDropTail(flow) {
++    const seg = flow.ooo.pop();
++    flow.oooBytes -= seg.data.length;
++    oooStats.bytes -= seg.data.length;
++    oooStats.segs -= 1;
++    oooStats.dropped += 1;
++    oooStats.droppedBytes += seg.data.length;
++    // A FIN sitting beyond a dropped piece can no longer be trusted to be contiguous.
++    if (flow.oooFin !== null && !seqBefore(seg.seq, flow.oooFin)) flow.oooFin = null;
++  }
++
++  function oooInsert(flow, seqNo, data, fin) {
++    let start = rel(flow, seqNo);
++    if (start >= RCV_WND) {
++      oooStats.outOfWindow += 1;
++      return;
++    }
++    let body = data;
++    if (start + body.length > RCV_WND) {
++      body = body.subarray(0, RCV_WND - start);
++      fin = false;
++      oooStats.outOfWindow += 1;
++    }
++    if (fin) flow.oooFin = (seqNo + data.length) >>> 0;
++    if (!body.length || !oooSegsCap || !oooBytesCap) return;
++    // Cut the new range down to the parts no queued piece covers (queued bytes win).
++    const pieces = [];
++    let cur = start;
++    const end = start + body.length;
++    for (const seg of flow.ooo) {
++      const a = rel(flow, seg.seq);
++      const b = a + seg.data.length;
++      if (b <= cur) continue;
++      if (a >= end) break;
++      if (a > cur) pieces.push([cur, a]);
++      cur = Math.max(cur, b);
++      if (cur >= end) break;
++    }
++    if (cur < end) pieces.push([cur, end]);
++    for (const [pa, pb] of pieces) {
++      const chunk = Buffer.from(body.subarray(pa - start, pb - start));
++      const item = { seq: (flow.rcvNxt + pa) >>> 0, data: chunk };
++      let i = 0;
++      while (i < flow.ooo.length && rel(flow, flow.ooo[i].seq) < pa) i += 1;
++      flow.ooo.splice(i, 0, item);
++      flow.oooBytes += chunk.length;
++      oooStats.bytes += chunk.length;
++      oooStats.segs += 1;
++      // Coalesce with contiguous neighbours so the segment cap counts holes, not packets.
++      const next = flow.ooo[i + 1];
++      if (next && next.seq === ((item.seq + item.data.length) >>> 0)) {
++        item.data = Buffer.concat([item.data, next.data]);
++        flow.ooo.splice(i + 1, 1);
++        oooStats.segs -= 1;
++      }
++      const prev = flow.ooo[i - 1];
++      if (prev && ((prev.seq + prev.data.length) >>> 0) === item.seq) {
++        prev.data = Buffer.concat([prev.data, item.data]);
++        flow.ooo.splice(i, 1);
++        oooStats.segs -= 1;
++      }
++    }
++    while (flow.ooo.length && (flow.ooo.length > oooSegsCap || flow.oooBytes > oooBytesCap || oooStats.bytes > oooTotalCap)) oooDropTail(flow);
++  }
++
++  function deliver(flow, data) {
++    if (!data.length) return;
++    flow.socket.write(data);
++    flow.rcvNxt = (flow.rcvNxt + data.length) >>> 0;
++  }
++
++  function takeFin(flow) {
++    flow.rcvNxt = (flow.rcvNxt + 1) >>> 0;
++    flow.finRcvd = true;
++    oooClear(flow);
++    flow.oooFin = null;
++    flow.socket.end();
++  }
++
+   function takePayload(flow, seqNo, data, flags) {
++    let fin = Boolean(flags & FIN);
++    // Retransmission overlapping what we already have: keep only the new tail.
++    if (seqBefore(seqNo, flow.rcvNxt)) {
++      const skip = (flow.rcvNxt - seqNo) >>> 0;
++      if (skip > data.length || (skip === data.length && !fin)) return false;
++      data = data.subarray(skip);
++      seqNo = flow.rcvNxt;
++    }
+     if (seqNo !== flow.rcvNxt) {
+-      if (data.length && !seqBefore(seqNo, flow.rcvNxt) && ((seqNo - flow.rcvNxt) >>> 0) <= 65535) {
+-        if (!flow.hold || ((seqNo - flow.rcvNxt) >>> 0) < ((flow.hold.seq - flow.rcvNxt) >>> 0)) {
+-          flow.hold = { seq: seqNo, data, flags };
+-        }
+-      }
++      if (data.length || fin) oooInsert(flow, seqNo, data, fin);
+       return false;
+     }
+-    if (data.length) {
+-      flow.socket.write(data);
+-      flow.rcvNxt = (flow.rcvNxt + data.length) >>> 0;
++    if (flow.finRcvd) return false;
++    deliver(flow, data);
++    // Drain queued pieces that the new data reached.
++    while (flow.ooo.length && !seqBefore(flow.rcvNxt, flow.ooo[0].seq)) {
++      const seg = flow.ooo.shift();
++      flow.oooBytes -= seg.data.length;
++      oooStats.bytes -= seg.data.length;
++      oooStats.segs -= 1;
++      const skip = (flow.rcvNxt - seg.seq) >>> 0;
++      if (skip < seg.data.length) deliver(flow, seg.data.subarray(skip));
+     }
+-    if (flags & FIN) {
+-      flow.rcvNxt = (flow.rcvNxt + 1) >>> 0;
+-      flow.finRcvd = true;
+-      flow.hold = null;
+-      flow.socket.end();
++    if (fin || (flow.oooFin !== null && flow.oooFin === flow.rcvNxt)) {
++      takeFin(flow);
+       return true;
+     }
+-    if (flow.hold && flow.hold.seq === flow.rcvNxt) {
+-      const held = flow.hold;
+-      flow.hold = null;
+-      takePayload(flow, held.seq, held.data, held.flags);
+-    }
+     return true;
+   }
+ 
+   function resetFlow(key, flow) {
++    oooClear(flow);
++    stopRto(flow);
++    stopReo(flow);
+     emitTcp(flow, flow.sndNxt, RST | ACK, Buffer.alloc(0));
+     flow.socket?.destroy();
+     if (flow.timer) clearTimeout(flow.timer);
+@@ -402,6 +691,11 @@ export function createEngine({ dialTcp, dialUdp, emit, fakeIp = null, mss = MSS,
+     const key = `${ip.src}:${tcp.sport}>${ip.dst}:${tcp.dport}`;
+     if (tcp.flags & RST) {
+       const gone = tcpFlows.get(key);
++      if (gone) {
++        oooClear(gone);
++        stopRto(gone);
++        stopReo(gone);
++      }
+       gone?.socket?.destroy();
+       if (gone?.timer) clearTimeout(gone.timer);
+       tcpFlows.delete(key);
+@@ -423,13 +717,27 @@ export function createEngine({ dialTcp, dialUdp, emit, fakeIp = null, mss = MSS,
+         socket: null,
+         unacked: [],
+         pending: [],
+-        hold: null,
++        ooo: [],
++        oooBytes: 0,
++        oooFin: null,
++        sndMss: Math.min(localMss, tcp.mss || DEFAULT_PEER_MSS),
+         paused: false,
+         finPending: false,
+         finSent: false,
+         finRcvd: false,
+         timeWait: false,
+         timer: null,
++        rtoTimer: null,
++        retries: 0,
++        rto: rtoMs,
++        srtt: 0,
++        rttvar: 0,
++        recover: null,
++        dupAcks: 0,
++        reoTimer: null,
++        fastRetx: 0,
++        lastRetxAt: 0,
++        progressAt: Date.now(),
+       };
+       tcpFlows.set(key, flow);
+       const host = fakeIp?.lookup(ip.dst) || ip.dst;
+@@ -460,8 +768,12 @@ export function createEngine({ dialTcp, dialUdp, emit, fakeIp = null, mss = MSS,
+     }
+     const flow = tcpFlows.get(key);
+     if (!flow?.socket) return;
++    const sameWnd = tcp.window === flow.peerWnd;
+     if (typeof tcp.window === "number") flow.peerWnd = tcp.window;
+-    if (tcp.flags & ACK) noteAck(flow, tcp.ack);
++    if (tcp.flags & ACK) {
++      if ((tcp.ack >>> 0) === flow.sndUna && !tcp.data.length && !(tcp.flags & (SYN | FIN)) && sameWnd) noteDupAck(flow);
++      else noteAck(flow, tcp.ack);
++    }
+     const accepted = tcp.data.length || (tcp.flags & FIN) ? takePayload(flow, tcp.seq, tcp.data, tcp.flags) : false;
+     if (accepted || tcp.data.length || (tcp.flags & ACK)) ackOnly(flow);
+     if (flow.timeWait) return;
+@@ -530,6 +842,10 @@ export function createEngine({ dialTcp, dialUdp, emit, fakeIp = null, mss = MSS,
+       }
+       if (ip.proto === 17) await onUdp(ip);
+     },
++    /** Out-of-order queue usage (engine-wide) and the MSS announced in SYN|ACK. */
++    stats() {
++      return { mss: localMss, ooo: { ...oooStats } };
++    },
+     retransmit() {
+       for (const flow of tcpFlows.values()) {
+         for (const seg of flow.unacked) emitTcp(flow, seg.seq, seg.flags, seg.payload);
+@@ -538,6 +854,9 @@ export function createEngine({ dialTcp, dialUdp, emit, fakeIp = null, mss = MSS,
+     close() {
+       clearInterval(sweep);
+       for (const flow of tcpFlows.values()) {
++        oooClear(flow);
++        stopRto(flow);
++        stopReo(flow);
+         if (flow.timer) clearTimeout(flow.timer);
+         flow.socket?.destroy();
+       }
+diff --git a/public/agent/lexis.config.json b/public/agent/lexis.config.json
+index bcb04bb..1028e29 100644
+--- a/public/agent/lexis.config.json
++++ b/public/agent/lexis.config.json
+@@ -84,6 +84,12 @@
+     "method": "portproxy",
+     "gateway": "10.7.0.1"
+   },
++  "tun": {
++    "mtu": 1500,
++    "oooMaxBytes": 65535,
++    "oooMaxSegs": 64,
++    "oooTotalBytes": 8388608
++  },
+   "android": {
+     "method": "vpn",
+     "mtu": 1500,
+diff --git "a/public/agent/\344\275\277\347\224\250\350\257\264\346\230\216.txt" "b/public/agent/\344\275\277\347\224\250\350\257\264\346\230\216.txt"
+index 5d8224b..a0d532f 100644
+--- "a/public/agent/\344\275\277\347\224\250\350\257\264\346\230\216.txt"
++++ "b/public/agent/\344\275\277\347\224\250\350\257\264\346\230\216.txt"
+@@ -22,7 +22,7 @@ NAT 后面的机器用边缘角色连出去。配置里的 role 必须写成 edg
+ SOCKS 接受 CONNECT 和 UDP ASSOCIATE，UDP 可以是 IPv6。http 入站是 HTTP 代理，支持 CONNECT 和绝对地址的普通请求，认证跟 SOCKS 用同一对用户名密码。同一条连接上的每一个请求都会单独重写：代理认证不会带到目标，Host 必须和绝对地址一致，Content-Length 和 Transfer-Encoding 写在一起会直接拒绝，不会转发出去。客户端写了 Connection: close，或者 HTTP/1.0 没有 keep-alive，这一次响应后会关掉到客户端的连接。HEAD、204、304 没有正文，不会干等到空闲超时。1xx 会转给客户端，然后继续读真正的响应。没有长度、也不是分块、一直读到连接关闭的响应，末尾不足 16 KiB 的那段也会送完。socksAuth 的用户名和密码都填了才认证，留空就不认证。
+ 
+ 固定端口：进程监听配置里的端口。SOCKS 和 HTTP 给本机程序当代理；TCP 入站按目标转发；tunnel 入站做词表握手，然后接受上面的打开命令。
+-系统接管：进程仍常驻，并写出平台脚本。Linux 在有 root 和 iptables 时写 redirect 或 tproxy。redirect 的 OUTPUT 会把本机程序转回透明端口；本进程的每一条 TCP 出站，包括连对端的隧道外层，先打 fwmark，规则碰到这个标记就放行。tproxy 同时写 PREROUTING 和 OUTPUT，TCP 和 UDP 都写。旁路标记是配置里的 mark，转进本机监听的是另一个标记，两个不能用同一个。私网、运营商级 NAT、组播和对端的 IPv4 地址不接管。IPv6 这一版还没有单独的监听。虚拟网卡 lexis0 的默认路由只接公网；私网和对端地址仍走原来的路由。tun 只处理 IPv4：linux.ipv6 默认是 "block"，这时公网 IPv6 被设为不可达（回环、链路本地 fe80::/10、ULA fc00::/7、组播不受影响），应用会回落到 IPv4，避免 IPv6 绕过隧道直连；设为 "off" 则不动 IPv6 路由，IPv6 流量不经过隧道。ICMP（含 ping）在 tun 下不转发，也不会伪造回复。用户态栈仍是词隙自己的，不是 gVisor：段长 1200，未确认的段可以重发，但常驻进程没有定时去调；乱序先留一段，对端窗口是 0 时停发。系统接管且 linux.dnsRedirect 不是 false 时，虚拟网卡、本机包通道和透明 UDP 上的 53 端口在进程里回答。A 记录给 198.18.0.0/15 里的一个假地址，AAAA 回空的 NOERROR。假地址只存在于本机，拨号前映射回域名，这样 GEOSITE 仍看得到名字，也绝不会去连 198.18。标记由本机模块设置，连接由 Node 发起，不再在主线程里同步解析和等待。没有 root、没有 iptables，或内核拒绝 IP_TRANSPARENT、SO_MARK、TUN 时，规则只留在文件里，流量不会被真正接管。这一版没有在具备这些权限的机器上证明 redirect、tproxy 或虚拟网卡已经接住流量。Windows 的 portproxy 只绑 127.0.0.1。WinDivert 只有 windivert-redirect.c，驱动和 exe 不在包里，选了也不会改系统流量。Android 写出 vpn-session.json，绕过私网、运营商级 NAT、组播和对端地址，包通道在 127.0.0.1:17891，旁边有 LexisVpnService.kt 源码。Termux 不能弹出系统 VPN，也没有编译好的安装包。
++系统接管：进程仍常驻，并写出平台脚本。Linux 在有 root 和 iptables 时写 redirect 或 tproxy。redirect 的 OUTPUT 会把本机程序转回透明端口；本进程的每一条 TCP 出站，包括连对端的隧道外层，先打 fwmark，规则碰到这个标记就放行。tproxy 同时写 PREROUTING 和 OUTPUT，TCP 和 UDP 都写。旁路标记是配置里的 mark，转进本机监听的是另一个标记，两个不能用同一个。私网、运营商级 NAT、组播和对端的 IPv4 地址不接管。IPv6 这一版还没有单独的监听。虚拟网卡 lexis0 的默认路由只接公网；私网和对端地址仍走原来的路由。tun 只处理 IPv4：linux.ipv6 默认是 "block"，这时公网 IPv6 被设为不可达（回环、链路本地 fe80::/10、ULA fc00::/7、组播不受影响），应用会回落到 IPv4，避免 IPv6 绕过隧道直连；设为 "off" 则不动 IPv6 路由，IPv6 流量不经过隧道。ICMP（含 ping）在 tun 下不转发，也不会伪造回复。用户态栈仍是词隙自己的，不是 gVisor：SYN|ACK 带 MSS 选项（tun.mtu 减 40，默认 1460），发送段长取它和对端 SYN 里 MSS 的较小值（对端没带时按 536）；未确认的段按 RTO 定时重发；乱序段按上限缓存多段（见下面的 tun 一节），对端窗口是 0 时停发。系统接管且 linux.dnsRedirect 不是 false 时，虚拟网卡、本机包通道和透明 UDP 上的 53 端口在进程里回答。A 记录给 198.18.0.0/15 里的一个假地址，AAAA 回空的 NOERROR。假地址只存在于本机，拨号前映射回域名，这样 GEOSITE 仍看得到名字，也绝不会去连 198.18。标记由本机模块设置，连接由 Node 发起，不再在主线程里同步解析和等待。没有 root、没有 iptables，或内核拒绝 IP_TRANSPARENT、SO_MARK、TUN 时，规则只留在文件里，流量不会被真正接管。这一版没有在具备这些权限的机器上证明 redirect、tproxy 或虚拟网卡已经接住流量。Windows 的 portproxy 只绑 127.0.0.1。WinDivert 只有 windivert-redirect.c，驱动和 exe 不在包里，选了也不会改系统流量。Android 写出 vpn-session.json，绕过私网、运营商级 NAT、组播和对端地址，包通道在 127.0.0.1:17891，旁边有 LexisVpnService.kt 源码。Termux 不能弹出系统 VPN，也没有编译好的安装包。
+ 
+ SOCKS、HTTP 和固定转发默认只绑 127.0.0.1。只有 link.allowLan 为 true 时才按配置里的地址监听。反向入口同样受这道限制。隧道入口可以听更宽的地址。
+ 出口拨号前会先解析域名。回环、内网、链路本地、运营商级 NAT 和文档地址默认拒绝。egress.allow 一行一个主机、主机:端口或 IPv4 网段，用来单独放行。这道拦截不作用于你本机 SOCKS 的直连和绕行，也不作用于你自己暴露的本机服务。公网的 22、80、443 不单独封禁。握手超时、拨号超时和同时握手数在 link.handshakeMs、link.dialMs、link.maxHandshakes。半开握手上限：link.maxHalfOpen（全局，默认 512）；link.maxHalfOpenPerIp（每网段，默认 8，网段长度 link.halfOpenPrefixV4 默认 24、link.halfOpenPrefixV6 默认 64，设成 32/128 即按单个地址计）。hello 校验失败会立刻让出名额，但连接仍静默保持到握手超时再断开；连上后 link.firstByteMs（默认 2000 毫秒，0 为关闭）内一个字节都没收到也会让出名额，之后到的数据一律忽略；这类静默连接最多 link.maxSilent 条（默认 1024），超过后多出来的会提前断开。半开中的连接也占 link.maxConns（默认 1024），所以 maxConns 要不小于 maxHalfOpen 加上平时的会话数，否则半开上限实际被 maxConns 截住；旧配置里写死 maxConns: 128 的，升级后请改大，进程启动时会提示。
+@@ -41,3 +41,9 @@ SOCKS、HTTP 和固定转发默认只绑 127.0.0.1。只有 link.allowLan 为 tr
+ 控制台导出的 JSON 覆盖 lexis.config.json。名单和公钥变化会自己重读，旧会话会断开。两端都要把对方公钥放进 peers，并写同一个用 --gen-token 生成的握手口令（不少于 128 bit）。要让对方从本机出去，把那个节点的 exit 打开。没有做过连续 24 小时的浸泡。
+ 
+ 3.0.3：虚拟网卡按流排队。同一条流（协议和两端地址）里的包仍按顺序处理；不同的流互不等待，所以一条慢的拨号不会卡住整张网卡。单条流排队超过 64 个包时丢掉后来的，记在 lexis_tun_flow_drops（TCP 靠对端重传，UDP 可能丢）。整段排队或正在处理的包超过 256 个时，读网卡会先停一下。单个包处理超过 link.dialMs 加 2 秒只记 lexis_tun_stalls，不会插队。发往对端地址的包如果掉进虚拟网卡（到对端的路由没了），直接丢掉，记 lexis_tun_loop_drops；脚本里还给对端地址加了不可达规则，避免隧道套自己。会话正在重连时，UDP 打开最多等 3 秒再试一次，记 lexis_udp_rebuild_retries。套接字上的异步错误和未处理的拒绝不再把进程打崩，未处理的记 lexis_unhandled。这些都没有在真机上证明虚拟网卡已经接住流量。
++
++tun 上传方向（release/3.0-upload）：配置里的 tun 一节。
++- tun.mtu（默认 1500；Android 缺省时用 android.mtu）：SYN|ACK 里宣告 MSS = mtu − 40。tun.mss 可以直接指定，优先于 mtu。每条流发送用 min(本端 MSS, 对端 SYN 的 MSS)，对端 SYN 没带 MSS 选项时按 RFC 9293 的 536。
++- 乱序缓存：tun.oooMaxBytes（默认 65535，单条流字节上限，不会超过固定的 65535 接收窗口）、tun.oooMaxSegs（默认 64，单条流段数上限，相邻连续段合并后计数）、tun.oooTotalBytes（默认 8388608，整台引擎的总字节上限）。任一为 0 表示不缓存乱序段（只收按序段）。
++- 规则：与已收数据重叠的重传只取新的尾部；与缓存段重叠时保留已缓存的字节，只补空隙；超出 rcvNxt + 65535 窗口的部分丢弃；超上限时先丢离 rcvNxt 最远的段（补洞最需要的是近的段，远的段对端会重发）；空洞补上后按序交付并释放；收到 FIN、RST、重置或流被回收时整条流的缓存立即释放。
++- 不做窗口缩放：接收窗口固定 65535。窗口缩放要求我们按实际可缓存量宣告窗口，并对 socket.write 做背压，否则放大窗口只会放大内存占用；1 MiB 上传在 65535 窗口、1460 段长下已不受窗口限制以外的因素卡住（见补丁 README 的实测表）。高 RTT 下吞吐仍受 65535/RTT 限制。
+diff --git a/scripts/lexis-tun-fastretx.test.mjs b/scripts/lexis-tun-fastretx.test.mjs
+new file mode 100644
+index 0000000..d3efd22
+--- /dev/null
++++ b/scripts/lexis-tun-fastretx.test.mjs
+@@ -0,0 +1,147 @@
++import assert from "node:assert/strict";
++import net from "node:net";
++import test from "node:test";
++import { buildTcpPacket, createEngine, parseIpv4, parseTcp } from "../public/agent/lexis-tun.mjs";
++
++// Fast retransmit: duplicate ACKs from the tun client trigger a resend before the RTO.
++// (recorded but never acknowledged). Without a retransmission timer wired into the
++
++const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
++const SYN = 0x02;
++const ACK = 0x10;
++const RST = 0x04;
++
++function listen(onSocket) {
++  return new Promise((resolve) => {
++    const server = net.createServer(onSocket);
++    server.listen(0, "127.0.0.1", () => resolve(server));
++  });
++}
++
++function dial(port) {
++  return new Promise((resolve, reject) => {
++    const socket = net.connect(port, "127.0.0.1", () => resolve(socket));
++    socket.once("error", reject);
++  });
++}
++
++async function setup(body, opts, hsDelay = 0) {
++  let serverClosed = false;
++  const server = await listen((socket) => {
++    socket.on("error", () => socket.destroy());
++    socket.on("close", () => { serverClosed = true; });
++    socket.write(body);
++  });
++  const port = server.address().port;
++  const out = [];
++  const engine = createEngine({
++    dialTcp: () => dial(port),
++    dialUdp: async () => { throw new Error("udp"); },
++    emit: (packet) => out.push(Object.assign(parseTcp(parseIpv4(Buffer.from(packet)).payload), { at: performance.now() })),
++    ...opts,
++  });
++  const clientSeq = 5000;
++  await engine.push(buildTcpPacket({ src: "10.9.0.2", dst: "127.0.0.1", sport: 45000, dport: port, seq: clientSeq, ack: 0, flags: SYN, window: 65535, mss: opts?.mss }));
++  const deadline = Date.now() + 2000;
++  while (!out.some((t) => t.flags & SYN) && Date.now() < deadline) await sleep(5);
++  const synAck = out.find((t) => t.flags & SYN);
++  assert.ok(synAck, "没有 SYN-ACK");
++  if (hsDelay) await sleep(hsDelay); // handshake RTT sample = hsDelay
++  // Client completes the handshake (acks the SYN only) then all later data is lost.
++  await engine.push(buildTcpPacket({ src: "10.9.0.2", dst: "127.0.0.1", sport: 45000, dport: port, seq: clientSeq + 1, ack: (synAck.seq + 1) >>> 0, flags: ACK, window: 65535 }));
++  return { engine, server, out, port, synAck, clientSeq, closed: () => serverClosed };
++}
++
++const MSS = 1000;
++const body = Buffer.alloc(MSS * 5, 7);
++const opts = { mss: MSS, rtoMs: 5000, rtoMaxMs: 10000, maxRetries: 20 };
++
++async function segsOf(out) {
++  const deadline = Date.now() + 2000;
++  let segs;
++  while (Date.now() < deadline) {
++    segs = out.filter((t) => t.data.length);
++    if (segs.reduce((n, t) => n + t.data.length, 0) >= body.length) break;
++    await sleep(5);
++  }
++  return segs.slice();
++}
++
++function ackPkt(ctx, ack, window = 65535) {
++  return buildTcpPacket({ src: "10.9.0.2", dst: "127.0.0.1", sport: 45000, dport: ctx.port, seq: ctx.clientSeq + 1, ack: ack >>> 0, flags: ACK, window });
++}
++
++test("tun: 3 duplicate ACKs resend the oldest segment before the RTO, once per recovery", async () => {
++  // SRTT ~20 ms (guard window ~25 ms); without an RTT sample the guard would wait a whole RTO.
++  const ctx = await setup(body, opts, 20);
++  try {
++    const segs = await segsOf(ctx.out);
++    await sleep(40); // head older than the guard window
++    assert.equal(segs.length, 5);
++    const first = segs[0].seq;
++    const count = (s) => ctx.out.filter((t) => t.data.length && t.seq === s).length;
++    // Segment 0 lost: client acks nothing new (ack = first) for segs 1..4 -> 4 dup ACKs.
++    await ctx.engine.push(ackPkt(ctx, first));
++    await ctx.engine.push(ackPkt(ctx, first));
++    assert.equal(count(first), 1, "2 个重复 ACK 不应触发");
++    await ctx.engine.push(ackPkt(ctx, first));
++    assert.equal(count(first), 2, "第 3 个重复 ACK 没有快速重传");
++    for (let i = 0; i < 5; i += 1) await ctx.engine.push(ackPkt(ctx, first));
++    assert.equal(count(first), 2, "同一恢复期内重复触发");
++    // Partial ACK (segment 0 arrived, 2 also lost) -> resend new oldest (seg 1 → here seg at first+MSS).
++    await ctx.engine.push(ackPkt(ctx, first + MSS));
++    assert.equal(count(first + MSS), 2, "部分确认没有重发新的最早段");
++    // Full ACK ends recovery; nothing else resent.
++    await ctx.engine.push(ackPkt(ctx, first + body.length));
++    await sleep(100);
++    assert.equal(ctx.out.filter((t) => t.data.length).length, 7);
++  } finally {
++    ctx.engine.close();
++    ctx.server.close();
++  }
++});
++
++test("tun: window updates are not duplicate ACKs; new recovery after recover point", async () => {
++  const ctx = await setup(body, opts);
++  try {
++    const segs = await segsOf(ctx.out);
++    const first = segs[0].seq;
++    const count = (s) => ctx.out.filter((t) => t.data.length && t.seq === s).length;
++    await ctx.engine.push(ackPkt(ctx, first, 60000));
++    await ctx.engine.push(ackPkt(ctx, first, 50000));
++    await ctx.engine.push(ackPkt(ctx, first, 40000));
++    assert.equal(count(first), 1, "窗口更新被当成重复 ACK");
++    await ctx.engine.push(ackPkt(ctx, first + 3 * MSS, 40000));
++    for (let i = 0; i < 3; i += 1) await ctx.engine.push(ackPkt(ctx, first + 3 * MSS, 40000));
++    const deadline = Date.now() + 120; // well below the 200 ms RTO floor; may be deferred by the reordering guard (SRTT*1.25)
++    while (count(first + 3 * MSS) < 2 && Date.now() < deadline) await sleep(5);
++    assert.equal(count(first + 3 * MSS), 2, "新的丢包没有快速重传");
++  } finally {
++    ctx.engine.close();
++    ctx.server.close();
++  }
++});
++
++test("tun: reordering guard defers fast retransmit until the head is older than SRTT*1.25", async () => {
++  // SRTT ~150 ms from the handshake (a ~0-1 ms handshake sample would make the guard
++  // window ~20 ms and the test timing-dependent).
++  const ctx = await setup(body, opts, 150);
++  try {
++    const segs = await segsOf(ctx.out);
++    const first = segs[0].seq;
++    const count = (s) => ctx.out.filter((t) => t.data.length && t.seq === s).length;
++    await ctx.engine.push(ackPkt(ctx, first + MSS)); // segment 0 sent ~150 ms ago
++    for (let i = 0; i < 3; i += 1) await ctx.engine.push(ackPkt(ctx, first + MSS));
++    assert.equal(count(first + MSS), 1, "头段未超时就快速重传（可能只是乱序）");
++    await ctx.engine.push(ackPkt(ctx, first + 2 * MSS)); // reordered segment arrives
++    await sleep(100);
++    assert.equal(count(first + MSS), 1, "乱序后 ACK 已前进，延迟的快速重传不应再发");
++    for (let i = 0; i < 3; i += 1) await ctx.engine.push(ackPkt(ctx, first + 2 * MSS));
++    const deadline = Date.now() + 120; // below the RTO (~450 ms here)
++    while (count(first + 2 * MSS) < 2 && Date.now() < deadline) await sleep(5);
++    assert.equal(count(first + 2 * MSS), 2, "头段够老后没有快速重传");
++  } finally {
++    ctx.engine.close();
++    ctx.server.close();
++  }
++});
+diff --git a/scripts/lexis-tun-flowgc.test.mjs b/scripts/lexis-tun-flowgc.test.mjs
+index 8890ac5..8cbd3aa 100644
+--- a/scripts/lexis-tun-flowgc.test.mjs
++++ b/scripts/lexis-tun-flowgc.test.mjs
+@@ -62,7 +62,8 @@ test("gracefully closed tun flow is dropped after TIME_WAIT", async () => {
+ });
+ 
+ test("half-closed tun flow is reset after finLingerMs", async () => {
+-  const r = await rig({ serverEnds: false, finLingerMs: 80 });
++  // Echoed data stays unacked, so the RST comes from the RTO give-up after linger.
++  const r = await rig({ serverEnds: false, finLingerMs: 80, rtoMs: 20, rtoMaxMs: 40, maxRetries: 2, giveUpMs: 0 });
+   try {
+     const rst = await r.waitFor((t) => t.flags & RST);
+     assert.ok(rst, "RST after linger");
+diff --git a/scripts/lexis-tun-retransmit.test.mjs b/scripts/lexis-tun-retransmit.test.mjs
+new file mode 100644
+index 0000000..f71b6fe
+--- /dev/null
++++ b/scripts/lexis-tun-retransmit.test.mjs
+@@ -0,0 +1,160 @@
++import assert from "node:assert/strict";
++import net from "node:net";
++import test from "node:test";
++import { buildTcpPacket, createEngine, parseIpv4, parseTcp } from "../public/agent/lexis-tun.mjs";
++
++// Lossy link model: every segment the engine emits toward the tun client is "dropped"
++// (recorded but never acknowledged). Without a retransmission timer wired into the
++// engine the data is sent once and the flow stays stuck forever.
++
++const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
++const SYN = 0x02;
++const ACK = 0x10;
++const RST = 0x04;
++
++function listen(onSocket) {
++  return new Promise((resolve) => {
++    const server = net.createServer(onSocket);
++    server.listen(0, "127.0.0.1", () => resolve(server));
++  });
++}
++
++function dial(port) {
++  return new Promise((resolve, reject) => {
++    const socket = net.connect(port, "127.0.0.1", () => resolve(socket));
++    socket.once("error", reject);
++  });
++}
++
++async function setup(body, opts) {
++  let serverClosed = false;
++  const server = await listen((socket) => {
++    socket.on("error", () => socket.destroy());
++    socket.on("close", () => { serverClosed = true; });
++    socket.write(body);
++  });
++  const port = server.address().port;
++  const out = [];
++  const engine = createEngine({
++    dialTcp: () => dial(port),
++    dialUdp: async () => { throw new Error("udp"); },
++    emit: (packet) => out.push(Object.assign(parseTcp(parseIpv4(Buffer.from(packet)).payload), { at: performance.now() })),
++    ...opts,
++  });
++  const clientSeq = 5000;
++  await engine.push(buildTcpPacket({ src: "10.9.0.2", dst: "127.0.0.1", sport: 45000, dport: port, seq: clientSeq, ack: 0, flags: SYN, window: 65535 }));
++  const deadline = Date.now() + 2000;
++  while (!out.some((t) => t.flags & SYN) && Date.now() < deadline) await sleep(5);
++  const synAck = out.find((t) => t.flags & SYN);
++  assert.ok(synAck, "没有 SYN-ACK");
++  // Client completes the handshake (acks the SYN only) then all later data is lost.
++  await engine.push(buildTcpPacket({ src: "10.9.0.2", dst: "127.0.0.1", sport: 45000, dport: port, seq: clientSeq + 1, ack: (synAck.seq + 1) >>> 0, flags: ACK, window: 65535 }));
++  return { engine, server, out, port, synAck, clientSeq, closed: () => serverClosed };
++}
++
++test("tun: unacked data segment is retransmitted on timeout without an external call", async () => {
++  const body = Buffer.from("lost-segment-payload");
++  const { engine, server, out } = await setup(body, { rtoMs: 50, rtoMaxMs: 200, maxRetries: 20 });
++  try {
++    const copies = () => out.filter((t) => t.data.length && t.data.equals(body)).length;
++    const deadline = Date.now() + 1500;
++    while (copies() < 3 && Date.now() < deadline) await sleep(10);
++    assert.ok(copies() >= 3, `丢包后没有超时重传（数据段只发了 ${copies()} 次）`);
++    const seqs = new Set(out.filter((t) => t.data.equals(body)).map((t) => t.seq));
++    assert.equal(seqs.size, 1, "重传的序号必须与原段一致");
++  } finally {
++    engine.close();
++    server.close();
++  }
++});
++
++test("tun: an ACK covering the data stops retransmission", async () => {
++  const body = Buffer.from("acked-later");
++  const { engine, server, out, port, clientSeq } = await setup(body, { rtoMs: 40, rtoMaxMs: 1000, maxRetries: 20 });
++  try {
++    const data = () => out.filter((t) => t.data.equals(body));
++    const deadline = Date.now() + 1500;
++    while (data().length < 3 && Date.now() < deadline) await sleep(5);
++    assert.ok(data().length >= 3, "没有重传");
++    const seg = data()[0];
++    await engine.push(buildTcpPacket({ src: "10.9.0.2", dst: "127.0.0.1", sport: 45000, dport: port, seq: clientSeq + 1, ack: (seg.seq + body.length) >>> 0, flags: ACK, window: 65535 }));
++    const n = data().length;
++    await sleep(400);
++    assert.equal(data().length, n, "确认之后还在重传");
++  } finally {
++    engine.close();
++    server.close();
++  }
++});
++
++test("tun: retransmission is bounded; flow is reset with RST and its socket closed", async () => {
++  const body = Buffer.from("never-acked");
++  const { engine, server, out, closed } = await setup(body, { rtoMs: 20, rtoMaxMs: 80, maxRetries: 3, giveUpMs: 0 });
++  try {
++    const deadline = Date.now() + 3000;
++    while (!out.some((t) => t.flags & RST) && Date.now() < deadline) await sleep(10);
++    assert.ok(out.some((t) => t.flags & RST), "重传上限后没有发 RST");
++    const copies = out.filter((t) => t.data.equals(body)).length;
++    assert.equal(copies, 1 + 3, "原段 1 次 + 重传 maxRetries 次");
++    const at = out.filter((t) => t.data.equals(body)).map((t) => t.at);
++    assert.ok(at[3] - at[2] > (at[1] - at[0]) * 1.5, `没有指数退避：${at.map((x) => x.toFixed(0)).join(",")}`);
++    await sleep(300);
++    assert.equal(out.filter((t) => t.data.equals(body)).length, copies, "RST 之后仍在重传");
++    const until = Date.now() + 1000;
++    while (!closed() && Date.now() < until) await sleep(10);
++    assert.ok(closed(), "RST 之后上游连接没有关闭");
++  } finally {
++    engine.close();
++    server.close();
++  }
++});
++
++test("tun: RST needs both maxRetries and giveUpMs without progress", async () => {
++  const body = Buffer.from("slow-give-up");
++  const { engine, server, out } = await setup(body, { rtoMs: 20, rtoMaxMs: 40, maxRetries: 2, giveUpMs: 400 });
++  try {
++    const start = performance.now();
++    const deadline = Date.now() + 3000;
++    while (!out.some((t) => t.flags & RST) && Date.now() < deadline) await sleep(10);
++    const rst = out.find((t) => t.flags & RST);
++    assert.ok(rst, "giveUpMs 之后没有发 RST");
++    assert.ok(rst.at - start >= 350, `RST 早于 giveUpMs：${(rst.at - start).toFixed(0)} ms`);
++  } finally {
++    engine.close();
++    server.close();
++  }
++});
++
++test("tun: after a retransmitted SYN-ACK without RTT sample, data starts with RTO = synRtoMs (RFC 6298 5.7)", async () => {
++  const body = Buffer.from("after-syn-retx");
++  let port;
++  const server = await listen((socket) => {
++    socket.on("error", () => socket.destroy());
++    setTimeout(() => socket.write(body), 300); // after the handshake ACK
++  });
++  port = server.address().port;
++  const out = [];
++  const engine = createEngine({
++    dialTcp: () => dial(port),
++    dialUdp: async () => { throw new Error("udp"); },
++    emit: (packet) => out.push(Object.assign(parseTcp(parseIpv4(Buffer.from(packet)).payload), { at: performance.now() })),
++    rtoMs: 40, rtoMaxMs: 5000, maxRetries: 20, synRtoMs: 400,
++  });
++  try {
++    await engine.push(buildTcpPacket({ src: "10.9.0.2", dst: "127.0.0.1", sport: 45001, dport: port, seq: 7000, ack: 0, flags: SYN, window: 65535 }));
++    const deadline = Date.now() + 2000;
++    while (out.filter((t) => t.flags & SYN).length < 2 && Date.now() < deadline) await sleep(5);
++    const syns = out.filter((t) => t.flags & SYN);
++    assert.ok(syns.length >= 2, "SYN-ACK 没有超时重发");
++    await engine.push(buildTcpPacket({ src: "10.9.0.2", dst: "127.0.0.1", sport: 45001, dport: port, seq: 7001, ack: (syns[0].seq + 1) >>> 0, flags: ACK, window: 65535 }));
++    const data = () => out.filter((t) => t.data.equals(body));
++    const until = Date.now() + 2000;
++    while (data().length < 2 && Date.now() < until) await sleep(5);
++    assert.ok(data().length >= 2, "数据段没有重传");
++    const gap = data()[1].at - data()[0].at;
++    assert.ok(gap >= 350, `SYN-ACK 重发后数据 RTO 应为 synRtoMs，实际 ${gap.toFixed(0)} ms`);
++  } finally {
++    engine.close();
++    server.close();
++  }
++});
+diff --git a/scripts/lexis-tun-upload.test.mjs b/scripts/lexis-tun-upload.test.mjs
+new file mode 100644
+index 0000000..074e829
+--- /dev/null
++++ b/scripts/lexis-tun-upload.test.mjs
+@@ -0,0 +1,216 @@
++import assert from "node:assert/strict";
++import net from "node:net";
++import test from "node:test";
++import { buildTcpPacket, createEngine, parseIpv4, parseTcp } from "../public/agent/lexis-tun.mjs";
++
++// Upload direction (tun client -> engine -> upstream socket): MSS negotiation in the
++// handshake and the bounded multi-segment out-of-order queue.
++
++const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
++const SYN = 0x02;
++const ACK = 0x10;
++const FIN = 0x01;
++const RST = 0x04;
++const PSH = 0x08;
++
++async function waitFor(fn, ms = 2000) {
++  const end = Date.now() + ms;
++  while (!fn() && Date.now() < end) await sleep(5);
++  return fn();
++}
++
++async function setup({ synMss, serverWrite = null, sport = 46000, ...opts } = {}) {
++  const got = [];
++  let ended = false;
++  const server = await new Promise((resolve) => {
++    const s = net.createServer((socket) => {
++      socket.on("error", () => socket.destroy());
++      socket.on("data", (d) => got.push(d));
++      socket.on("end", () => { ended = true; });
++      if (serverWrite) socket.write(serverWrite);
++    });
++    s.listen(0, "127.0.0.1", () => resolve(s));
++  });
++  const port = server.address().port;
++  const out = [];
++  const engine = createEngine({
++    dialTcp: () => new Promise((resolve, reject) => { const c = net.connect(port, "127.0.0.1", () => resolve(c)); c.once("error", reject); }),
++    dialUdp: async () => { throw new Error("udp"); },
++    emit: (packet) => out.push(parseTcp(parseIpv4(Buffer.from(packet)).payload)),
++    rtoMs: 5000,
++    ...opts,
++  });
++  const iss = 9000;
++  const pkt = (o) => buildTcpPacket({ src: "10.9.0.2", dst: "127.0.0.1", sport, dport: port, ack: 0, window: 65535, ...o });
++  await engine.push(pkt({ seq: iss, flags: SYN, mss: synMss }));
++  assert.ok(await waitFor(() => out.some((t) => t.flags & SYN)), "没有 SYN-ACK");
++  const synAck = out.find((t) => t.flags & SYN);
++  const ackNo = (synAck.seq + 1) >>> 0;
++  await engine.push(pkt({ seq: iss + 1, ack: ackNo, flags: ACK }));
++  // send(off, bytes[, flags]) puts client payload at stream offset off.
++  const send = (off, data, flags = ACK | PSH) => engine.push(pkt({ seq: (iss + 1 + off) >>> 0, ack: ackNo, flags, payload: data }));
++  const body = () => Buffer.concat(got);
++  const lastAck = () => [...out].reverse().find((t) => t.flags & ACK)?.ack;
++  const done = () => { engine.close(); server.close(); };
++  return { engine, server, out, synAck, send, body, lastAck, iss, done, ended: () => ended, pkt, ackNo };
++}
++
++const pattern = (n, salt = 0) => Buffer.from(Array.from({ length: n }, (_, i) => (i * 7 + salt) & 0xff));
++
++test("tun MSS: SYN|ACK announces mtu-40; send MSS is min(local, peer SYN MSS)", async () => {
++  const a = await setup({ synMss: 1400, serverWrite: Buffer.alloc(20000, 1) });
++  try {
++    assert.equal(a.synAck.mss, 1460, "默认 mtu 1500 应宣告 1460");
++    await waitFor(() => a.out.filter((t) => t.data.length).length >= 5);
++    const sizes = a.out.filter((t) => t.data.length).map((t) => t.data.length);
++    assert.equal(Math.max(...sizes), 1400, `发送段长应取对端 1400：${sizes}`);
++  } finally {
++    a.done();
++  }
++  const b = await setup({ synMss: 1460, mtu: 1280, serverWrite: Buffer.alloc(20000, 1), sport: 46001 });
++  try {
++    assert.equal(b.synAck.mss, 1240);
++    await waitFor(() => b.out.filter((t) => t.data.length).length >= 5);
++    assert.equal(Math.max(...b.out.filter((t) => t.data.length).map((t) => t.data.length)), 1240);
++  } finally {
++    b.done();
++  }
++  const c = await setup({ serverWrite: Buffer.alloc(20000, 1), sport: 46002 });
++  try {
++    await waitFor(() => c.out.filter((t) => t.data.length).length >= 5);
++    assert.equal(Math.max(...c.out.filter((t) => t.data.length).map((t) => t.data.length)), 536, "对端没带 MSS 时按 536");
++  } finally {
++    c.done();
++  }
++  const d = await setup({ synMss: 1460, mss: 1000, sport: 46003 });
++  try {
++    assert.equal(d.synAck.mss, 1000, "tun.mss 覆盖 mtu");
++    // A retransmitted SYN|ACK keeps the option.
++    d.engine.retransmit();
++  } finally {
++    d.done();
++  }
++});
++
++test("tun reorder: several out-of-order segments are held and delivered in order", async () => {
++  const s = await setup({ synMss: 1000 });
++  try {
++    const data = pattern(5000);
++    const seg = (i) => s.send(i * 1000, data.subarray(i * 1000, (i + 1) * 1000));
++    await seg(4);
++    await seg(2);
++    await seg(3);
++    await seg(1);
++    assert.equal(s.engine.stats().ooo.segs, 1, "2,3,4 连续应合并成一段（1 已到达 4 之前只差 0）");
++    assert.equal(s.engine.stats().ooo.bytes, 4000);
++    assert.equal(s.lastAck(), (s.iss + 1) >>> 0, "缺第 0 段时 ACK 不动");
++    await seg(0);
++    assert.ok(await waitFor(() => s.body().length === 5000), `收到 ${s.body().length}`);
++    assert.ok(s.body().equals(data), "字节不一致");
++    assert.equal(s.lastAck(), (s.iss + 1 + 5000) >>> 0);
++    assert.equal(s.engine.stats().ooo.bytes, 0, "补洞后缓存应清空");
++    assert.equal(s.engine.stats().ooo.segs, 0);
++  } finally {
++    s.done();
++  }
++});
++
++test("tun reorder: overlapping segments and partial retransmissions merge without duplication", async () => {
++  const s = await setup({ synMss: 1000 });
++  try {
++    const data = pattern(4000, 3);
++    const part = (a, b) => s.send(a, data.subarray(a, b));
++    await part(2000, 3000);
++    await part(2500, 3500); // overlaps queued tail
++    await part(1500, 2200); // overlaps queued head
++    await part(1800, 2600); // fully covered
++    await part(0, 1000);
++    await part(500, 1600); // overlaps rcvNxt: only the new tail is used, then fills the hole
++    await part(3400, 4000);
++    assert.ok(await waitFor(() => s.body().length >= 4000));
++    assert.ok(s.body().equals(data), "重叠合并后字节不一致");
++    await part(0, 4000); // full duplicate after the fact
++    await sleep(30);
++    assert.equal(s.body().length, 4000, "重复段不应再交付");
++    assert.equal(s.engine.stats().ooo.bytes, 0);
++  } finally {
++    s.done();
++  }
++});
++
++test("tun reorder caps: segment and byte limits drop the farthest pieces; out-of-window is dropped", async () => {
++  const s = await setup({ synMss: 1000, oooMaxSegs: 2, oooMaxBytes: 1500 });
++  try {
++    const data = pattern(9000, 5);
++    const seg = (i) => s.send(i * 1000, data.subarray(i * 1000, (i + 1) * 1000));
++    await seg(6);
++    await seg(4);
++    await seg(2); // 3 holes-separated pieces > 2 segs, and 3000 B > 1500 B: keep nearest only
++    let st = s.engine.stats().ooo;
++    assert.equal(st.segs, 1, JSON.stringify(st));
++    assert.equal(st.bytes, 1000);
++    assert.equal(st.dropped, 2);
++    // Beyond rcvNxt + 65535 is outside the window.
++    await s.send(70000, Buffer.alloc(100, 9));
++    st = s.engine.stats().ooo;
++    assert.equal(st.outOfWindow, 1);
++    assert.equal(st.bytes, 1000);
++    // The sender retransmits; everything still arrives intact.
++    for (const i of [0, 1, 3, 4, 5, 6, 7, 8]) await seg(i);
++    assert.ok(await waitFor(() => s.body().length === 9000), `收到 ${s.body().length}`);
++    assert.ok(s.body().equals(data));
++    assert.equal(s.engine.stats().ooo.bytes, 0);
++  } finally {
++    s.done();
++  }
++  const z = await setup({ synMss: 1000, oooMaxSegs: 0, sport: 46010 });
++  try {
++    await z.send(1000, Buffer.alloc(1000, 1));
++    assert.equal(z.engine.stats().ooo.bytes, 0, "oooMaxSegs=0 不缓存");
++  } finally {
++    z.done();
++  }
++  const g = await setup({ synMss: 1000, oooTotalBytes: 1200, sport: 46011 });
++  try {
++    await g.send(1000, Buffer.alloc(1000, 1));
++    await g.send(3000, Buffer.alloc(1000, 1));
++    assert.equal(g.engine.stats().ooo.bytes, 1000, "整机上限 1200 只留一段");
++  } finally {
++    g.done();
++  }
++});
++
++test("tun reorder: queued bytes are released on RST, on FIN completion and on flow drop", async () => {
++  const s = await setup({ synMss: 1000 });
++  try {
++    await s.send(1000, Buffer.alloc(1000, 1));
++    await s.send(3000, Buffer.alloc(500, 1));
++    assert.equal(s.engine.stats().ooo.bytes, 1500);
++    await s.engine.push(s.pkt({ seq: (s.iss + 1) >>> 0, ack: s.ackNo, flags: RST }));
++    assert.deepEqual([s.engine.stats().ooo.bytes, s.engine.stats().ooo.segs], [0, 0], "RST 后应释放");
++  } finally {
++    s.done();
++  }
++  const f = await setup({ synMss: 1000, sport: 46020 });
++  try {
++    const data = pattern(3000, 1);
++    await f.send(2000, data.subarray(2000), ACK | FIN); // FIN arrives out of order
++    await f.send(1000, data.subarray(1000, 2000));
++    assert.equal(f.engine.stats().ooo.bytes, 2000);
++    await f.send(0, data.subarray(0, 1000));
++    assert.ok(await waitFor(() => f.ended()), "乱序 FIN 补齐后应结束上游写");
++    assert.ok(f.body().equals(data));
++    assert.equal(f.lastAck(), (f.iss + 1 + 3000 + 1) >>> 0, "ACK 应覆盖 FIN");
++    assert.equal(f.engine.stats().ooo.bytes, 0);
++  } finally {
++    f.done();
++  }
++  const r = await setup({ synMss: 1000, sport: 46021 });
++  try {
++    await r.send(1000, Buffer.alloc(1000, 1));
++    r.engine.close();
++    assert.equal(r.engine.stats().ooo.bytes, 0, "引擎关闭后应释放");
++  } finally {
++    r.done();
++  }
++});

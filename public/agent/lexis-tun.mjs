@@ -47,8 +47,31 @@ export function parseTcp(payload) {
     ack: buf.readUInt32BE(8),
     flags: buf[13],
     window: buf.readUInt16BE(14),
+    mss: tcpMssOption(buf.subarray(20, off)),
     data: buf.subarray(off),
   };
+}
+
+/** MSS option (kind 2, len 4) from a TCP options block, or null when absent/malformed. */
+export function tcpMssOption(opts) {
+  let i = 0;
+  while (i < opts.length) {
+    const kind = opts[i];
+    if (kind === 0) break;
+    if (kind === 1) {
+      i += 1;
+      continue;
+    }
+    if (i + 1 >= opts.length) break;
+    const len = opts[i + 1];
+    if (len < 2 || i + len > opts.length) break;
+    if (kind === 2 && len === 4) {
+      const v = opts.readUInt16BE(i + 2);
+      return v > 0 ? v : null;
+    }
+    i += len;
+  }
+  return null;
 }
 
 export function parseUdp(payload) {
@@ -70,17 +93,24 @@ function ipv4(src, dst, proto, payload) {
   return packet;
 }
 
-export function buildTcpPacket({ src, dst, sport, dport, seq, ack, flags, payload = Buffer.alloc(0), window = 65535 }) {
+export function buildTcpPacket({ src, dst, sport, dport, seq, ack, flags, payload = Buffer.alloc(0), window = 65535, mss = null }) {
   const body = Buffer.from(payload);
-  const tcp = Buffer.alloc(20 + body.length);
+  // Only the MSS option is ever written (SYN segments); 4 bytes keeps the header 32-bit aligned.
+  const optLen = mss ? 4 : 0;
+  const tcp = Buffer.alloc(20 + optLen + body.length);
   tcp.writeUInt16BE(sport, 0);
   tcp.writeUInt16BE(dport, 2);
   tcp.writeUInt32BE(seq >>> 0, 4);
   tcp.writeUInt32BE(ack >>> 0, 8);
-  tcp[12] = 5 << 4;
+  tcp[12] = ((20 + optLen) / 4) << 4;
   tcp[13] = flags;
   tcp.writeUInt16BE(window, 14);
-  body.copy(tcp, 20);
+  if (optLen) {
+    tcp[20] = 2;
+    tcp[21] = 4;
+    tcp.writeUInt16BE(Math.max(1, Math.min(65535, mss | 0)), 22);
+  }
+  body.copy(tcp, 20 + optLen);
   const pseudo = Buffer.alloc(12);
   writeIp(pseudo, 0, src);
   writeIp(pseudo, 4, dst);
@@ -110,7 +140,12 @@ function seq() {
   return crypto.getRandomValues(new Uint32Array(1))[0];
 }
 
-const MSS = 1200;
+// RFC 9293 3.7.1: without an MSS option the peer must be assumed to take 536.
+const DEFAULT_PEER_MSS = 536;
+const TUN_MTU = 1500;
+// The engine advertises a fixed 65535-byte window (no window scaling), so nothing
+// beyond rcvNxt + RCV_WND is ever accepted into the out-of-order queue.
+const RCV_WND = 65535;
 
 function seqBefore(left, right) {
   return ((left - right) | 0) < 0;
@@ -239,10 +274,17 @@ export function answerDns(packet, fakeIp, ttl = 60) {
   return Buffer.concat([header, asked, answer]);
 }
 
-export function createEngine({ dialTcp, dialUdp, emit, fakeIp = null, mss = MSS, log = () => undefined, udpIdleMs = 60000, udpMax = 64, timeWaitMs = 2000, finLingerMs = 60000, loopGuard = [], onLoopDrop = () => undefined }) {
+export function createEngine({ dialTcp, dialUdp, emit, fakeIp = null, mtu = TUN_MTU, mss = null, oooMaxBytes = RCV_WND, oooMaxSegs = 64, oooTotalBytes = 8 << 20, log = () => undefined, udpIdleMs = 60000, udpMax = 64, timeWaitMs = 2000, finLingerMs = 60000, rtoMs = 1000, rtoMinMs = 200, rtoMaxMs = 60000, maxRetries = 7, giveUpMs = 180000, synRtoMs = 3000, dupAckThresh = 3, loopGuard = [], onLoopDrop = () => undefined }) {
   // 3.0.3 loop guard: packets addressed to our own peers (gates) must never be tunnelled;
   // they only show up here when the route to the peer fell back to the tun table.
   const guarded = new Set(loopGuard);
+  // MSS we announce in SYN|ACK: what fits one tun MTU (IPv4 + TCP headers without options
+  // = 40 bytes), unless `mss` overrides it. The send MSS of a flow is min(this, peer's MSS).
+  const localMss = Math.max(88, Math.min(65495, Number(mss) > 0 ? Number(mss) : (Number(mtu) || TUN_MTU) - 40));
+  const oooBytesCap = Math.max(0, Math.min(RCV_WND, Number(oooMaxBytes) || 0));
+  const oooSegsCap = Math.max(0, Number(oooMaxSegs) | 0);
+  const oooTotalCap = Math.max(0, Number(oooTotalBytes) || 0);
+  const oooStats = { bytes: 0, segs: 0, dropped: 0, droppedBytes: 0, outOfWindow: 0 };
   // Flows used to be removed only on RST/error, so every gracefully closed TCP
   // connection stayed in tcpFlows (with its socket and buffers) for the life of the
   // engine. Now: both FINs exchanged and ours acked -> short TIME_WAIT, then drop;
@@ -282,8 +324,65 @@ export function createEngine({ dialTcp, dialUdp, emit, fakeIp = null, mss = MSS,
       ack: flow.rcvNxt,
       flags,
       payload,
-      window: 65535,
+      window: RCV_WND,
+      mss: flags & SYN ? localMss : null,
     }));
+  }
+
+  // Retransmission timeout (RFC 6298): flow.unacked holds the in-flight segments.
+  // While any are outstanding one timer runs. RTO starts at rtoMs, then follows
+  // SRTT/RTTVAR from ACKs of segments sent once (Karn), floored at rtoMinMs.
+  // On expiry only the oldest unacked segment is resent and the timeout doubles
+  // (capped at rtoMaxMs) and stays doubled until a new RTT sample; until the ACK passes the point reached when the timer
+  // fired, each partial ACK resends the new oldest segment (it was sent at least
+  // one RTO earlier, so it is lost, not in flight). An ACK that advances sndUna
+  // resets the retry count. The flow is reset (RST) and dropped only when both
+  // maxRetries consecutive expiries and giveUpMs (3 min) passed without ACK progress. Duplicate-ACK fast retransmit: see noteDupAck.
+  const rtoFloor = Math.min(rtoMinMs, rtoMs);
+
+  function stopRto(flow) {
+    if (flow.rtoTimer) clearTimeout(flow.rtoTimer);
+    flow.rtoTimer = null;
+  }
+
+  function resendSeg(flow, seg) {
+    seg.tx += 1;
+    seg.sentAt = Date.now();
+    flow.lastRetxAt = seg.sentAt;
+    emitTcp(flow, seg.seq, seg.flags, seg.payload);
+  }
+
+  function armRto(flow) {
+    stopRto(flow);
+    if (!flow.unacked.length) return;
+    const wait = flow.rto;
+    flow.rtoTimer = setTimeout(() => {
+      flow.rtoTimer = null;
+      if (tcpFlows.get(flow.key) !== flow || !flow.unacked.length) return;
+      if (flow.retries >= maxRetries && Date.now() - flow.progressAt >= giveUpMs) {
+        log(`tcp ${flow.key} 重传 ${flow.retries} 次仍无确认，重置`);
+        resetFlow(flow.key, flow);
+        return;
+      }
+      flow.retries += 1;
+      // Backed-off RTO persists until a fresh RTT sample (RFC 6298 5.5/5.7).
+      flow.rto = Math.min(rtoMaxMs, flow.rto * 2);
+      flow.recover = flow.sndNxt;
+      resendSeg(flow, flow.unacked[0]);
+      armRto(flow);
+    }, wait);
+    flow.rtoTimer.unref?.();
+  }
+
+  function sampleRtt(flow, r) {
+    if (!flow.srtt) {
+      flow.srtt = r;
+      flow.rttvar = r / 2;
+    } else {
+      flow.rttvar = 0.75 * flow.rttvar + 0.25 * Math.abs(flow.srtt - r);
+      flow.srtt = 0.875 * flow.srtt + 0.125 * r;
+    }
+    flow.rto = Math.min(rtoMaxMs, Math.max(rtoFloor, flow.srtt + Math.max(10, 4 * flow.rttvar)));
   }
 
   function sendTcp(flow, flags, payload = Buffer.alloc(0)) {
@@ -292,8 +391,9 @@ export function createEngine({ dialTcp, dialUdp, emit, fakeIp = null, mss = MSS,
     emitTcp(flow, seqNo, flags, body);
     const len = body.length + ((flags & (SYN | FIN)) ? 1 : 0);
     if (len && (flags & RST) === 0) {
-      flow.unacked.push({ seq: seqNo, flags, payload: body, len });
+      flow.unacked.push({ seq: seqNo, flags, payload: body, len, sentAt: Date.now(), tx: 1 });
       flow.sndNxt = (flow.sndNxt + len) >>> 0;
+      if (!flow.rtoTimer) armRto(flow);
     }
   }
 
@@ -305,12 +405,96 @@ export function createEngine({ dialTcp, dialUdp, emit, fakeIp = null, mss = MSS,
     return (flow.sndNxt - flow.sndUna) >>> 0;
   }
 
+  // Fast retransmit (RFC 5681 3.2 / RFC 6582 NewReno, no SACK): dupAckThresh pure
+  // duplicate ACKs (no data, no SYN/FIN, same window, ack == sndUna, data outstanding)
+  // resend the oldest unacked segment once and enter recovery with recover = sndNxt.
+  // Reordering guard (RACK-style time check, RFC 8985 6.2): the oldest segment is only
+  // treated as lost once it is older than lateMs = SRTT + max(2 ms, SRTT/4); a younger
+  // one may just be reordered, so the decision is deferred to that age and dropped if
+  // the ACK advances meanwhile. While sndUna is below recover further duplicates are
+  // ignored (no repeat trigger); a partial ACK resends the new oldest segment only if it
+  // is also older than lateMs (shared with RTO recovery); an ACK reaching recover ends
+  // recovery. A fast retransmit does not change RTO backoff (the timer is restarted).
+  // The engine has no cwnd (bounded by peerWnd), so no window halving/inflation.
+  function lateMs(flow) {
+    // No RTT sample yet: use the current RTO, so the guard is not disabled (age 0).
+    return flow.srtt ? flow.srtt + Math.max(2, flow.srtt / 4) : flow.rto;
+  }
+
+  function stopReo(flow) {
+    if (flow.reoTimer) clearTimeout(flow.reoTimer);
+    flow.reoTimer = null;
+  }
+
+  function inRecovery(flow) {
+    return flow.recover !== null && seqBefore(flow.sndUna, flow.recover);
+  }
+
+  function fastRetransmit(flow) {
+    if (tcpFlows.get(flow.key) !== flow || !flow.unacked.length || inRecovery(flow)) return;
+    if (flow.dupAcks < dupAckThresh) return;
+    const wait = lateMs(flow) - (Date.now() - flow.unacked[0].sentAt);
+    if (wait > 0) {
+      if (!flow.reoTimer) {
+        flow.reoTimer = setTimeout(() => {
+          flow.reoTimer = null;
+          fastRetransmit(flow);
+        }, Math.ceil(wait));
+        flow.reoTimer.unref?.();
+      }
+      return;
+    }
+    flow.recover = flow.sndNxt;
+    flow.fastRetx += 1;
+    resendSeg(flow, flow.unacked[0]);
+    armRto(flow);
+  }
+
+  function noteDupAck(flow) {
+    if (!flow.unacked.length) return;
+    flow.dupAcks += 1;
+    fastRetransmit(flow);
+  }
+
   function noteAck(flow, ack) {
-    flow.unacked = flow.unacked.filter((seg) => seqBefore(ack, (seg.seq + seg.len) >>> 0));
-    if (!seqBefore(ack, flow.sndUna) && !seqBefore(flow.sndNxt, ack)) flow.sndUna = ack >>> 0;
+    let sample = 0;
+    let synRetx = false;
+    flow.unacked = flow.unacked.filter((seg) => {
+      if (seqBefore(ack, (seg.seq + seg.len) >>> 0)) return true;
+      // Karn: only segments sent once AND first sent after the last retransmission.
+      // Segments sent before a retransmission sat behind the hole it repairs, so their
+      // "RTT" includes the recovery time (inflated SRTT/RTO to tens of seconds at 5%
+      // loss); segments sent after it are timed normally.
+      if (seg.tx === 1 && seg.sentAt > flow.lastRetxAt) sample = Date.now() - seg.sentAt;
+      if ((seg.flags & SYN) && seg.tx > 1) synRetx = true;
+      return false;
+    });
+    // RFC 6298 5.7: SYN-ACK was retransmitted and the handshake gave no RTT sample ->
+    // data starts with RTO = synRtoMs (3 s), not the backed-off value (which can sit at
+    // ~RTT and fire spuriously, e.g. 2000 ms RTT after a 1 s initial RTO).
+    if (synRetx && !flow.srtt && !sample) flow.rto = Math.min(rtoMaxMs, Math.max(flow.rto, synRtoMs));
+    if (!seqBefore(ack, flow.sndUna) && !seqBefore(flow.sndNxt, ack) && (ack >>> 0) !== flow.sndUna) {
+      flow.sndUna = ack >>> 0;
+      flow.progressAt = Date.now();
+      if (sample) sampleRtt(flow, Math.max(1, sample));
+      flow.retries = 0;
+      flow.dupAcks = 0;
+      stopReo(flow);
+      if (flow.recover !== null && seqBefore(flow.sndUna, flow.recover) && flow.unacked.length) {
+        const head = flow.unacked[0];
+        if (seqBefore(head.seq, flow.recover) && Date.now() - head.sentAt >= lateMs(flow)) resendSeg(flow, head);
+      } else {
+        flow.recover = null;
+      }
+      armRto(flow);
+    }
+    if (!flow.unacked.length) stopRto(flow);
   }
 
   function dropFlow(flow) {
+    oooClear(flow);
+    stopRto(flow);
+    stopReo(flow);
     if (flow.timer) clearTimeout(flow.timer);
     flow.timer = null;
     if (tcpFlows.get(flow.key) === flow) tcpFlows.delete(flow.key);
@@ -331,7 +515,11 @@ export function createEngine({ dialTcp, dialUdp, emit, fakeIp = null, mss = MSS,
     if ((flow.finSent || flow.finRcvd) && !flow.timer) {
       flow.timer = setTimeout(() => {
         flow.timer = null;
-        if (tcpFlows.get(flow.key) === flow) resetFlow(flow.key, flow);
+        if (tcpFlows.get(flow.key) !== flow) return;
+        // Our data is still in RTO recovery (backoff can reach rtoMaxMs, longer than
+        // finLingerMs): keep lingering; the RTO give-up (maxRetries) bounds this flow.
+        if (flow.unacked.length && flow.rtoTimer) return checkClosed(flow);
+        resetFlow(flow.key, flow);
       }, finLingerMs);
       flow.timer.unref?.();
     }
@@ -346,7 +534,7 @@ export function createEngine({ dialTcp, dialUdp, emit, fakeIp = null, mss = MSS,
         flow.socket.pause?.();
         return;
       }
-      const take = Math.min(mss, room, flow.pending[0].length);
+      const take = Math.min(flow.sndMss, room, flow.pending[0].length);
       const chunk = flow.pending[0].subarray(0, take);
       flow.pending[0] = flow.pending[0].subarray(take);
       if (!flow.pending[0].length) flow.pending.shift();
@@ -362,35 +550,136 @@ export function createEngine({ dialTcp, dialUdp, emit, fakeIp = null, mss = MSS,
     }
   }
 
-  function takePayload(flow, seqNo, data, flags) {
-    if (seqNo !== flow.rcvNxt) {
-      if (data.length && !seqBefore(seqNo, flow.rcvNxt) && ((seqNo - flow.rcvNxt) >>> 0) <= 65535) {
-        if (!flow.hold || ((seqNo - flow.rcvNxt) >>> 0) < ((flow.hold.seq - flow.rcvNxt) >>> 0)) {
-          flow.hold = { seq: seqNo, data, flags };
-        }
+  // Out-of-order queue: flow.ooo is sorted by sequence, non-overlapping, adjacent pieces
+  // coalesced. Bounded per flow (oooMaxBytes / oooMaxSegs, bytes never above the 65535
+  // receive window) and engine-wide (oooTotalBytes). Over a cap the piece farthest from
+  // rcvNxt is dropped first (the nearest ones are what fills the hole; the sender will
+  // retransmit the rest). Freed when the hole fills, and on FIN/RST/reset/flow drop.
+  const rel = (flow, sq) => (sq - flow.rcvNxt) >>> 0;
+
+  function oooClear(flow) {
+    if (!flow.ooo?.length) return;
+    for (const seg of flow.ooo) oooStats.bytes -= seg.data.length;
+    oooStats.segs -= flow.ooo.length;
+    flow.oooBytes = 0;
+    flow.ooo = [];
+    flow.oooFin = null;
+  }
+
+  function oooDropTail(flow) {
+    const seg = flow.ooo.pop();
+    flow.oooBytes -= seg.data.length;
+    oooStats.bytes -= seg.data.length;
+    oooStats.segs -= 1;
+    oooStats.dropped += 1;
+    oooStats.droppedBytes += seg.data.length;
+    // A FIN sitting beyond a dropped piece can no longer be trusted to be contiguous.
+    if (flow.oooFin !== null && !seqBefore(seg.seq, flow.oooFin)) flow.oooFin = null;
+  }
+
+  function oooInsert(flow, seqNo, data, fin) {
+    let start = rel(flow, seqNo);
+    if (start >= RCV_WND) {
+      oooStats.outOfWindow += 1;
+      return;
+    }
+    let body = data;
+    if (start + body.length > RCV_WND) {
+      body = body.subarray(0, RCV_WND - start);
+      fin = false;
+      oooStats.outOfWindow += 1;
+    }
+    if (fin) flow.oooFin = (seqNo + data.length) >>> 0;
+    if (!body.length || !oooSegsCap || !oooBytesCap) return;
+    // Cut the new range down to the parts no queued piece covers (queued bytes win).
+    const pieces = [];
+    let cur = start;
+    const end = start + body.length;
+    for (const seg of flow.ooo) {
+      const a = rel(flow, seg.seq);
+      const b = a + seg.data.length;
+      if (b <= cur) continue;
+      if (a >= end) break;
+      if (a > cur) pieces.push([cur, a]);
+      cur = Math.max(cur, b);
+      if (cur >= end) break;
+    }
+    if (cur < end) pieces.push([cur, end]);
+    for (const [pa, pb] of pieces) {
+      const chunk = Buffer.from(body.subarray(pa - start, pb - start));
+      const item = { seq: (flow.rcvNxt + pa) >>> 0, data: chunk };
+      let i = 0;
+      while (i < flow.ooo.length && rel(flow, flow.ooo[i].seq) < pa) i += 1;
+      flow.ooo.splice(i, 0, item);
+      flow.oooBytes += chunk.length;
+      oooStats.bytes += chunk.length;
+      oooStats.segs += 1;
+      // Coalesce with contiguous neighbours so the segment cap counts holes, not packets.
+      const next = flow.ooo[i + 1];
+      if (next && next.seq === ((item.seq + item.data.length) >>> 0)) {
+        item.data = Buffer.concat([item.data, next.data]);
+        flow.ooo.splice(i + 1, 1);
+        oooStats.segs -= 1;
       }
+      const prev = flow.ooo[i - 1];
+      if (prev && ((prev.seq + prev.data.length) >>> 0) === item.seq) {
+        prev.data = Buffer.concat([prev.data, item.data]);
+        flow.ooo.splice(i, 1);
+        oooStats.segs -= 1;
+      }
+    }
+    while (flow.ooo.length && (flow.ooo.length > oooSegsCap || flow.oooBytes > oooBytesCap || oooStats.bytes > oooTotalCap)) oooDropTail(flow);
+  }
+
+  function deliver(flow, data) {
+    if (!data.length) return;
+    flow.socket.write(data);
+    flow.rcvNxt = (flow.rcvNxt + data.length) >>> 0;
+  }
+
+  function takeFin(flow) {
+    flow.rcvNxt = (flow.rcvNxt + 1) >>> 0;
+    flow.finRcvd = true;
+    oooClear(flow);
+    flow.oooFin = null;
+    flow.socket.end();
+  }
+
+  function takePayload(flow, seqNo, data, flags) {
+    let fin = Boolean(flags & FIN);
+    // Retransmission overlapping what we already have: keep only the new tail.
+    if (seqBefore(seqNo, flow.rcvNxt)) {
+      const skip = (flow.rcvNxt - seqNo) >>> 0;
+      if (skip > data.length || (skip === data.length && !fin)) return false;
+      data = data.subarray(skip);
+      seqNo = flow.rcvNxt;
+    }
+    if (seqNo !== flow.rcvNxt) {
+      if (data.length || fin) oooInsert(flow, seqNo, data, fin);
       return false;
     }
-    if (data.length) {
-      flow.socket.write(data);
-      flow.rcvNxt = (flow.rcvNxt + data.length) >>> 0;
+    if (flow.finRcvd) return false;
+    deliver(flow, data);
+    // Drain queued pieces that the new data reached.
+    while (flow.ooo.length && !seqBefore(flow.rcvNxt, flow.ooo[0].seq)) {
+      const seg = flow.ooo.shift();
+      flow.oooBytes -= seg.data.length;
+      oooStats.bytes -= seg.data.length;
+      oooStats.segs -= 1;
+      const skip = (flow.rcvNxt - seg.seq) >>> 0;
+      if (skip < seg.data.length) deliver(flow, seg.data.subarray(skip));
     }
-    if (flags & FIN) {
-      flow.rcvNxt = (flow.rcvNxt + 1) >>> 0;
-      flow.finRcvd = true;
-      flow.hold = null;
-      flow.socket.end();
+    if (fin || (flow.oooFin !== null && flow.oooFin === flow.rcvNxt)) {
+      takeFin(flow);
       return true;
-    }
-    if (flow.hold && flow.hold.seq === flow.rcvNxt) {
-      const held = flow.hold;
-      flow.hold = null;
-      takePayload(flow, held.seq, held.data, held.flags);
     }
     return true;
   }
 
   function resetFlow(key, flow) {
+    oooClear(flow);
+    stopRto(flow);
+    stopReo(flow);
     emitTcp(flow, flow.sndNxt, RST | ACK, Buffer.alloc(0));
     flow.socket?.destroy();
     if (flow.timer) clearTimeout(flow.timer);
@@ -402,6 +691,11 @@ export function createEngine({ dialTcp, dialUdp, emit, fakeIp = null, mss = MSS,
     const key = `${ip.src}:${tcp.sport}>${ip.dst}:${tcp.dport}`;
     if (tcp.flags & RST) {
       const gone = tcpFlows.get(key);
+      if (gone) {
+        oooClear(gone);
+        stopRto(gone);
+        stopReo(gone);
+      }
       gone?.socket?.destroy();
       if (gone?.timer) clearTimeout(gone.timer);
       tcpFlows.delete(key);
@@ -423,13 +717,27 @@ export function createEngine({ dialTcp, dialUdp, emit, fakeIp = null, mss = MSS,
         socket: null,
         unacked: [],
         pending: [],
-        hold: null,
+        ooo: [],
+        oooBytes: 0,
+        oooFin: null,
+        sndMss: Math.min(localMss, tcp.mss || DEFAULT_PEER_MSS),
         paused: false,
         finPending: false,
         finSent: false,
         finRcvd: false,
         timeWait: false,
         timer: null,
+        rtoTimer: null,
+        retries: 0,
+        rto: rtoMs,
+        srtt: 0,
+        rttvar: 0,
+        recover: null,
+        dupAcks: 0,
+        reoTimer: null,
+        fastRetx: 0,
+        lastRetxAt: 0,
+        progressAt: Date.now(),
       };
       tcpFlows.set(key, flow);
       const host = fakeIp?.lookup(ip.dst) || ip.dst;
@@ -460,8 +768,12 @@ export function createEngine({ dialTcp, dialUdp, emit, fakeIp = null, mss = MSS,
     }
     const flow = tcpFlows.get(key);
     if (!flow?.socket) return;
+    const sameWnd = tcp.window === flow.peerWnd;
     if (typeof tcp.window === "number") flow.peerWnd = tcp.window;
-    if (tcp.flags & ACK) noteAck(flow, tcp.ack);
+    if (tcp.flags & ACK) {
+      if ((tcp.ack >>> 0) === flow.sndUna && !tcp.data.length && !(tcp.flags & (SYN | FIN)) && sameWnd) noteDupAck(flow);
+      else noteAck(flow, tcp.ack);
+    }
     const accepted = tcp.data.length || (tcp.flags & FIN) ? takePayload(flow, tcp.seq, tcp.data, tcp.flags) : false;
     if (accepted || tcp.data.length || (tcp.flags & ACK)) ackOnly(flow);
     if (flow.timeWait) return;
@@ -530,6 +842,10 @@ export function createEngine({ dialTcp, dialUdp, emit, fakeIp = null, mss = MSS,
       }
       if (ip.proto === 17) await onUdp(ip);
     },
+    /** Out-of-order queue usage (engine-wide) and the MSS announced in SYN|ACK. */
+    stats() {
+      return { mss: localMss, ooo: { ...oooStats } };
+    },
     retransmit() {
       for (const flow of tcpFlows.values()) {
         for (const seg of flow.unacked) emitTcp(flow, seg.seq, seg.flags, seg.payload);
@@ -538,6 +854,9 @@ export function createEngine({ dialTcp, dialUdp, emit, fakeIp = null, mss = MSS,
     close() {
       clearInterval(sweep);
       for (const flow of tcpFlows.values()) {
+        oooClear(flow);
+        stopRto(flow);
+        stopReo(flow);
         if (flow.timer) clearTimeout(flow.timer);
         flow.socket?.destroy();
       }

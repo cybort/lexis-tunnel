@@ -107,6 +107,8 @@ export type LexisProfile = {
   linux: { method: "tproxy" | "redirect" | "tun"; mark: number; table: number; dnsRedirect: boolean; ipv6: "block" | "off" };
   windows: { method: "windivert" | "portproxy"; gateway: string };
   android: { method: "vpn"; mtu: number; address: string; dns: string };
+  /** Userspace TCP on the virtual NIC. Omitted mss means announce mtu-40. */
+  tun: { mtu: number; mss: number | null; oooMaxBytes: number; oooMaxSegs: number; oooTotalBytes: number };
   kdf: ArgonParams;
   honey: boolean;
   /** Cover coefficients. Keys used to compile it are not stored. */
@@ -235,6 +237,7 @@ export function defaultProfile(): LexisProfile {
     linux: { method: "redirect", mark: 255, table: 100, dnsRedirect: true, ipv6: "block" },
     windows: { method: "portproxy", gateway: "10.7.0.1" },
     android: { method: "vpn", mtu: 1500, address: "10.7.0.2/32", dns: "1.1.1.1" },
+    tun: { mtu: 1500, mss: null, oooMaxBytes: 65535, oooMaxSegs: 64, oooTotalBytes: 8 << 20 },
     kdf: { ...DEFAULT_KDF },
     honey: false,
     honeyProgram: null,
@@ -300,6 +303,23 @@ function linuxOf(base: LexisProfile["linux"], raw?: Partial<LexisProfile["linux"
   };
 }
 
+function mssOf(value: unknown): number | null {
+  if (value == null || value === "") return null;
+  const n = typeof value === "number" ? value : Number(value);
+  if (!Number.isInteger(n) || n < 88 || n > 65495) return null;
+  return n;
+}
+
+function tunOf(base: LexisProfile["tun"], raw?: Partial<LexisProfile["tun"]> | null): LexisProfile["tun"] {
+  return {
+    mtu: clampNum(raw?.mtu, 576, 65535, base.mtu),
+    mss: mssOf(raw?.mss),
+    oooMaxBytes: clampNum(raw?.oooMaxBytes, 0, 65535, base.oooMaxBytes),
+    oooMaxSegs: clampNum(raw?.oooMaxSegs, 0, 4096, base.oooMaxSegs),
+    oooTotalBytes: clampNum(raw?.oooTotalBytes, 0, 1 << 30, base.oooTotalBytes),
+  };
+}
+
 export function normalizeProfile(input: unknown): LexisProfile {
   const base = defaultProfile();
   if (!input || typeof input !== "object") return base;
@@ -316,6 +336,7 @@ export function normalizeProfile(input: unknown): LexisProfile {
     processes: Array.isArray(raw.processes) ? raw.processes.map(normalizeProcess) : base.processes,
     rules: Array.isArray(raw.rules) ? raw.rules.map(normalizeRule) : base.rules,
     linux: linuxOf(base.linux, raw.linux),
+    tun: tunOf(base.tun, raw.tun),
     windows: { ...base.windows, ...(raw.windows ?? {}) },
     android: { ...base.android, ...(raw.android ?? {}) },
     heartbeatSec: clampNum(raw.heartbeatSec, 5, 120, base.heartbeatSec),

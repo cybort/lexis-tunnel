@@ -62,7 +62,8 @@ test("gracefully closed tun flow is dropped after TIME_WAIT", async () => {
 });
 
 test("half-closed tun flow is reset after finLingerMs", async () => {
-  const r = await rig({ serverEnds: false, finLingerMs: 80 });
+  // Echoed data stays unacked, so the RST comes from the RTO give-up after linger.
+  const r = await rig({ serverEnds: false, finLingerMs: 80, rtoMs: 20, rtoMaxMs: 40, maxRetries: 2, giveUpMs: 0 });
   try {
     const rst = await r.waitFor((t) => t.flags & RST);
     assert.ok(rst, "RST after linger");

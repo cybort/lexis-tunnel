@@ -63,6 +63,34 @@ export function ConfigPanel() {
   const [coverIdx2, setCoverIdx2] = useState("");
   const [coverError, setCoverError] = useState<string | null>(null);
   const [covering, setCovering] = useState(false);
+  const [tunDraft, setTunDraft] = useState<Partial<Record<"mtu" | "mss" | "oooMaxBytes" | "oooMaxSegs" | "oooTotalBytes", string>>>({});
+  const tunField = (key: "mtu" | "mss" | "oooMaxBytes" | "oooMaxSegs" | "oooTotalBytes", min: number, max: number, fallback: number, emptyNull = false) => ({
+    value: tunDraft[key] ?? (emptyNull ? (profile.tun?.mss ?? "") : (profile.tun?.[key] ?? fallback)),
+    onChange: (e: { target: { value: string } }) => {
+      const text = e.target.value;
+      setTunDraft((draft) => ({ ...draft, [key]: text }));
+      const trimmed = text.trim();
+      if (trimmed === "") {
+        if (emptyNull) patch({ tun: { ...profile.tun, mss: null } });
+        return;
+      }
+      if (!/^\d+$/.test(trimmed)) return;
+      const n = Number(trimmed);
+      if (n < min || n > max) return;
+      patch({ tun: { ...profile.tun, [key]: n } });
+      setTunDraft((draft) => {
+        const next = { ...draft };
+        delete next[key];
+        return next;
+      });
+    },
+    onBlur: () =>
+      setTunDraft((draft) => {
+        const next = { ...draft };
+        delete next[key];
+        return next;
+      }),
+  });
   const hit = matchRoute(profile, { host, ip, process: proc });
   const issues = profileIssues(profile);
 
@@ -744,6 +772,30 @@ export function ConfigPanel() {
             <input className={control} aria-label="VPN 地址" value={profile.android.address} onChange={(e) => patch({ android: { ...profile.android, address: e.target.value } })} />
             <input className={control} aria-label="DNS" value={profile.android.dns} onChange={(e) => patch({ android: { ...profile.android, dns: e.target.value } })} />
           </Platform>
+        </div>
+      </section>
+
+      <section className="rounded-md border border-line bg-panel p-4">
+        <h2 className="text-base font-medium">虚拟网卡的用户态 TCP</h2>
+        <p className="mt-2 text-sm text-mist">
+          只在虚拟网卡上生效。SYN|ACK 宣告的段长是 MTU 减 40；段长留空就用这个数。实际发送取它和对端通告的较小值，对端没写时按 536。未确认的段按超时重发，三个重复确认会提前重发最早的一段。乱序可以留多段，写成 0 就不缓存。接收窗口固定 65535，不做窗口缩放。没有在这台机器上证明虚拟网卡已经接住流量。
+        </p>
+        <div className="mt-4 grid gap-3 sm:grid-cols-2 lg:grid-cols-3">
+          <Field label="MTU">
+            <input className={control} aria-label="虚拟网卡 MTU" inputMode="numeric" {...tunField("mtu", 576, 65535, 1500)} />
+          </Field>
+          <Field label="宣告段长（空则按 MTU）">
+            <input className={control} aria-label="宣告段长" inputMode="numeric" placeholder="空" {...tunField("mss", 88, 65495, 0, true)} />
+          </Field>
+          <Field label="单流乱序字节">
+            <input className={control} aria-label="单流乱序字节" inputMode="numeric" {...tunField("oooMaxBytes", 0, 65535, 65535)} />
+          </Field>
+          <Field label="单流乱序段数">
+            <input className={control} aria-label="单流乱序段数" inputMode="numeric" {...tunField("oooMaxSegs", 0, 4096, 64)} />
+          </Field>
+          <Field label="整机乱序字节">
+            <input className={control} aria-label="整机乱序字节" inputMode="numeric" {...tunField("oooTotalBytes", 0, 1073741824, 8388608)} />
+          </Field>
         </div>
       </section>
 

@@ -130,3 +130,17 @@ assert.equal(defaultProfile().linux.ipv6, "block");
 assert.equal(normalizeProfile({ linux: { method: "tun" } }).linux.ipv6, "block");
 assert.equal(normalizeProfile({ linux: { method: "tun", ipv6: "off" } }).linux.ipv6, "off");
 assert.equal(normalizeProfile({ linux: { method: "tun", ipv6: "yes" } as never }).linux.ipv6, "block");
+
+// 3.0.4 tun: MSS override only when in range; zero caps are kept
+assert.equal(defaultProfile().tun.mtu, 1500);
+assert.equal(defaultProfile().tun.mss, null);
+assert.deepEqual(
+  [defaultProfile().tun.oooMaxBytes, defaultProfile().tun.oooMaxSegs, defaultProfile().tun.oooTotalBytes],
+  [65535, 64, 8 << 20],
+);
+assert.equal(normalizeProfile({ tun: { mtu: 1280, mss: 1000, oooMaxSegs: 0 } }).tun.mtu, 1280);
+assert.equal(normalizeProfile({ tun: { mss: 1000 } }).tun.mss, 1000);
+assert.equal(normalizeProfile({ tun: { mss: 10 } }).tun.mss, null);
+assert.equal(normalizeProfile({ tun: { mtu: 100, oooMaxSegs: 99999 } }).tun.mtu, 1500);
+assert.equal(normalizeProfile({ tun: { mtu: 100, oooMaxSegs: 99999 } }).tun.oooMaxSegs, 64);
+assert.equal(normalizeProfile({ tun: { oooMaxBytes: 0, oooTotalBytes: 0 } }).tun.oooMaxBytes, 0);

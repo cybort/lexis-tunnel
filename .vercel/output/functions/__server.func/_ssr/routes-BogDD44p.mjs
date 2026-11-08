@@ -7,8 +7,8 @@ import { n as persist, r as create, t as createJSONStorage } from "../_libs/zust
 import { i as argon2id, n as hkdf, r as hmac, t as sha256 } from "../_libs/noble__hashes.mjs";
 import { t as require_index_node } from "../_libs/bokuweb__zstd-wasm.mjs";
 import { a as Cell, i as Bar, n as YAxis, o as ResponsiveContainer, r as XAxis, s as Tooltip, t as BarChart } from "../_libs/recharts+[...].mjs";
-//#region node_modules/.nitro/vite/services/ssr/assets/routes-BRE9pX-q.js
-var routes_BRE9pX_q_exports = /* @__PURE__ */ __exportAll({
+//#region node_modules/.nitro/vite/services/ssr/assets/routes-BogDD44p.js
+var routes_BogDD44p_exports = /* @__PURE__ */ __exportAll({
 	component: () => Home,
 	n: () => aesCtrKeystream,
 	r: () => x25519PublicKey,
@@ -313,7 +313,7 @@ async function identityFromJwks(publicJwk, privateJwk) {
 	if (privateJwk.kty !== "OKP" || privateJwk.crv !== "X25519" || !privateJwk.d) throw new LexisError("侧车里的私钥不是 X25519");
 	const publicRaw = jwkOkpToRaw(publicJwk);
 	const seed = b64urlDecode(privateJwk.d);
-	const { x25519PublicKey } = await import("./native-lpghMd2f.mjs");
+	const { x25519PublicKey } = await import("./native-CYkI5cTl.mjs");
 	const expect = x25519PublicKey(seed);
 	if (publicRaw.length !== 32 || !expect.every((b, i) => b === publicRaw[i])) throw new LexisError("侧车里的私钥和公钥不是一对");
 	return {
@@ -1252,6 +1252,13 @@ function defaultProfile() {
 			address: "10.7.0.2/32",
 			dns: "1.1.1.1"
 		},
+		tun: {
+			mtu: 1500,
+			mss: null,
+			oooMaxBytes: 65535,
+			oooMaxSegs: 64,
+			oooTotalBytes: 8 << 20
+		},
 		kdf: { ...DEFAULT_KDF },
 		honey: false,
 		honeyProgram: null,
@@ -1325,6 +1332,21 @@ function linuxOf(base, raw) {
 		ipv6: raw?.ipv6 === "off" ? "off" : "block"
 	};
 }
+function mssOf(value) {
+	if (value == null || value === "") return null;
+	const n = typeof value === "number" ? value : Number(value);
+	if (!Number.isInteger(n) || n < 88 || n > 65495) return null;
+	return n;
+}
+function tunOf(base, raw) {
+	return {
+		mtu: clampNum(raw?.mtu, 576, 65535, base.mtu),
+		mss: mssOf(raw?.mss),
+		oooMaxBytes: clampNum(raw?.oooMaxBytes, 0, 65535, base.oooMaxBytes),
+		oooMaxSegs: clampNum(raw?.oooMaxSegs, 0, 4096, base.oooMaxSegs),
+		oooTotalBytes: clampNum(raw?.oooTotalBytes, 0, 1 << 30, base.oooTotalBytes)
+	};
+}
 function normalizeProfile(input) {
 	const base = defaultProfile();
 	if (!input || typeof input !== "object") return base;
@@ -1341,6 +1363,7 @@ function normalizeProfile(input) {
 		processes: Array.isArray(raw.processes) ? raw.processes.map(normalizeProcess) : base.processes,
 		rules: Array.isArray(raw.rules) ? raw.rules.map(normalizeRule) : base.rules,
 		linux: linuxOf(base.linux, raw.linux),
+		tun: tunOf(base.tun, raw.tun),
 		windows: {
 			...base.windows,
 			...raw.windows ?? {}
@@ -3872,6 +3895,42 @@ function ConfigPanel() {
 	const [coverIdx2, setCoverIdx2] = (0, import_react.useState)("");
 	const [coverError, setCoverError] = (0, import_react.useState)(null);
 	const [covering, setCovering] = (0, import_react.useState)(false);
+	const [tunDraft, setTunDraft] = (0, import_react.useState)({});
+	const tunField = (key, min, max, fallback, emptyNull = false) => ({
+		value: tunDraft[key] ?? (emptyNull ? profile.tun?.mss ?? "" : profile.tun?.[key] ?? fallback),
+		onChange: (e) => {
+			const text = e.target.value;
+			setTunDraft((draft) => ({
+				...draft,
+				[key]: text
+			}));
+			const trimmed = text.trim();
+			if (trimmed === "") {
+				if (emptyNull) patch({ tun: {
+					...profile.tun,
+					mss: null
+				} });
+				return;
+			}
+			if (!/^\d+$/.test(trimmed)) return;
+			const n = Number(trimmed);
+			if (n < min || n > max) return;
+			patch({ tun: {
+				...profile.tun,
+				[key]: n
+			} });
+			setTunDraft((draft) => {
+				const next = { ...draft };
+				delete next[key];
+				return next;
+			});
+		},
+		onBlur: () => setTunDraft((draft) => {
+			const next = { ...draft };
+			delete next[key];
+			return next;
+		})
+	});
 	const hit = matchRoute(profile, {
 		host,
 		ip,
@@ -5155,6 +5214,70 @@ function ConfigPanel() {
 			}),
 			/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("section", {
 				className: "rounded-md border border-line bg-panel p-4",
+				children: [
+					/* @__PURE__ */ (0, import_jsx_runtime.jsx)("h2", {
+						className: "text-base font-medium",
+						children: "虚拟网卡的用户态 TCP"
+					}),
+					/* @__PURE__ */ (0, import_jsx_runtime.jsx)("p", {
+						className: "mt-2 text-sm text-mist",
+						children: "只在虚拟网卡上生效。SYN|ACK 宣告的段长是 MTU 减 40；段长留空就用这个数。实际发送取它和对端通告的较小值，对端没写时按 536。未确认的段按超时重发，三个重复确认会提前重发最早的一段。乱序可以留多段，写成 0 就不缓存。接收窗口固定 65535，不做窗口缩放。没有在这台机器上证明虚拟网卡已经接住流量。"
+					}),
+					/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", {
+						className: "mt-4 grid gap-3 sm:grid-cols-2 lg:grid-cols-3",
+						children: [
+							/* @__PURE__ */ (0, import_jsx_runtime.jsx)(Field, {
+								label: "MTU",
+								children: /* @__PURE__ */ (0, import_jsx_runtime.jsx)("input", {
+									className: control,
+									"aria-label": "虚拟网卡 MTU",
+									inputMode: "numeric",
+									...tunField("mtu", 576, 65535, 1500)
+								})
+							}),
+							/* @__PURE__ */ (0, import_jsx_runtime.jsx)(Field, {
+								label: "宣告段长（空则按 MTU）",
+								children: /* @__PURE__ */ (0, import_jsx_runtime.jsx)("input", {
+									className: control,
+									"aria-label": "宣告段长",
+									inputMode: "numeric",
+									placeholder: "空",
+									...tunField("mss", 88, 65495, 0, true)
+								})
+							}),
+							/* @__PURE__ */ (0, import_jsx_runtime.jsx)(Field, {
+								label: "单流乱序字节",
+								children: /* @__PURE__ */ (0, import_jsx_runtime.jsx)("input", {
+									className: control,
+									"aria-label": "单流乱序字节",
+									inputMode: "numeric",
+									...tunField("oooMaxBytes", 0, 65535, 65535)
+								})
+							}),
+							/* @__PURE__ */ (0, import_jsx_runtime.jsx)(Field, {
+								label: "单流乱序段数",
+								children: /* @__PURE__ */ (0, import_jsx_runtime.jsx)("input", {
+									className: control,
+									"aria-label": "单流乱序段数",
+									inputMode: "numeric",
+									...tunField("oooMaxSegs", 0, 4096, 64)
+								})
+							}),
+							/* @__PURE__ */ (0, import_jsx_runtime.jsx)(Field, {
+								label: "整机乱序字节",
+								children: /* @__PURE__ */ (0, import_jsx_runtime.jsx)("input", {
+									className: control,
+									"aria-label": "整机乱序字节",
+									inputMode: "numeric",
+									...tunField("oooTotalBytes", 0, 1073741824, 8388608)
+								})
+							})
+						]
+					})
+				]
+			}),
+			/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("section", {
+				className: "rounded-md border border-line bg-panel p-4",
 				children: [/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", {
 					className: "flex items-center justify-between gap-3",
 					children: [/* @__PURE__ */ (0, import_jsx_runtime.jsx)("h2", {
@@ -6360,7 +6483,7 @@ var STEPS = [
 	{
 		n: "02",
 		title: "临时密钥握出会话密钥",
-		body: "内网端主动连出。问候用临时密钥和闸门长期公钥算出的共享秘密来加密，只拿口令和闸门公钥解不出里面的长期公钥。会话密钥还混入两把临时密钥的共享秘密，再交给 Argon2id。握手确认用这个临时秘密来算，不再是公开的转录。这一层不是 TLS。帧仍是这一版。安装包是 3.0.3，和 3.0.0 的帧对得上。"
+		body: "内网端主动连出。问候用临时密钥和闸门长期公钥算出的共享秘密来加密，只拿口令和闸门公钥解不出里面的长期公钥。会话密钥还混入两把临时密钥的共享秘密，再交给 Argon2id。握手确认用这个临时秘密来算，不再是公开的转录。这一层不是 TLS。帧仍是这一版。安装包是 3.0.4，和 3.0.0 的帧对得上。"
 	},
 	{
 		n: "03",
@@ -6433,7 +6556,7 @@ function Overview({ onOpen }) {
 					}, title))
 				}), /* @__PURE__ */ (0, import_jsx_runtime.jsx)("p", {
 					className: "mt-4 text-sm text-mist",
-					children: "浏览器里不能守一个真正的 TCP 端口。这条控制台把握手和封装按 3.0 跑完，和下载的常驻进程是同一套帧。安装包是 3.0.3，和 3.0.0 的帧对得上。口令至少 128 比特，长期密钥都是 X25519。闸门半开按网段计，默认全局 512、每段 8，连接上限默认 1024。坏问候会马上让出名额，连接仍静默到握手超时；一个字节都不到，两秒后也会让出名额。静默连接堆过 1024 才会马上关掉。这不是系统层的建连限速，也不是 gVisor。TLS 和 WebSocket 只包在外面，方便过 CDN。安装包不再附带 TLS 私钥。时钟对不齐时，时间窗两边各留 120 秒。HTTP 代理按每个请求重写，去掉代理认证，并拒绝长度和分块写在一起。客户端要求关闭，或 HTTP/1.0 没声明保持连接时，响应后会关掉这条连接。状态页在回环上可以看指标；离开回环要状态口令，健康检查仍然公开。Linux 上的用户态栈会切段、暂存一段乱序，并按对端窗口停发。未确认的段可以重发，常驻进程没有定时去调。虚拟网卡按流排队：同一条流顺序不变，慢的一条不会卡住别的流，单条流排队超过 64 个就丢后面的。发往对端、却掉进虚拟网卡的包会丢掉。虚拟网卡只认 IPv4。公网 IPv6 默认不可达，回环、链路本地、ULA 和组播仍走原来的路由；写成 off 则不改 IPv6，那些流量不进隧道。ICMP 不转发。系统接管时，53 端口的查询答成 198.18.0.0/15 里的假地址，再映射回域名，假地址本身不会被拨出去。没有在这台机器上证明虚拟网卡或透明代理已经接住流量。Windows 的 WinDivert 只有源码，驱动不在包里。Android 只带 VpnService 源码和本机包通道，没有装好的系统 VPN。中继默认关闭。缺了角色的配置不会被当成边缘。"
+					children: "浏览器里不能守一个真正的 TCP 端口。这条控制台把握手和封装按 3.0 跑完，和下载的常驻进程是同一套帧。安装包是 3.0.4，和 3.0.0 的帧对得上。口令至少 128 比特，长期密钥都是 X25519。闸门半开按网段计，默认全局 512、每段 8，连接上限默认 1024。坏问候会马上让出名额，连接仍静默到握手超时；一个字节都不到，两秒后也会让出名额。静默连接堆过 1024 才会马上关掉。这不是系统层的建连限速，也不是 gVisor。TLS 和 WebSocket 只包在外面，方便过 CDN。安装包不再附带 TLS 私钥。时钟对不齐时，时间窗两边各留 120 秒。HTTP 代理按每个请求重写，去掉代理认证，并拒绝长度和分块写在一起。客户端要求关闭，或 HTTP/1.0 没声明保持连接时，响应后会关掉这条连接。状态页在回环上可以看指标；离开回环要状态口令，健康检查仍然公开。Linux 上的用户态栈会切段，并按对端窗口停发。未确认的段按超时重发，三个重复确认会提前重发最早的一段；连续 7 次超时并且 3 分钟没有新的确认，才发 RST 关掉这条流。乱序可以留多段，默认单流 64 段、65535 字节，整机 8 MiB，超了先丢离缺口最远的。SYN|ACK 宣告的段长是 mtu 减 40，默认 1460；实际发送取它和对端通告的较小值，对端没写时按 536。接收窗口固定 65535，不做窗口缩放。虚拟网卡按流排队：同一条流顺序不变，慢的一条不会卡住别的流，单条流排队超过 64 个就丢后面的。发往对端、却掉进虚拟网卡的包会丢掉。虚拟网卡只认 IPv4。公网 IPv6 默认不可达，回环、链路本地、ULA 和组播仍走原来的路由；写成 off 则不改 IPv6，那些流量不进隧道。ICMP 不转发。系统接管时，53 端口的查询答成 198.18.0.0/15 里的假地址，再映射回域名，假地址本身不会被拨出去。没有在这台机器上证明虚拟网卡或透明代理已经接住流量。Windows 的 WinDivert 只有源码，驱动不在包里。Android 只带 VpnService 源码和本机包通道，没有装好的系统 VPN。中继默认关闭。缺了角色的配置不会被当成边缘。"
 				})]
 			}),
 			/* @__PURE__ */ (0, import_jsx_runtime.jsx)("div", {
@@ -6620,4 +6743,4 @@ function Home() {
 	return /* @__PURE__ */ (0, import_jsx_runtime.jsx)(Console, {});
 }
 //#endregion
-export { Home as component, routes_BRE9pX_q_exports as i, aesCtrKeystream as n, x25519PublicKey as r, aes256Block as t };
+export { Home as component, routes_BogDD44p_exports as i, aesCtrKeystream as n, x25519PublicKey as r, aes256Block as t };
