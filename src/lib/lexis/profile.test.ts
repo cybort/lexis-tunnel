@@ -89,6 +89,8 @@ assert.equal(profileIssues(normalizeProfile({ role: "edge", statusHost: "0.0.0.0
 assert.equal(defaultProfile().frame.maxExpansion, 5);
 assert.equal(defaultProfile().frame.smallFramePolicy, "expansion");
 assert.equal(defaultProfile().frame.coalesceTarget, 1024);
+assert.equal(defaultProfile().frame.dte, "bb-k-v4");
+assert.equal(defaultProfile().frame.dteCheck, true);
 assert.equal(defaultProfile().link.udpIdleMs, 60000);
 assert.equal(defaultProfile().link.udpMax, 64);
 assert.equal(defaultProfile().link.maxHalfOpen, 512);
@@ -101,6 +103,17 @@ const framed = normalizeProfile({ frame: { maxExpansion: 99, smallFramePolicy: "
 assert.equal(framed.frame.maxExpansion, 5);
 assert.equal(framed.frame.smallFramePolicy, "honey");
 assert.equal(framed.frame.coalesceTarget, 1024);
+assert.equal(framed.frame.dte, "bb-k-v4");
+assert.equal(framed.frame.dteCheck, true);
+const dteRound = normalizeProfile({ frame: { dte: "rans-v3", dteCheck: false } });
+assert.equal(dteRound.frame.dte, "rans-v3");
+assert.equal(dteRound.frame.dteCheck, false);
+const exported = exportedConfig(dteRound);
+assert.equal(exported.frame.dte, "rans-v3");
+assert.equal(exported.frame.dteCheck, false);
+let unknownDte = false;
+try { normalizeProfile({ frame: { dte: "nope-v9" } }); } catch { unknownDte = true; }
+assert.equal(unknownDte, true);
 assert.equal(framed.link.udpIdleMs, 60000);
 assert.equal(framed.link.udpMax, 64);
 assert.ok(estimateTokenBits(mintHandshakeToken()) >= 128);
@@ -144,3 +157,24 @@ assert.equal(normalizeProfile({ tun: { mss: 10 } }).tun.mss, null);
 assert.equal(normalizeProfile({ tun: { mtu: 100, oooMaxSegs: 99999 } }).tun.mtu, 1500);
 assert.equal(normalizeProfile({ tun: { mtu: 100, oooMaxSegs: 99999 } }).tun.oooMaxSegs, 64);
 assert.equal(normalizeProfile({ tun: { oooMaxBytes: 0, oooTotalBytes: 0 } }).tun.oooMaxBytes, 0);
+assert.equal(normalizeProfile({ tun: { oooMaxBytes: 0, oooTotalBytes: 0 } }).tun.oooTotalBytes, 0);
+assert.equal(normalizeProfile({ tun: { mss: 0 } }).tun.mss, null);
+assert.equal(normalizeProfile({ tun: { mss: "" as never } }).tun.mss, null);
+assert.equal(normalizeProfile({ tun: { mss: null, mtu: 1400, oooMaxBytes: 0, oooMaxSegs: 0, oooTotalBytes: 0 } }).tun.mtu, 1400);
+const kept = normalizeProfile({
+  frame: { dte: "bb-c8-v4", dteCheck: false, maxExpansion: 8, smallFramePolicy: "honey", coalesceTarget: 2048 },
+  tun: { mtu: 1280, mss: 1000, oooMaxBytes: 100, oooMaxSegs: 2, oooTotalBytes: 4096 },
+});
+assert.equal(kept.frame.dte, "bb-c8-v4");
+assert.equal(kept.frame.dteCheck, false);
+assert.equal(kept.frame.maxExpansion, 8);
+assert.equal(kept.tun.mss, 1000);
+assert.equal(kept.tun.oooTotalBytes, 4096);
+const again = normalizeProfile(JSON.parse(JSON.stringify(exportedConfig(kept))));
+assert.equal(again.frame.dte, "bb-c8-v4");
+assert.equal(again.frame.dteCheck, false);
+assert.equal(again.tun.mss, 1000);
+assert.equal(again.tun.oooMaxBytes, 100);
+assert.equal(again.tun.oooMaxSegs, 2);
+assert.equal(normalizeProfile({ frame: { dte: "dfa-v4", dteCheck: false } }).frame.dte, "dfa-v4");
+assert.equal(normalizeProfile({ frame: { dte: "rans-v3" } }).frame.dteCheck, true);

@@ -121,6 +121,10 @@ export type LexisProfile = {
     maxExpansion: number;
     smallFramePolicy: "expansion" | "honey";
     coalesceTarget: number;
+    /** v4 word coding. Default bb-k-v4. Both ends must match; not negotiated. */
+    dte: string;
+    /** Bind frame.dte into handshake key confirmation (default true). Both ends must match. */
+    dteCheck: boolean;
   };
   link: {
     token: string;
@@ -243,7 +247,7 @@ export function defaultProfile(): LexisProfile {
     honeyProgram: null,
     seal: null,
     zstd: { enabled: false, level: 3 },
-    frame: { maxExpansion: 5, smallFramePolicy: "expansion", coalesceTarget: 1024 },
+    frame: { maxExpansion: 5, smallFramePolicy: "expansion", coalesceTarget: 1024, dte: "bb-k-v4", dteCheck: true },
     link: {
       token: "",
       idleMs: 120000,
@@ -700,12 +704,35 @@ function mapAction(value: string): RuleAction {
   return ACTION_ALIAS[value] ?? ACTION_ALIAS[value.toUpperCase()] ?? "proxy";
 }
 
+/** Keep in sync with src/lib/lexis/v2/frame2.ts DTES / BBX_DTES. Unknown values refuse at normalize. */
+const FRAME_DTES = [
+  "rans-v3",
+  "bb-v4",
+  "bb-k-v4",
+  "bb-c8-v4",
+  "bb-ou-v4",
+  "bb-ouc8-v4",
+  "bb-ouc8r-v4",
+  "dfa-v4",
+] as const;
+
+function frameDteOf(raw: unknown, fallback: string): string {
+  if (raw === undefined || raw === null || raw === "") return fallback;
+  if (typeof raw !== "string" || !(FRAME_DTES as readonly string[]).includes(raw)) {
+    throw new Error(`frame.dte: unknown value ${raw}`);
+  }
+  return raw;
+}
+
 function frameOf(base: LexisProfile["frame"], raw?: Partial<LexisProfile["frame"]> | null): LexisProfile["frame"] {
   const policy = raw?.smallFramePolicy === "honey" ? "honey" : raw?.smallFramePolicy === "expansion" ? "expansion" : base.smallFramePolicy;
+  const dteCheck = raw?.dteCheck === undefined || raw?.dteCheck === null ? base.dteCheck : !!raw.dteCheck;
   return {
     maxExpansion: clampNum(raw?.maxExpansion, 1, 16, base.maxExpansion),
     smallFramePolicy: policy,
     coalesceTarget: clampNum(raw?.coalesceTarget, 64, 4096, base.coalesceTarget),
+    dte: frameDteOf(raw?.dte, base.dte),
+    dteCheck,
   };
 }
 

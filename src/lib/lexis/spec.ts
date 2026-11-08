@@ -1,12 +1,17 @@
-/** LEXIS 3.x. Wire image is prose; secrecy is the session key.
- * Wire format: HCTR2 wide-block + keyed rANS corpus words (v2/frame2.ts, v2/handshake3.ts).
+/** LEXIS 4.x. Default frame.dte is bb-k-v4 (protocolName). Hello, server and finish keep
+ * their 3.x layout and lengths. With frame.dteCheck (default on) the confirmation transcript
+ * also binds frame.dte, so a 3.0 peer does not finish unless this end uses rans-v3 and the
+ * check is off. Setting rans-v3 alone is not enough. Wire image is prose; secrecy is the session key.
+ * Wire format: HCTR2 wide-block plus corpus words. K uses a public model and a keyed tail.
+ * rans-v3 is the keyed rANS fallback. There is no separate byte-distribution proof for K
+ * beyond that model. (v2/frame2.ts, v2/handshake3.ts).
  * `lexiconSize` / `bitsPerWord` / `mac*` below describe the legacy v1 codebook record layer
  * (seal.ts, lexicon.ts), which is still in the lib but not used on the wire. */
 
 export const SPEC = {
-  name: "lexis-hctr2-rans-v3",
+  name: "lexis-hctr2-bb-k-v4",
   /** Sidecar `cipher` values written by older builds; recognised on import. */
-  legacyNames: ["lexis-codebook-ctr-v1", "lexis-hctr2-rans-v2"] as readonly string[],
+  legacyNames: ["lexis-codebook-ctr-v1", "lexis-hctr2-rans-v2", "lexis-hctr2-rans-v3", "lexis-hctr2-bb-v4"] as readonly string[],
   curve: "X25519",
   kdf: "Argon2id",
   expand: "HKDF-SHA-256",

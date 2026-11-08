@@ -25,7 +25,7 @@ import { clampKdf, decodeKdf, deriveSessionKeyAsync, encodeKdf, featureByte, typ
 import { SPEC } from "../spec";
 import type { MeshNode } from "../types";
 import { elligatorKeyPair, sharedFromPub, sharedFromRep, type EphemeralKey } from "./elligator";
-import { constantTimeEqual, deriveV2Keys, type V2Keys } from "./frame2";
+import { constantTimeEqual, deriveV2Keys, getDefaultDte, type V2Keys } from "./frame2";
 import { x25519 } from "@noble/curves/ed25519.js";
 import { hctr2Decrypt, hctr2Encrypt, hctr2Key } from "./hctr2";
 import { buildModel, bytesToWords, wordsToBytes, type WordModel } from "./model";
@@ -97,11 +97,26 @@ export function windowCandidates(now = Date.now()): number[] {
   return out;
 }
 
+/** frame.dteCheck (default true): bind this end's frame.dte into the transcript that both key
+ * confirmations (confirmS, confirmC) are computed over. A dte mismatch then fails exactly like a
+ * wrong key: the edge refuses confirmS and closes; the gate never gets a valid finish and takes its
+ * existing silent path (release half-open slot, hold silent to the deadline). No byte on the wire
+ * changes size or layout; confirm tags stay 16 uniform bytes. false = old transcript (handshake
+ * succeeds, first data frame fails integrity). Both ends must use the same setting. */
+let dteCheck = true;
+export function setDteCheck(on: boolean | undefined): void {
+  if (on === undefined || on === null) return;
+  dteCheck = !!on;
+}
+export function getDteCheck(): boolean {
+  return dteCheck;
+}
 function transcript(p: {
   repC: Uint8Array; repS: Uint8Array; ltC: Uint8Array; ltS: Uint8Array; window: number;
   nonceC: Uint8Array; nonceS: Uint8Array; kdf: Uint8Array; features: number;
 }) {
-  return sha256(concat(enc.encode("lexis-v3-transcript"), p.repC, p.repS, p.ltC, p.ltS, u32be(p.window >>> 0), p.nonceC, p.nonceS, p.kdf, new Uint8Array([p.features & 0xff])));
+  const tr = sha256(concat(enc.encode("lexis-v3-transcript"), p.repC, p.repS, p.ltC, p.ltS, u32be(p.window >>> 0), p.nonceC, p.nonceS, p.kdf, new Uint8Array([p.features & 0xff])));
+  return dteCheck ? sha256(concat(enc.encode("lexis-v4-transcript-dte"), tr, enc.encode(getDefaultDte()))) : tr;
 }
 
 /* D2: every confirmation is keyed on a secret that needs an EPHEMERAL private scalar

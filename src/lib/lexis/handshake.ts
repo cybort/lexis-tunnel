@@ -27,8 +27,8 @@ import { SPEC } from "./spec";
 import type { MeshNode } from "./types";
 import type { HoneyProgram } from "./honey";
 import { estimateTokenBits } from "./profile";
-import type { V2Keys } from "./v2/frame2";
-import { edgeFinish3, edgeStart3, gateAccept3, gateRespond3, HandshakeDrop } from "./v2/handshake3";
+import { setDefaultDte, type V2Keys } from "./v2/frame2";
+import { edgeFinish3, edgeStart3, gateAccept3, gateRespond3, HandshakeDrop, setDteCheck } from "./v2/handshake3";
 
 export type Direction = "e2g" | "g2e";
 
@@ -448,14 +448,21 @@ function indexWords(words: string[]): Map<string, number> {
   return map;
 }
 
-/** Browser lab. Same Noise-NK handshake and HCTR2 frame keys as the 3.0.0 agent. */
+/** Browser lab. Same Noise-NK handshake and HCTR2 keys as the agent. Both ends share this
+ * JavaScript realm, so frame.dte and frame.dteCheck are process-wide defaults set before the
+ * calls below. This path only demonstrates two ends with the same options. It cannot show a mismatch. */
 export async function establish3(
   edge: MeshNode,
   gate: MeshNode,
   now = Date.now(),
   offer?: Partial<SessionOffer>,
   token = "",
+  frame?: { dte?: string; dteCheck?: boolean },
 ): Promise<LiveSession> {
+  if (frame) {
+    setDefaultDte(frame.dte);
+    setDteCheck(frame.dteCheck);
+  }
   if (edge.role !== "edge" || gate.role !== "gate") {
     throw new LexisError("需要一个内网端和一个公网闸门");
   }

@@ -1,7 +1,7 @@
 import { i as __toESM } from "../_runtime.mjs";
 import { q as require_react, x as require_jsx_runtime, y as Link } from "../_libs/@tanstack/react-router+[...].mjs";
 import { i as Smartphone, o as Monitor, r as Terminal } from "../_libs/lucide-react.mjs";
-//#region node_modules/.nitro/vite/services/ssr/assets/download-Bu_5Ypz7.js
+//#region node_modules/.nitro/vite/services/ssr/assets/download-BXJw-h2C.js
 var import_react = /* @__PURE__ */ __toESM(require_react());
 var import_jsx_runtime = require_jsx_runtime();
 var CARDS = [
@@ -85,7 +85,7 @@ function DownloadPage() {
 					children: [
 						/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("p", {
 							className: "font-mono text-xs text-sage",
-							children: ["LEXIS ", manifest?.version ?? "1.0.0"]
+							children: ["LEXIS ", manifest?.version ?? "4.0.0"]
 						}),
 						/* @__PURE__ */ (0, import_jsx_runtime.jsx)("h2", {
 							className: "mt-2 text-2xl font-bold",
@@ -93,7 +93,7 @@ function DownloadPage() {
 						}),
 						/* @__PURE__ */ (0, import_jsx_runtime.jsx)("p", {
 							className: "mt-2 max-w-2xl text-sm text-mist",
-							children: "通信进程安装后留在后台。转发正文和这条控制台是同一套 3.0 帧。安装包是 3.0.4，和 3.0.0 的帧对得上。TLS 和 WebSocket 只做外层。安装包不带 TLS 私钥。长期密钥是 X25519，旧的 P-256 身份对不上。握手口令两端相同，至少 128 比特，可以用常驻进程的 --gen-token 生成。半开按网段计，默认全局 512、连接上限 1024。虚拟网卡只认 IPv4，公网 IPv6 默认不可达。未确认的段会按超时重发，乱序可以留多段。中继和出口都要逐个节点打开。NAT 后面的服务用暴露和反向入口；反向入口默认只绑回环。导出的配置带本机私钥，两端要互相放上对方公钥。需要 Node.js 22。"
+							children: "安装包是 4.0.0，默认 bb-k-v4（方案 K），和这页演示是同一套帧。和 3.0.x 默认不互通。要和仍跑 3.0.x 的一端互通，这一端要显式选 rans-v3 并关闭 frame.dteCheck，只改词编码不够。两端都是 4.0 时仍建议开着检查。TLS 和 WebSocket 只做外层。安装包不带 TLS 私钥。长期密钥是 X25519，旧的 P-256 身份对不上。握手口令两端相同，至少 128 比特，可以用常驻进程的 --gen-token 生成。半开按网段计，默认全局 512、连接上限 1024。虚拟网卡只认 IPv4，公网 IPv6 默认不可达。未确认的段会按超时重发，乱序可以留多段。没有在这台机器上证明虚拟网卡已经接住流量。Windows 的 WinDivert 和 Android 的系统 VPN 只有源码。中继和出口都要逐个节点打开。需要 Node.js 22。"
 						})
 					]
 				}),

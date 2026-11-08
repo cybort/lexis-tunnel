@@ -1,29 +1,66 @@
 /**
- * T19: lexis frame v2.
+ * Frame v2/v4. Protocol id is protocolName(frame.dte), default bb-k-v4. Not sent on the wire.
  *
  *   inner  = compressed || pad || mnemonic(16) || u16be(len(compressed))
  *   cipher = HCTR2-AES256(K_perm, tweak = u64 counter || dir || u32 window || u16 gen || "LX", inner)
- *   wire   = rANS(K_lex model)(cipher)  -> corpus words
+ *   wire   = words(cipher) under frame.dte
+ *            bb-k-v4 (default): public word model, keyed tail, re-seal check
+ *            rans-v3: keyed rANS (3.0.x data frames)
  *
- * - The 128-bit mnemonic comes from the session key (HKDF), so it is fixed per
- *   key generation; any change to any wire word, a wrong counter (replay, deletion,
- *   reorder), a wrong direction or window turns the whole SPRP output into noise and
- *   the mnemonic check (constant time) fails.
- * - Counters are strictly consecutive and continue across rekeys (gen increments).
- * - Separate HKDF keys: permutation, word list, padding, mnemonic.
- * - Padding length is keyed (K_pad, counter) and bounded by maxExpansion over the
- *   compressed size; the fixed 18-byte overhead is not counted against small frames.
+ * frame.dteCheck (handshake3, default on) mixes frame.dte into key confirmation.
+ * A 3.0.x peer completes the handshake only if this end uses rans-v3 and dteCheck is off.
+ * Re-seal on K confirms the tail key. It does not prove the peer sent the frame.
+ * Honey does not stop someone who already holds a candidate session key.
  */
 import { hkdf } from "@noble/hashes/hkdf.js";
 import { sha256 } from "@noble/hashes/sha2.js";
+import { ctr } from "@noble/ciphers/aes.js";
 import { hctr2Decrypt, hctr2Encrypt, hctr2Key, type Hctr2Key } from "./hctr2";
-import { buildModel, bytesToWords, wordsToBytes, type WordModel } from "./model";
+import { buildModel, buildModelV4, bytesToWords, wordsToBytes, type WordModel } from "./model";
+import { bbAlign, bbParse, bbSeal, wordsForBytes } from "./bb";
+import { alignX, BBX_DTES, parseX, sealX, specOf, wordsMinX, type BbxDte } from "./bbx";
+/** bb-v4: measured wire bytes per word (avg word length + space). */
+const BB_WIRE_PER_WORD = 4.89;
+function bbWordsMin(n: number): number {
+  for (let k = 0; k < 4; k++) { const m = wordsForBytes(n + k); if (m.length) return m[m.length - 1]; }
+  return Math.ceil((8 * n) / 9.44);
+}
 
 /** Wire protocol identity. Deliberately NOT sent on the wire (a version byte is a fingerprint);
  *  both ends must run the same protocol. Incompatible with 1.8.0 (lexis-codebook-ctr-v1). */
-export const PROTOCOL = { name: "lexis-hctr2-rans-v3", version: 3, agent: "3.0.4" } as const;
+export const PROTOCOL = { name: "lexis-hctr2-bb-k-v4", version: 4, agent: "4.0.0" } as const;
+
+/** frame.dte (v4). Default "bb-k-v4" (scheme K): surjective bits-back over ONE public word
+ * model, tail bits from a key-derived stream, re-seal on open. "bb-v4" is the A0 fallback
+ * (CSPRNG tail, malleable words below the ciphertext). "rans-v3" is the keyed rANS model
+ * (3.0.x data frames; re-encode confirms a candidate key, ~2–3% false pass). Not negotiated.
+ * Handshake interop with 3.0.x also needs frame.dteCheck off. Unknown values throw. */
+export type Dte = "rans-v3" | "bb-v4" | "bb-k-v4" | BbxDte;
+const DTES: readonly string[] = ["rans-v3", "bb-v4", "bb-k-v4", ...BBX_DTES];
+/** bb-v4 family (same public-model surjective parse, same lengths): bb-v4, bb-k-v4 (scheme K). */
+const isBb = (d: Dte): boolean => d === "bb-v4" || d === "bb-k-v4";
+const isBbx = (d: Dte): d is BbxDte => (BBX_DTES as readonly string[]).includes(d);
+let defaultDte: Dte = "bb-k-v4";
+export function setDefaultDte(d: string | undefined): void {
+  if (d === undefined || d === null || d === "") return;
+  if (!DTES.includes(d)) throw new Error(`frame.dte: unknown value ${d}`);
+  defaultDte = d as Dte;
+}
+/** Protocol id per frame.dte (documentation / status page; never on the wire). */
+export function protocolName(d: Dte = defaultDte): string {
+  return `lexis-hctr2-${d}`;
+}
+export function getDefaultDte(): Dte {
+  return defaultDte;
+}
 
 export type Dir = "e2g" | "g2e";
+
+function parseWords(keys: { dte: Dte; wire: WordModel }, words: string[]): Uint8Array {
+  if (isBb(keys.dte)) return bbParse(words);
+  if (isBbx(keys.dte)) return parseX(specOf(keys.dte), words);
+  return wordsToBytes(keys.wire, words);
+}
 const enc = new TextEncoder();
 
 export type V2Keys = {
@@ -32,13 +69,19 @@ export type V2Keys = {
   model: WordModel;
   padKey: Uint8Array;
   mnemonic: Uint8Array;
+  /** bb-k-v4: AES-128 key of the canonical tail stream (independent HKDF label "tail"). */
+  tailKey: Uint8Array;
+  dte: Dte;
+  /** model used for frame words: keyed `model` for rans-v3, the shared public model for bb-v4.
+   *  `model` itself stays keyed (the v3 hello / handshake words use it, unchanged). */
+  wire: WordModel;
 };
 
 function derive(sk: Uint8Array, label: string, gen: number, len = 32): Uint8Array {
   return hkdf(sha256, sk, enc.encode("lexis-v2"), enc.encode(`${label}|gen=${gen}`), len);
 }
 
-export function deriveV2Keys(sk: Uint8Array, gen = 0, mnemonicBase?: Uint8Array | null): V2Keys {
+export function deriveV2Keys(sk: Uint8Array, gen = 0, mnemonicBase?: Uint8Array | null, dte: Dte = defaultDte): V2Keys {
   const lexKey = derive(sk, "lex", gen);
   const padKey = derive(sk, "pad", gen);
   // D2 honey: the mnemonic is derived from a per-handshake secret (mnemonicBase) that
@@ -48,12 +91,16 @@ export function deriveV2Keys(sk: Uint8Array, gen = 0, mnemonicBase?: Uint8Array 
   const mnemonic = mnemonicBase
     ? hkdf(sha256, mnemonicBase, enc.encode("lexis-v2-mnemonic"), enc.encode(`mnemonic|gen=${gen}`), 16)
     : derive(sk, "mnemonic", gen, 16);
+  const model = buildModel(lexKey, padKey);
   return {
     gen,
     perm: hctr2Key(derive(sk, "perm", gen)),
-    model: buildModel(lexKey, padKey),
+    model,
     padKey,
     mnemonic,
+    tailKey: derive(sk, "tail", gen, 16),
+    dte,
+    wire: dte === "rans-v3" ? model : buildModelV4(),
   };
 }
 
@@ -130,8 +177,19 @@ export function padLength(keys: V2Keys, counter: number, dir: Dir, len: number, 
     const mix = sha256(new Uint8Array([...keys.padKey, ...tweakOf(counter, dir, 0, keys.gen)]));
     return ((mix[0] << 8) | mix[1]) % 256;
   }
-  const budget = Math.floor((maxExpansion * Math.max(len, 1)) / WIRE_PER_INNER_BYTE) - len;
-  const maxPad = Math.max(0, Math.min(255, budget - OVERHEAD));
+  let maxPad: number;
+  if (keys.dte !== "rans-v3") {
+    const wmin = isBb(keys.dte) ? bbWordsMin : (n: number) => wordsMinX(specOf(keys.dte as BbxDte), n);
+    // bb-v4 spends more words on short frames (fixed information margin), so the wire budget
+    // is checked against the actual word count: largest pad whose frame stays within
+    // maxExpansion * |P| wire bytes (BB_WIRE_PER_WORD measured chars incl. space).
+    const cap = maxExpansion * Math.max(len, 1);
+    maxPad = 0;
+    for (let p = 255; p > 0; p--) if (wmin(len + p + OVERHEAD) * BB_WIRE_PER_WORD <= cap) { maxPad = p; break; }
+  } else {
+    const budget = Math.floor((maxExpansion * Math.max(len, 1)) / WIRE_PER_INNER_BYTE) - len;
+    maxPad = Math.max(0, Math.min(255, budget - OVERHEAD));
+  }
   if (maxPad === 0) return 0;
   const mix = sha256(new Uint8Array([...keys.padKey, ...tweakOf(counter, dir, 0, keys.gen)]));
   return ((mix[0] << 8) | mix[1]) % (maxPad + 1);
@@ -149,25 +207,69 @@ export function sealV2(opts: {
   const { keys, counter, window, dir, plaintext } = opts;
   if (plaintext.length > 0xffff) throw new Error("frame too large");
   if (!Number.isSafeInteger(counter) || counter < 1) throw new Error("bad counter");
-  const pad = padLength(keys, counter, dir, plaintext.length, opts.maxExpansion ?? 2, opts.smallFramePolicy ?? "expansion");
-  const inner = new Uint8Array(plaintext.length + pad + OVERHEAD);
-  inner.set(plaintext, 0);
-  if (pad) {
-    const fill = sha256(new Uint8Array([...keys.padKey, 0x70, ...tweakOf(counter, dir, window, keys.gen)]));
-    for (let i = 0; i < pad; i++) inner[plaintext.length + i] = fill[i % 32] ^ (i >> 5);
+  let pad = padLength(keys, counter, dir, plaintext.length, opts.maxExpansion ?? 2, opts.smallFramePolicy ?? "expansion");
+  // bb-v4: the word count fixes the inner length; nudge the pad by +-1 when the natural length
+  // falls in a 1-byte gap of the representable set (the length field still carries the pad).
+  if (isBb(keys.dte)) pad = bbAlign(plaintext.length + OVERHEAD, pad);
+  else if (isBbx(keys.dte)) pad = alignX(specOf(keys.dte), plaintext.length + OVERHEAD, pad);
+  const cipherFor = (pad: number): Uint8Array => {
+    const inner = new Uint8Array(plaintext.length + pad + OVERHEAD);
+    inner.set(plaintext, 0);
+    if (pad) {
+      const fill = sha256(new Uint8Array([...keys.padKey, 0x70, ...tweakOf(counter, dir, window, keys.gen)]));
+      for (let i = 0; i < pad; i++) inner[plaintext.length + i] = fill[i % 32] ^ (i >> 5);
+    }
+    inner.set(keys.mnemonic, plaintext.length + pad);
+    const field = encodeLenField(plaintext.length, plaintext.length + pad);
+    inner[inner.length - 2] = (field >> 8) & 0xff;
+    inner[inner.length - 1] = field & 0xff;
+    return hctr2Encrypt(keys.perm, tweakOf(counter, dir, window, keys.gen), inner);
+  };
+  if (keys.dte === "bb-v4") return bbSeal(cipherFor(pad)).join(" ");
+  if (keys.dte === "bb-k-v4") { const C = cipherFor(pad); return bbSeal(C, tailStream(keys, counter, dir, window, C)).join(" "); }
+  if (keys.dte === "rans-v3") return bytesToWords(keys.model, cipherFor(pad), counter & 0xff).join(" ");
+  const sp = specOf(keys.dte);
+  if (!sp.canon) return (sealX(sp, cipherFor(pad)) as string[]).join(" ");
+  // dfa-v4 (canonical, no bits-back): the word count follows the information of the words, so
+  // some lengths are skipped for a given ciphertext; the sender then moves the pad (+1, +2, ...;
+  // downwards near 255). The length field carries the pad, the receiver is unchanged.
+  for (let k = 0; k < 512; k++) {
+    const p = pad + k <= 255 ? pad + k : pad - (pad + k - 255);
+    if (p < 0) break;
+    const w = sealX(sp, cipherFor(p));
+    if (w) return w.join(" ");
   }
-  inner.set(keys.mnemonic, plaintext.length + pad);
-  const field = encodeLenField(plaintext.length, plaintext.length + pad);
-  inner[inner.length - 2] = (field >> 8) & 0xff;
-  inner[inner.length - 1] = field & 0xff;
-  const cipher = hctr2Encrypt(keys.perm, tweakOf(counter, dir, window, keys.gen), inner);
-  return bytesToWords(keys.model, cipher, counter & 0xff).join(" ");
+  throw new Error("dfa-v4: encode failed");
+}
+
+/** bb-k-v4 (scheme K, keyed canonical tail): the bits below the ciphertext and the word-count
+ * choice come from AES-128-CTR(K_tail, IV = SHA-256(tweak || C)[0..16]) instead of the CSPRNG,
+ * so the words are a deterministic function of (key, counter, dir, window, C). The receiver
+ * parses C, re-seals with the same stream and requires the identical word sequence, so no
+ * word (including the tail words below C) can be changed. To an observer without K_tail the
+ * stream is computationally indistinguishable from CSPRNG bits (same word distribution). */
+function tailStream(keys: V2Keys, counter: number, dir: Dir, window: number, C: Uint8Array): () => number {
+  const t = tweakOf(counter, dir, window, keys.gen);
+  const h = sha256.create().update(t).update(C).digest();
+  const iv = h.subarray(0, 16);
+  let len = 256, buf = ctr(keys.tailKey, iv).encrypt(new Uint8Array(len)), p = 0;
+  return () => {
+    if (p >= buf.length) { len *= 4; buf = ctr(keys.tailKey, iv).encrypt(new Uint8Array(len)); } // prefix-stable regrow
+    return buf[p++];
+  };
+}
+function canonK(keys: V2Keys, counter: number, dir: Dir, window: number, cipher: Uint8Array, words: string[]): boolean {
+  let again: string[];
+  try { again = bbSeal(cipher, tailStream(keys, counter, dir, window, cipher)); } catch { return false; }
+  let d = again.length ^ words.length;
+  for (let i = 0; i < again.length && i < words.length; i++) d |= again[i] === words[i] ? 0 : 1;
+  return d === 0;
 }
 
 /** Raw SPRP inverse without any check: used by the wrong-key randomness tests. */
 export function unsealRawV2(keys: V2Keys, counter: number, window: number, dir: Dir, prose: string): Uint8Array {
   const words = prose.trim().toLowerCase().split(/\s+/).filter(Boolean);
-  const cipher = wordsToBytes(keys.model, words);
+  const cipher = parseWords(keys, words);
   if (cipher.length < 16) return cipher;
   return hctr2Decrypt(keys.perm, tweakOf(counter, dir, window, keys.gen), cipher);
 }
@@ -178,29 +280,24 @@ export type HoneyView = { mnemonic: Uint8Array; body: Uint8Array; formatValid: b
 
 /**
  * D2 honey decrypt. With ANY key this returns a 16-byte mnemonic and a body and never
- * throws: a wrong key simply yields a different (random) mnemonic and a random body,
- * both valid in format. This is the view an attacker who guesses/seizes a key gets;
- * the frame layer adds no explicit key-confirmation value. `formatValid` is the canonical
- * re-encoding check (words -> bytes -> words must reproduce the prose). It is NOT
- * key-independent: the rANS word model is keyed, so the check passes ~100% under the
- * right key and only ~2-3% under a wrong key (measured AUC 0.987 from one frame). Anyone
- * holding a candidate session key can therefore confirm it from a single frame; this is
- * an accepted boundary (user decision 2026-11-02, Zipf rANS kept, no GF bijection).
- * Other confirmations available to a candidate-key holder: body structure (batch/record
- * headers, zstd magic) and, on small unpadded frames, the decoded pad share. Honey only
- * defends against brute-forcing the long-term private key / passphrase, never against a
- * candidate session key. Session keys are not reachable from long-term keys + transcript
- * (ephemeral DH).
+ * throws: a wrong key simply yields a different mnemonic and body. formatValid is not a
+ * honey ciphertext. For rans-v3 it is the keyed re-encode (about 100% on the right key,
+ * about 2–3% on a wrong key). For bb-k-v4 and the public-model DTEs the honey path does
+ * not re-seal, so formatValid stays true; openV2's re-seal is a separate confirmation and
+ * does not prove the peer sent the frame. A candidate session key can still be checked.
+ * That oracle is an accepted boundary (2026-11-02). Honey only slows guessing of the
+ * long-term private key and the passphrase.
  */
 export function openV2Honey(opts: { keys: V2Keys; counter: number; window: number; dir: Dir; prose: string }): HoneyView {
   const words = opts.prose.trim().toLowerCase().split(/\s+/).filter(Boolean);
-  const cipher = wordsToBytes(opts.keys.model, words);
+  const cipher = parseWords(opts.keys, words);
   const inner = cipher.length >= 16 ? hctr2Decrypt(opts.keys.perm, tweakOf(opts.counter, opts.dir, opts.window, opts.keys.gen), cipher) : cipher;
   if (inner.length < OVERHEAD) return { mnemonic: new Uint8Array(16), body: new Uint8Array(0), formatValid: false };
   const mnemonic = inner.slice(inner.length - OVERHEAD, inner.length - 2);
   const len = decodeLenField((inner[inner.length - 2] << 8) | inner[inner.length - 1], inner.length - OVERHEAD);
   let canonical = true;
-  if (cipher.length >= 16) {
+  if (cipher.length >= 16 && opts.keys.dte === "rans-v3") {
+    // bb-v4: every word sequence is a valid encoding (surjective parse); nothing to check.
     const again = bytesToWords(opts.keys.model, cipher, opts.counter & 0xff);
     canonical = again.length === words.length && again.every((w, i) => w === words[i]);
   }
@@ -211,12 +308,19 @@ export function openV2Honey(opts: { keys: V2Keys; counter: number; window: numbe
 
 export function openV2(opts: { keys: V2Keys; counter: number; window: number; dir: Dir; prose: string }): Uint8Array {
   const words = opts.prose.trim().toLowerCase().split(/\s+/).filter(Boolean);
-  const cipher = wordsToBytes(opts.keys.model, words);
+  const cipher = parseWords(opts.keys, words);
   if (cipher.length < OVERHEAD) throw new FrameError("帧完整性校验失败");
-  // Canonical encoding: the rANS tail can carry virtual bytes that do not reach the
-  // ciphertext, so re-encode and require the exact word sequence (no wire malleability).
-  const again = bytesToWords(opts.keys.model, cipher, opts.counter & 0xff);
-  if (again.length !== words.length || again.some((w, i) => w !== words[i])) throw new FrameError("帧完整性校验失败");
+  if (opts.keys.dte === "rans-v3") {
+    // Canonical encoding (v3): the rANS tail can carry virtual bytes that do not reach the
+    // ciphertext, so re-encode and require the exact word sequence (no wire malleability).
+    const again = bytesToWords(opts.keys.model, cipher, opts.counter & 0xff);
+    if (again.length !== words.length || again.some((w, i) => w !== words[i])) throw new FrameError("帧完整性校验失败");
+  }
+  // bb-k-v4: keyed canonical tail -- re-seal with the keyed stream, require the same words.
+  if (opts.keys.dte === "bb-k-v4" && !canonK(opts.keys, opts.counter, opts.dir, opts.window, cipher, words)) throw new FrameError("帧完整性校验失败");
+  // bb-v4: no canonical check. The last few words (below the ciphertext's 8n bits) are
+  // malleable (a different wire, same ciphertext); the SPRP + mnemonic still authenticate
+  // every ciphertext byte and the counter forbids replays.
   const inner = hctr2Decrypt(opts.keys.perm, tweakOf(opts.counter, opts.dir, opts.window, opts.keys.gen), cipher);
   if (inner.length < OVERHEAD) throw new FrameError("帧完整性校验失败");
   const mn = inner.subarray(inner.length - OVERHEAD, inner.length - 2);

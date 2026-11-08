@@ -63,7 +63,13 @@ export function ConfigPanel() {
   const [coverIdx2, setCoverIdx2] = useState("");
   const [coverError, setCoverError] = useState<string | null>(null);
   const [covering, setCovering] = useState(false);
+  const [a1Ask, setA1Ask] = useState(false);
   const [tunDraft, setTunDraft] = useState<Partial<Record<"mtu" | "mss" | "oooMaxBytes" | "oooMaxSegs" | "oooTotalBytes", string>>>({});
+  const experimentalDtes = ["bb-v4", "bb-c8-v4", "bb-ou-v4", "bb-ouc8-v4", "bb-ouc8r-v4", "dfa-v4"] as const;
+  const dteExperimental = experimentalDtes.includes(profile.frame.dte as (typeof experimentalDtes)[number]);
+  function setFrame(partial: Partial<LexisProfile["frame"]>) {
+    patch({ frame: { ...profile.frame, ...partial } });
+  }
   const tunField = (key: "mtu" | "mss" | "oooMaxBytes" | "oooMaxSegs" | "oooTotalBytes", min: number, max: number, fallback: number, emptyNull = false) => ({
     value: tunDraft[key] ?? (emptyNull ? (profile.tun?.mss ?? "") : (profile.tun?.[key] ?? fallback)),
     onChange: (e: { target: { value: string } }) => {
@@ -76,6 +82,15 @@ export function ConfigPanel() {
       }
       if (!/^\d+$/.test(trimmed)) return;
       const n = Number(trimmed);
+      if (emptyNull && n === 0) {
+        patch({ tun: { ...profile.tun, mss: null } });
+        setTunDraft((draft) => {
+          const next = { ...draft };
+          delete next[key];
+          return next;
+        });
+        return;
+      }
       if (n < min || n > max) return;
       patch({ tun: { ...profile.tun, [key]: n } });
       setTunDraft((draft) => {
@@ -212,7 +227,7 @@ export function ConfigPanel() {
           压缩不靠这份配置在对端对齐。明文第一个字节是类型：0 是原文，1 是 zstd 帧。等级决定窗口，窗口写在帧头里，对端解开以后自己读。比原文更大时这一帧会改回类型 0。
         </p>
         <p className="mt-2 text-sm text-mist">
-          蜜文只挡对长期私钥和口令的暴力猜测。它不挡已经拿到候选会话密钥的人：一帧词重编码回去，对的密钥对得上，错的密钥大约只有 2%–3% 对得上。握手确认用临时密钥的共享秘密来算。两端的蜜文开关要写成一样，它会进入会话密钥；帧本身不再把坏帧落成另一句词。封面系数仍按旧的句式封存，3.0 的线上帧不用这句式。长期私钥的封存在节点页。这一版和 2.0 及更早的对端对不上。
+          蜜文只挡对长期私钥和口令的暴力猜测，不挡已经拿到候选会话密钥的人。默认方案 K 的词模型公开，密钥参与尾部；重封对得上只说明这把密钥能生成这条尾，不能证明帧来自对端。错钥的蜜文视图仍是一句格式合法的词，检查不在那条路径上。旧的 rans-v3 才用词序重编码确认密钥：对的密钥几乎总能对上，错的大约 2%–3%。握手确认用临时密钥的共享秘密来算。两端的蜜文开关要写成一样，它会进入会话密钥。封面系数仍按旧的句式封存，线上帧不用这句式。长期私钥的封存在节点页。这一版和 2.0 及更早的对端对不上。
         </p>
         <div className="mt-4 grid gap-3 sm:grid-cols-3">
           <Field label="Argon2 内存 KiB">
@@ -271,7 +286,7 @@ export function ConfigPanel() {
         </div>
         <div className="mt-4 grid gap-3">
           <p className="text-sm text-mist">
-            封面系数按旧的四词句式封存。3.0 的线上帧不再读这句式。密钥写成 64 位十六进制。封存之后只留系数。长期私钥的封存在节点页，任意口令都会解开一把合法的 X25519 私钥。
+            封面系数按旧的四词句式封存。线上帧不再读这句式。密钥写成 64 位十六进制。封存之后只留系数。长期私钥的封存在节点页，任意口令都会解开一把合法的 X25519 私钥。
           </p>
           <Field label="密钥">
             <input className={control} value={coverKey} autoComplete="off" spellCheck={false} placeholder="64 位十六进制" aria-label="封面密钥" onChange={(e) => setCoverKey(e.target.value)} />
@@ -298,7 +313,7 @@ export function ConfigPanel() {
           {profile.honeyProgram ? (
             <p className="text-sm text-mist">已封存 {profile.honeyProgram.coeffsB64.length} 个系数。密钥没有留下。导出配置会带上这组系数。</p>
           ) : (
-            <p className="text-sm text-mist">还没有封面系数。不封存时，蜜文句子仍从这把密钥和当前时间窗的词表里取，只是词序不由你指定。</p>
+            <p className="text-sm text-mist">还没有封面系数。不封存时，封面句子仍从这把密钥和当前时间窗的词表里取，只是词序不由你指定。数据帧不读这组系数。</p>
           )}
           {coverError ? <p className="text-sm text-ember">{coverError}</p> : null}
         </div>
@@ -322,7 +337,7 @@ export function ConfigPanel() {
       <section className="rounded-md border border-line bg-panel p-4">
         <h2 className="text-base font-medium">链路</h2>
         <p className="mt-2 text-sm text-mist">
-          常驻进程和这条控制台用同一套 3.0 帧。握手是 X25519，问候用临时密钥和闸门长期公钥的共享秘密加密。TCP、TLS、WebSocket 只负责协议和头，用来过 CDN。路径默认 /lexis。CDN 若自己终结 TLS，源站可以听 WebSocket。
+          控制台和安装包都是 4.0.0，默认 bb-k-v4。和 3.0.x 默认不互通。握手是 X25519，问候用临时密钥和闸门长期公钥的共享秘密加密。默认把词编码绑进密钥确认，两端必须相同。TCP、TLS、WebSocket 只负责协议和头，用来过 CDN。路径默认 /lexis。CDN 若自己终结 TLS，源站可以听 WebSocket。
         </p>
         <p className="mt-2 text-sm text-mist">
           一条会话上可以开多路。打开写成 tcp 主机 端口、udp 主机 端口、relay 节点 再接后面的命令，或 expose 服务名。中继和出口都要逐个节点打开。暴露不能经中继绕过去。跳数到 4 就停。慢的那一路只堵住自己。SOCKS 的用户名和密码留空就是不认证，HTTP 代理共用这一对。
@@ -628,6 +643,97 @@ export function ConfigPanel() {
             小帧蜜文填充
           </Btn>
         </div>
+        <div className="mt-4 grid gap-3 sm:grid-cols-2">
+          <Field label="词编码">
+            <select
+              className={control}
+              aria-label="词编码"
+              value={profile.frame.dte === "bb-k-v4" || profile.frame.dte === "rans-v3" ? profile.frame.dte : "experimental"}
+              onChange={(e) => {
+                const dte = e.target.value;
+                if (dte === "experimental") return;
+                setA1Ask(false);
+                setFrame({ dte });
+              }}
+            >
+              <option value="bb-k-v4">bb-k-v4 · 方案 K（默认）</option>
+              <option value="rans-v3">rans-v3 · 3.0 数据帧</option>
+              {dteExperimental ? (
+                <option value="experimental">当前是实验编码 {profile.frame.dte}</option>
+              ) : null}
+            </select>
+          </Field>
+          <Field label="握手检查">
+            <select
+              className={control}
+              aria-label="握手检查"
+              value={profile.frame.dteCheck ? "on" : "off"}
+              onChange={(e) => setFrame({ dteCheck: e.target.value === "on" })}
+            >
+              <option value="on">开 · 词编码写入密钥确认</option>
+              <option value="off">关 · 只用于旧版或诊断</option>
+            </select>
+          </Field>
+        </div>
+        <p className="mt-2 text-sm text-mist">
+          默认方案 K：密钥派生尾部并重封校验。两端必须相同，线上不协商。和 3.0.x 互通要同时选 rans-v3 并关闭检查。只改词编码不够。两端都是 4.0 时仍建议开着检查。检查开着时，对不上则内网端确认失败后关连接，闸门只回一次应答，放出半开名额后静默到超时，不会立刻回错。线格式不变。改词编码或检查会使浏览器里的旧会话作废。
+        </p>
+        <div className="mt-3 flex flex-wrap gap-2">
+          <Btn kind="ghost" onClick={() => { setA1Ask(false); setFrame({ dte: "bb-k-v4", dteCheck: true }); }}>
+            回到方案 K
+          </Btn>
+          <Btn kind="ghost" onClick={() => { setA1Ask(false); setFrame({ dte: "rans-v3", dteCheck: false }); }}>
+            填成 3.0 兼容
+          </Btn>
+        </div>
+        <details className="mt-4">
+          <summary className="min-h-11 cursor-pointer text-sm">实验词编码（不建议）</summary>
+          <div className="mt-2 grid gap-3">
+            <Field label="实验编码">
+              <select
+                className={control}
+                aria-label="实验词编码"
+                value={dteExperimental ? profile.frame.dte : ""}
+                onChange={(e) => {
+                  const dte = e.target.value;
+                  if (!dte) return;
+                  if (dte === "bb-c8-v4") {
+                    setA1Ask(true);
+                    return;
+                  }
+                  setA1Ask(false);
+                  setFrame({ dte });
+                }}
+              >
+                <option value="">未选实验编码</option>
+                <option value="bb-v4">bb-v4 · A0，尾词可改</option>
+                <option value="bb-c8-v4">bb-c8-v4 · A1，不建议</option>
+                <option value="bb-ou-v4">bb-ou-v4 · A2，实验</option>
+                <option value="bb-ouc8-v4">bb-ouc8-v4 · A3，实验</option>
+                <option value="bb-ouc8r-v4">bb-ouc8r-v4 · A3r，实验</option>
+                <option value="dfa-v4">dfa-v4 · A4，实验</option>
+              </select>
+            </Field>
+            {a1Ask ? (
+              <div className="flex flex-col gap-2">
+                <p className="text-sm text-ember">
+                  A1 有残余可塑性：本轮单词篡改 19/6000 仍被接受，明文不变；K 是 0/6000。测试结果不是安全性证明。不建议使用。
+                </p>
+                <div className="flex flex-wrap gap-2">
+                  <Btn kind="ember" onClick={() => { setA1Ask(false); setFrame({ dte: "bb-c8-v4" }); }}>
+                    仍要选用 A1
+                  </Btn>
+                  <Btn kind="ghost" onClick={() => setA1Ask(false)}>
+                    取消
+                  </Btn>
+                </div>
+              </div>
+            ) : null}
+            {profile.frame.dte === "bb-c8-v4" ? (
+              <p className="text-sm text-ember">当前是 A1。残余可塑性没有修掉，不要当成和 K 一样防篡改。</p>
+            ) : null}
+          </div>
+        </details>
       </section>
 
       <section className="rounded-md border border-line bg-panel p-4">
@@ -749,7 +855,7 @@ export function ConfigPanel() {
           {profile.mode === "system-forward" ? "客户端启动时会按当前系统写出并尝试执行。" : "现在走固定端口。这些参数会跟着配置走，切到系统接管才生效。"}
         </p>
         <div className="mt-4 grid gap-3 lg:grid-cols-3">
-          <Platform title="Linux" body="redirect、tproxy 或虚拟网卡。需要 root 才会改规则。虚拟网卡只认 IPv4。公网 IPv6 默认不可达，回环、链路本地、ULA 和组播仍走原来的路由。选「不动」则不改 IPv6，那些流量不进隧道。没有在这台机器上证明规则已经接住流量。">
+          <Platform title="Linux" body="redirect、tproxy 或虚拟网卡。需要 root 才会改规则。虚拟网卡只认 IPv4。公网 IPv6 默认不可达，回环、链路本地、ULA 和组播仍走原来的路由。选「不动」则不把 IPv6 送进隧道，并撤掉本程序自己加过的公网 IPv6 不可达规则。没有在这台机器上证明规则已经接住流量。">
             <select className={control} value={profile.linux.method} onChange={(e) => patch({ linux: { ...profile.linux, method: e.target.value as LexisProfile["linux"]["method"] } })}>
               <option value="redirect">redirect</option>
               <option value="tproxy">tproxy</option>
@@ -757,7 +863,7 @@ export function ConfigPanel() {
             </select>
             <select className={control} aria-label="公网 IPv6" value={profile.linux.ipv6 === "off" ? "off" : "block"} onChange={(e) => patch({ linux: { ...profile.linux, ipv6: e.target.value === "off" ? "off" : "block" } })}>
               <option value="block">公网 IPv6 不可达</option>
-              <option value="off">不动 IPv6</option>
+              <option value="off">不把 IPv6 送进隧道</option>
             </select>
             <input className={control} aria-label="fwmark" inputMode="numeric" value={profile.linux.mark} onChange={(e) => patch({ linux: { ...profile.linux, mark: Number(e.target.value) } })} />
           </Platform>
@@ -778,7 +884,13 @@ export function ConfigPanel() {
       <section className="rounded-md border border-line bg-panel p-4">
         <h2 className="text-base font-medium">虚拟网卡的用户态 TCP</h2>
         <p className="mt-2 text-sm text-mist">
-          只在虚拟网卡上生效。SYN|ACK 宣告的段长是 MTU 减 40；段长留空就用这个数。实际发送取它和对端通告的较小值，对端没写时按 536。未确认的段按超时重发，三个重复确认会提前重发最早的一段。乱序可以留多段，写成 0 就不缓存。接收窗口固定 65535，不做窗口缩放。没有在这台机器上证明虚拟网卡已经接住流量。
+          只在虚拟网卡的用户态 TCP 上生效，不会改系统网卡的 MTU。没有在这台机器上证明已经接住流量。Windows 的 WinDivert 和 Android 的系统 VPN 仍只是源码。Android 如果没写 tun.mtu，运行时可以退回 android.mtu；这里写出的 tun.mtu 优先。
+        </p>
+        <p className="mt-2 text-sm text-mist">
+          MTU 默认 1500，范围 576–65535，是宣告段长的基准（默认 MTU−40，1500 时为 1460）。宣告段长留空或 0 存成空，按这个基准；填写则用 88–65495 覆盖。实际发送取本地值和对端通告的较小者，对端没写时按 536。不要默认填 1200。
+        </p>
+        <p className="mt-2 text-sm text-mist">
+          单流乱序字节默认 65535（0–65535），0 不缓存乱序正文。单流乱序段数默认 64（0–4096），0 禁用乱序正文缓存，超限先丢离缺口最远的段。这和读包队列的 64 个包不是同一个数。整机乱序字节默认 8388608（8 MiB），范围 0–1073741824；0 不保留乱序数据。每个进程各有一份预算，不是整个系统共用一个上限。接收窗口固定 65535，不做窗口缩放。未确认的段按超时重发，三个重复确认会提前重发最早的一段。
         </p>
         <div className="mt-4 grid gap-3 sm:grid-cols-2 lg:grid-cols-3">
           <Field label="MTU">
@@ -793,7 +905,7 @@ export function ConfigPanel() {
           <Field label="单流乱序段数">
             <input className={control} aria-label="单流乱序段数" inputMode="numeric" {...tunField("oooMaxSegs", 0, 4096, 64)} />
           </Field>
-          <Field label="整机乱序字节">
+          <Field label="整机乱序字节（默认 8 MiB）">
             <input className={control} aria-label="整机乱序字节" inputMode="numeric" {...tunField("oooTotalBytes", 0, 1073741824, 8388608)} />
           </Field>
         </div>

@@ -1,5 +1,5 @@
 import { Link } from "@tanstack/react-router";
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { ensureSeed, useMesh } from "@/lib/lexis/store";
 import { useProfile } from "@/lib/lexis/profile-store";
 import { SPEC } from "@/lib/lexis/spec";
@@ -34,6 +34,22 @@ export function Console() {
   const [bootError, setBootError] = useState<string | null>(null);
   const [now, setNow] = useState(0);
   const [session, setSession] = useState<LiveSession | null>(null);
+  const frameDte = useProfile((s) => s.profile.frame.dte);
+  const frameDteCheck = useProfile((s) => s.profile.frame.dteCheck);
+  const frameWatch = useRef<string | null>(null);
+
+  useEffect(() => {
+    if (!booted) return;
+    const key = `${frameDte}|${String(frameDteCheck)}`;
+    if (frameWatch.current === null) {
+      frameWatch.current = key;
+      return;
+    }
+    if (frameWatch.current !== key) {
+      frameWatch.current = key;
+      setSession(null);
+    }
+  }, [booted, frameDte, frameDteCheck]);
 
   useEffect(() => {
     let live = true;

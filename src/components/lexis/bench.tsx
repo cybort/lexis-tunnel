@@ -8,7 +8,7 @@ import { packPayload, unpackPayload } from "@/lib/lexis/pack";
 import { useProfile } from "@/lib/lexis/profile-store";
 import { decodeRecord, encodeRecord, heartbeatPayload, RECORD, recordLabel } from "@/lib/lexis/records";
 import { useMesh } from "@/lib/lexis/store";
-import { FrameError, openV2, openV2Honey, packBatch, sealV2, SEG_COMPLETE, unpackBatch, deriveV2Keys } from "@/lib/lexis/v2/frame2";
+import { FrameError, openV2, openV2Honey, packBatch, protocolName, sealV2, SEG_COMPLETE, unpackBatch, deriveV2Keys } from "@/lib/lexis/v2/frame2";
 import { EntropyMeter } from "./meter";
 import { Btn, control, Field, Paper } from "./ui";
 
@@ -76,6 +76,8 @@ export function Bench({
   const [direction, setDirection] = useState<Direction>("g2e");
   const [copied, setCopied] = useState<string | null>(null);
   const [lastFrame, setLastFrame] = useState<{ prose: string; direction: Direction; counter: number } | null>(null);
+  const dte = profile.frame.dte;
+  const dteCheck = profile.frame.dteCheck;
 
   function push(item: Omit<LogItem, "id">) {
     setLogs((prev) => [{ ...item, id: crypto.randomUUID() }, ...prev].slice(0, 12));
@@ -94,11 +96,15 @@ export function Bench({
     setLastFrame(null);
     onSession(null);
     try {
-      const next = await establish3(edge, gate, Date.now(), { ...profile.kdf, honey: profile.honey }, profile.link.token);
+      const next = await establish3(edge, gate, Date.now(), { ...profile.kdf, honey: profile.honey }, profile.link.token, {
+        dte: profile.frame.dte,
+        dteCheck: profile.frame.dteCheck,
+      });
       onSession(next);
+      const chosen = next.v2?.dte ?? profile.frame.dte;
       push({
         title: "会话密钥已按握手回声派生",
-        meta: `3.0 · HCTR2 + rANS · Argon2id ${next.kdf.memoryKiB} KiB · t${next.kdf.iterations} · p${next.kdf.parallelism} · ${next.kdfMs} ms · 词表 ${next.lexicon.length} · ${next.honey ? "握手带蜜文标志" : "坏帧会拆掉会话"}`,
+        meta: `${next.v2 ? protocolName(next.v2.dte) : chosen} · 词编码 ${chosen} · 握手检查${profile.frame.dteCheck ? "开" : "关"} · Argon2id ${next.kdf.memoryKiB} KiB · t${next.kdf.iterations} · p${next.kdf.parallelism} · ${next.kdfMs} ms · ${chosen === "rans-v3" ? "帧词序随密钥" : "帧词模型公开"} · ${next.honey ? "握手带蜜文标志" : "坏帧会拆掉会话"}。两端选项相同，这一页不能演示错配。`,
       });
       for (const item of [
         { title: "内网端 → 闸门 · 问候", prose: next.helloWire },
@@ -122,7 +128,7 @@ export function Bench({
   }
 
   async function frame(current: LiveSession, dir: Direction, plaintext: Uint8Array) {
-    if (!current.v2) throw new LexisError("这次会话没有 3.0 帧密钥");
+    if (!current.v2) throw new LexisError("这次会话没有帧密钥");
     const packed = await packPayload(plaintext, profile.zstd);
     const counter = current.counters[dir] + 1;
     const batch = packBatch([{ flag: SEG_COMPLETE, data: packed.bytes }]);
@@ -276,20 +282,26 @@ export function Bench({
     setBusy(true);
     setError(null);
     try {
-      if (!session.v2) throw new LexisError("这次会话没有 3.0 帧密钥");
+      if (!session.v2) throw new LexisError("这次会话没有帧密钥");
+      const dteNow = session.v2.dte;
       const view = openV2Honey({
-        keys: deriveV2Keys(randomBytes(32)),
+        keys: deriveV2Keys(randomBytes(32), 0, null, dteNow),
         counter: lastFrame.counter,
         window: session.window,
         dir: lastFrame.direction,
         prose: lastFrame.prose,
       });
-      const note = view.formatValid
-        ? "规范性检查碰巧通过（错误密钥大约 2%–3%）。正文仍不是原文。"
-        : "规范性检查没过。错误密钥大约 97% 会这样。";
+      const note =
+        dteNow === "rans-v3"
+          ? view.formatValid
+            ? "rans-v3 的词序重编码碰巧通过（错误密钥大约 2%–3%）。正文仍不是原文。单靠这一步就能确认候选会话密钥，蜜文挡不住。"
+            : "rans-v3 的词序重编码没过。错误密钥大约 97% 会这样。蜜文挡不住已经拿到候选会话密钥的人。"
+          : dteNow === "bb-k-v4"
+            ? "方案 K 的蜜文路径不做重封检查，错钥仍是一份格式合法的视图。持有候选会话密钥的人可以重封或核对助记码。重封对得上不能证明这一帧来自对端。这一次用的是随机密钥。"
+            : `${dteNow} 的蜜文路径不把坏帧收成另一套词。错钥视图格式${view.formatValid ? "合法" : "不合法"}。这不是打不开篡改的证明。`;
       push({
         title: "错误密钥没有还原这一帧",
-        meta: `${note} 单靠这一步就能确认候选会话密钥，蜜文挡不住。助记码 ${view.mnemonic.length} 字节，正文 ${view.body.length} 字节。`,
+        meta: `${note} 助记码 ${view.mnemonic.length} 字节，正文 ${view.body.length} 字节。`,
       });
     } catch (err) {
       push({
@@ -310,7 +322,7 @@ export function Bench({
     setBusy(true);
     setError(null);
     try {
-      if (!session.v2) throw new LexisError("这次会话没有 3.0 帧密钥");
+      if (!session.v2) throw new LexisError("这次会话没有帧密钥");
       openV2({
         keys: session.v2,
         counter: lastFrame.counter,
@@ -373,6 +385,9 @@ export function Bench({
             <Btn disabled={busy} onClick={() => void handshake()}>
               {busy ? "进行中" : "握手"}
             </Btn>
+            <p className="text-sm text-mist">
+              当前 {dte} · {protocolName(dte as "bb-k-v4")} · 握手检查{dteCheck ? "开" : "关"}。两端用同一套选项，不能在这一页演示错配。词编码或检查一变，旧会话作废。方案 K 在浏览器里很慢，短帧也要等，不要改成很大的随机载荷。
+            </p>
           </div>
           {session ? (
             <dl className="mt-4 space-y-2 text-sm">
@@ -384,6 +399,7 @@ export function Bench({
                 <dt className="text-mist">派生</dt>
                 <dd className="font-mono text-xs">
                   {session.kdf.memoryKiB} KiB · t{session.kdf.iterations} · p{session.kdf.parallelism} · {session.kdfMs} ms ·{" "}
+                  {session.v2 ? `${protocolName(session.v2.dte)} · ${session.v2.dte}` : dte} · 握手检查{dteCheck ? "开" : "关"} ·{" "}
                   {profile.frame.smallFramePolicy === "honey" ? "小帧按蜜文填充" : "小帧优先压膨胀"} · 预算 {profile.frame.maxExpansion}×
                 </dd>
               </div>

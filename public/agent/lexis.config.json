@@ -132,5 +132,12 @@
   "identity": null,
   "peers": [],
   "exposes": [],
-  "reverses": []
+  "reverses": [],
+  "frame": {
+    "maxExpansion": 5,
+    "smallFramePolicy": "expansion",
+    "coalesceTarget": 1024,
+    "dte": "bb-k-v4",
+    "dteCheck": true
+  }
 }

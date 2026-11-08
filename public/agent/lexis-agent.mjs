@@ -2046,18 +2046,30 @@ if [ "$METHOD" = "tun" ]; then
     ip route replace default dev lexis0 table "$TABLE"
     ip rule del lookup "$TABLE" priority 200 2>/dev/null || true
     ip rule add lookup "$TABLE" priority 200
-    # 3.0.3 linux.ipv6 (default "block"): the tun engine only speaks IPv4, so public IPv6
+    # linux.ipv6 (default "block"): the tun engine only speaks IPv4, so public IPv6
     # would leave outside the tunnel. Make it unreachable; loopback, link-local, ULA and
-    # multicast keep the main table. "off" leaves IPv6 alone.
-    if [ "$IPV6" = "block" ] && ip -6 route show >/dev/null 2>&1; then
+    # multicast keep the main table. "off" does not send IPv6 into the tun. Either way,
+    # delete only the rules this script installs first, so block→off in the same netns
+    # stops blocking, and repeating either mode does not stack copies. Other IPv6 rules
+    # (different prefix, priority, or table) are left in place. IPv4 rules are untouched.
+    clear_lexis_ipv6() {
+      ip -6 route show >/dev/null 2>&1 || return 0
       prio=40
       for net in $NETS6; do
         ip -6 rule del to "$net" lookup main priority "$prio" 2>/dev/null || true
+        prio=$((prio + 1))
+      done
+      ip -6 route del unreachable default table "$TABLE" 2>/dev/null || true
+      ip -6 rule del lookup "$TABLE" priority 200 2>/dev/null || true
+    }
+    clear_lexis_ipv6
+    if [ "$IPV6" = "block" ] && ip -6 route show >/dev/null 2>&1; then
+      prio=40
+      for net in $NETS6; do
         ip -6 rule add to "$net" lookup main priority "$prio"
         prio=$((prio + 1))
       done
       ip -6 route replace unreachable default table "$TABLE"
-      ip -6 rule del lookup "$TABLE" priority 200 2>/dev/null || true
       ip -6 rule add lookup "$TABLE" priority 200
       echo "公网 IPv6 已设为不可达（linux.ipv6=block），避免绕过隧道。"
     fi
@@ -2383,7 +2395,7 @@ function watchConfig() {
       const prevPeers = peerList(activeConfig || {});
       const nextById = new Map(peerList(next).filter((peer) => peer.id).map((peer) => [peer.id, String(peer.publicRawB64 || "")]));
       activeConfig = next;
-      setFrameOptions({ maxExpansion: next?.frame?.maxExpansion, smallFramePolicy: next?.frame?.smallFramePolicy, coalesceTarget: next?.frame?.coalesceTarget });
+      setFrameOptions({ maxExpansion: next?.frame?.maxExpansion, smallFramePolicy: next?.frame?.smallFramePolicy, coalesceTarget: next?.frame?.coalesceTarget, dte: next?.frame?.dte, dteCheck: next?.frame?.dteCheck });
       state.config = next;
       for (const peer of prevPeers) {
         if (!peer.id) continue;
@@ -2532,7 +2544,7 @@ async function main() {
   const config = await unlockIdentity(loadConfig());
   requireRole(config);
   activeConfig = config;
-  setFrameOptions({ maxExpansion: config?.frame?.maxExpansion, smallFramePolicy: config?.frame?.smallFramePolicy, coalesceTarget: config?.frame?.coalesceTarget });
+  setFrameOptions({ maxExpansion: config?.frame?.maxExpansion, smallFramePolicy: config?.frame?.smallFramePolicy, coalesceTarget: config?.frame?.coalesceTarget, dte: config?.frame?.dte, dteCheck: config?.frame?.dteCheck });
   state.config = config;
   tighten(configPath);
   tighten(join(dirname(configPath), "lexis.seal.json"));

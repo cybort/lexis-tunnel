@@ -50,7 +50,25 @@ test("tun script: linux.ipv6 defaults to block (unreachable default in the tun t
   assert.match(out, /IPv6 已设为不可达/);
 });
 
-test("tun script: linux.ipv6 = off leaves IPv6 alone", () => {
+test("tun script: linux.ipv6 = off deletes only this program's IPv6 rules and still installs IPv4", () => {
   const { log } = runScript({ ipv6: "off" });
-  assert.equal(log.filter((l) => l.startsWith("-6 rule add") || l.startsWith("-6 route replace")).length, 0, log.join(" | "));
+  const has = (line) => log.includes(line);
+  assert.equal(log.filter((l) => l.startsWith("-6 rule add") || l.startsWith("-6 route replace") || l.startsWith("-6 route add")).length, 0, log.join("\n"));
+  assert.equal(log.filter((l) => l.includes("flush")).length, 0);
+  for (const [i, net] of ["::1/128", "fe80::/10", "fc00::/7", "ff00::/8"].entries()) {
+    assert.ok(has(`-6 rule del to ${net} lookup main priority ${40 + i}`), net);
+  }
+  assert.ok(has("-6 route del unreachable default table 165"));
+  assert.ok(has("-6 rule del lookup 165 priority 200"));
+  assert.ok(has("rule add lookup 165 priority 200"));
+  assert.equal(log.filter((l) => l.includes("2001:db8")).length, 0);
+});
+
+test("tun script: linux.ipv6 = block clears its own rules before adding them again", () => {
+  const { log } = runScript({});
+  const del = log.indexOf("-6 rule del lookup 165 priority 200");
+  const add = log.indexOf("-6 rule add lookup 165 priority 200");
+  assert.ok(del >= 0 && add > del, log.join("\n"));
+  assert.ok(log.includes("-6 route del unreachable default table 165"));
+  assert.ok(log.includes("-6 route replace unreachable default table 165"));
 });

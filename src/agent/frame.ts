@@ -18,8 +18,8 @@ import { currentWindow, edgeFinish, edgeStart, gateAccept, gateRespond, openSess
 import { deriveSessionKey, honeyFromFeatures, setSessionKeyDeriver, type ArgonParams, type SessionOffer } from "../lib/lexis/kdf";
 import { invertLexicon, sessionLexicon } from "../lib/lexis/lexicon";
 import { decodeRecord, encodeRecord, heartbeatPayload, RECORD } from "../lib/lexis/records";
-import { deriveV2Keys, nextSessionKey, openV2, packBatch, Reassembler, sealV2, SEG_COMPLETE, SEG_HEADER, SEG_LAST, SEG_MORE, unpackBatch, type Segment } from "../lib/lexis/v2/frame2";
-import { edgeFinish3, edgeStart3, gateAccept3, gateRespond3 } from "../lib/lexis/v2/handshake3";
+import { deriveV2Keys, setDefaultDte, nextSessionKey, openV2, packBatch, Reassembler, sealV2, SEG_COMPLETE, SEG_HEADER, SEG_LAST, SEG_MORE, unpackBatch, type Segment } from "../lib/lexis/v2/frame2";
+import { edgeFinish3, edgeStart3, gateAccept3, gateRespond3, setDteCheck } from "../lib/lexis/v2/handshake3";
 import type { MeshNode } from "../lib/lexis/types";
 
 export { createIdentity };
@@ -34,7 +34,11 @@ export const frameStats = { truncated: 0, ended: 0, integrity: 0, frames: 0, rec
 const MAX_FRAME_PAYLOAD = 4096;
 /** D1: flush a coalesced frame once this many record bytes are queued. Default 1024. */
 let COALESCE_TARGET = 1024;
-export function setFrameOptions(opts: { maxExpansion?: number; smallFramePolicy?: string; coalesceTarget?: number }) {
+export function setFrameOptions(opts: { maxExpansion?: number; smallFramePolicy?: string; coalesceTarget?: number; dte?: string; dteCheck?: boolean }) {
+  // frame.dte (v4): "bb-k-v4" (default; scheme K, keyed canonical tail, protocol lexis-hctr2-bb-k-v4) | "bb-v4" (A0, fallback) | "bb-c8-v4" (A1) | "bb-ou-v4" (A2) | "bb-ouc8-v4" / "bb-ouc8r-v4" (A3, ring off/on) | "dfa-v4" (A4) | "rans-v3". Must match on both ends (not negotiated; unknown values are refused).
+  setDefaultDte(opts.dte);
+  // frame.dteCheck (default true): dte mismatch fails the handshake key confirmation (silent, like a wrong key).
+  setDteCheck(opts.dteCheck !== false);
   frameSmallPolicy = opts.smallFramePolicy === "honey" ? "honey" : "expansion";
   const m = Number(opts.maxExpansion);
   if (Number.isFinite(m) && m >= 1 && m <= 16) frameMaxExpansion = m;
@@ -1066,7 +1070,14 @@ export async function connectSession(opts: {
   const pending = edgeStart3(self, opts.peerRawB64, Date.now(), opts.offer, token);
   await opts.pipe.write(pending.helloWire);
   const serverWire = await opts.pipe.read(wait);
-  const finished = await edgeFinish3(self, pending, opts.peerRawB64, serverWire);
+  let finished: Awaited<ReturnType<typeof edgeFinish3>>;
+  try {
+    finished = await edgeFinish3(self, pending, opts.peerRawB64, serverWire);
+  } catch (err) {
+    // key confirmation failed (wrong gate key, or frame.dte / frame.dteCheck mismatch): close now
+    opts.pipe.close();
+    throw err;
+  }
   await opts.pipe.write(finished.finishWire);
   const live = await openSession({
     edge: self,

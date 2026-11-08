@@ -217,6 +217,36 @@ export function buildModel(lexKey: Uint8Array, padKey: Uint8Array): WordModel {
   return model;
 }
 
+/** v4 DTE (rans-v4): ONE key-independent word model (corpus rank order). Because every
+ * key parses the wire with the same model, words -> bytes is the same function for
+ * every candidate key, so re-encoding / canonicality / header / tail checks carry no
+ * key information. The sender fills virtual tail bytes and header pad bits from a
+ * CSPRNG (B1: randomized, non-canonical), so a re-encode does not even reproduce the
+ * wire under the right key. See docs/design/frame-v4-dte.md. */
+let v4Model: WordModel | null = null;
+export function buildModelV4(): WordModel {
+  if (v4Model) return v4Model;
+  const words = WORDS.slice();
+  const index = new Map<string, number>();
+  words.forEach((w, i) => index.set(w, i));
+  const base = buildModel(new Uint8Array(32), new Uint8Array(32));
+  v4Model = { ...base, words, index, padKey: new Uint8Array(32) };
+  return v4Model;
+}
+
+/** CSPRNG byte source for the v4 sender (buffered). */
+export function csprngFill(): () => number {
+  let buf = new Uint8Array(0);
+  let pos = 0;
+  return () => {
+    if (pos >= buf.length) {
+      buf = crypto.getRandomValues(new Uint8Array(256));
+      pos = 0;
+    }
+    return buf[pos++];
+  };
+}
+
 /* Header for the rANS final state. The state is not uniform (rANS states follow a
  * roughly 1/x law, and the virtual-byte count is mostly 0), so sending its raw bits
  * made the first word of every frame ~7x more likely to be the top-ranked word
@@ -246,7 +276,7 @@ function findSym(model: WordModel, slot: number): number {
 }
 
 /** rANS: bytes (>= 4) -> word symbols. Never throws. */
-export function bytesToWords(model: WordModel, data: Uint8Array, padSeed: number): string[] {
+export function bytesToWords(model: WordModel, data: Uint8Array, padSeed: number, fill?: () => number): string[] {
   if (data.length < 4) throw new Error("rANS mapping needs at least 4 bytes");
   let x = L + (((data[0] << 24) | (data[1] << 16) | (data[2] << 8) | data[3]) >>> 0);
   let pos = 4;
@@ -263,8 +293,12 @@ export function bytesToWords(model: WordModel, data: Uint8Array, padSeed: number
       else {
         // Virtual tail bytes are dropped by the receiver; fill them with keyed
         // pseudo-random bytes (zeros biased the low state bits in the header).
-        vks ??= new KeyStream(model.padKey, 1000 + (padSeed & 0xff));
-        x = x * 256 + vks.byte();
+        // v4 (fill given): CSPRNG bytes, so the tail is not a function of any key.
+        if (fill) x = x * 256 + (fill() & 0xff);
+        else {
+          vks ??= new KeyStream(model.padKey, 1000 + (padSeed & 0xff));
+          x = x * 256 + vks.byte();
+        }
         virt++;
       }
     }
@@ -274,10 +308,10 @@ export function bytesToWords(model: WordModel, data: Uint8Array, padSeed: number
   const hs = (Math.floor(x / 2 ** LOW_BITS) - 16) * 4 + virt;
   let bits = sc.code[hs].toString(2).padStart(sc.len[hs], "0");
   bits += (x % 2 ** LOW_BITS).toString(2).padStart(LOW_BITS, "0");
-  const ks = new KeyStream(model.padKey, 2 + (padSeed & 0xff));
+  const ks = fill ? null : new KeyStream(model.padKey, 2 + (padSeed & 0xff));
   const head: number[] = [];
   let acc = "";
-  const pull = (i: number) => (i < bits.length ? bits[i] : (ks.byte() & 1).toString());
+  const pull = (i: number) => (i < bits.length ? bits[i] : ((ks ? ks.byte() : fill!()) & 1).toString());
   let i = 0;
   while (i < bits.length) {
     acc += pull(i++);
@@ -445,3 +479,25 @@ export function gfWordsToBytes(model: GfModel, words: string[], byteLen: number)
 }
 
 export const CORPUS = { words: WORDS, counts: COUNTS, freqByRank: FREQ_BY_RANK, groups: GROUPS };
+
+/** Measurement helper (acceptance scripts only): the rANS header a receiver parses from a
+ * word sequence -- the coded (x >> 28, virt) symbol, the virtual-tail count and the
+ * number of header words. */
+export function headerOf(model: WordModel, words: string[]): { hs: number; virt: number; headWords: number } {
+  const sc = stateCoder();
+  let bits = "";
+  let k = 0;
+  for (const w of words) {
+    const s = model.index.get(w) ?? 0;
+    bits += model.code[s].toString(2).padStart(model.codeLen[s], "0");
+    k++;
+    for (let n = 1; n <= bits.length && n <= 40; n++) {
+      const v = sc.tree.get(treeKey(n, parseInt(bits.slice(0, n), 2)));
+      if (v !== undefined) {
+        if (bits.length >= n + LOW_BITS) return { hs: v, virt: v % 4, headWords: k };
+        break;
+      }
+    }
+  }
+  return { hs: -1, virt: -1, headWords: k };
+}

@@ -39,7 +39,7 @@ export function LexiconPanel({ session }: { session: LiveSession | null }) {
       <section className="rounded-md border border-line bg-panel p-4">
         <h2 className="text-base font-medium">本窗词表</h2>
         <p className="mt-2 text-sm text-mist">
-          握手之后这里是这把会话密钥打乱过的英文词序，大约三万词，只在频次接近的词之间换位置。它不是公开的音节表。静态按钮仍会生成旧的握手音节表，只作对照，线上帧不用它。词表来自 FrequencyWords，许可是 CC BY-SA 4.0。
+          当前会话列出的是握手用的词序：按会话密钥在相近频次里打乱，问候和应答仍用它。默认方案 K 的数据帧不用这份词序，帧词模型是公开词频表，和密钥无关。选回 rans-v3 时，数据帧才用这份打乱后的词序。静态按钮是更早的握手音节表，线上帧不用。词表来自 FrequencyWords，许可是 CC BY-SA 4.0。
         </p>
         <div className="mt-4 flex flex-wrap gap-2">
           <Btn kind={source === "session" ? "solid" : "ghost"} onClick={() => setSource("session")}>
@@ -54,7 +54,7 @@ export function LexiconPanel({ session }: { session: LiveSession | null }) {
 
       {!words ? (
         <p className="text-sm text-mist">
-          {source === "session" ? "先在隧道页完成一次握手，秘密词表才会出现。" : "静态词表还没生成。"}
+          {source === "session" ? "先在隧道页完成一次握手，握手词序才会出现。" : "静态词表还没生成。"}
         </p>
       ) : (
         <section className="rounded-md border border-line bg-panel p-4">

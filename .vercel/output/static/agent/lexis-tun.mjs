@@ -274,7 +274,7 @@ export function answerDns(packet, fakeIp, ttl = 60) {
   return Buffer.concat([header, asked, answer]);
 }
 
-export function createEngine({ dialTcp, dialUdp, emit, fakeIp = null, mtu = TUN_MTU, mss = null, oooMaxBytes = RCV_WND, oooMaxSegs = 64, oooTotalBytes = 8 << 20, log = () => undefined, udpIdleMs = 60000, udpMax = 64, timeWaitMs = 2000, finLingerMs = 60000, rtoMs = 1000, rtoMinMs = 200, rtoMaxMs = 60000, maxRetries = 7, giveUpMs = 180000, synRtoMs = 3000, dupAckThresh = 3, loopGuard = [], onLoopDrop = () => undefined }) {
+export function createEngine({ dialTcp, dialUdp, emit, fakeIp = null, mtu = TUN_MTU, mss = null, oooMaxBytes = RCV_WND, oooMaxSegs = 64, oooTotalBytes = 8 << 20, log = () => undefined, udpIdleMs = 60000, udpMax = 64, timeWaitMs = 2000, finLingerMs = 60000, rtoMs = 1000, rtoMinMs = 200, rtoMaxMs = 60000, maxRetries = 7, giveUpMs = 180000, synRtoMs = 3000, dupAckThresh = 3, loopGuard = [], onLoopDrop = () => undefined, iss = null }) {
   // 3.0.3 loop guard: packets addressed to our own peers (gates) must never be tunnelled;
   // they only show up here when the route to the peer fell back to the tun table.
   const guarded = new Set(loopGuard);
@@ -285,6 +285,8 @@ export function createEngine({ dialTcp, dialUdp, emit, fakeIp = null, mtu = TUN_
   const oooSegsCap = Math.max(0, Number(oooMaxSegs) | 0);
   const oooTotalCap = Math.max(0, Number(oooTotalBytes) || 0);
   const oooStats = { bytes: 0, segs: 0, dropped: 0, droppedBytes: 0, outOfWindow: 0 };
+  // Tests pin the initial send sequence. Production leaves this null and draws a random ISS.
+  const fixedIss = iss === null || iss === undefined ? null : Number(iss) >>> 0;
   // Flows used to be removed only on RST/error, so every gracefully closed TCP
   // connection stayed in tcpFlows (with its socket and buffers) for the life of the
   // engine. Now: both FINs exchanged and ours acked -> short TIME_WAIT, then drop;
@@ -526,7 +528,7 @@ export function createEngine({ dialTcp, dialUdp, emit, fakeIp = null, mtu = TUN_
   }
 
   function pump(flow) {
-    if (!flow.socket) return;
+    if (!flow.socket || flow.aborting) return;
     while (flow.pending.length) {
       const room = flow.peerWnd - flight(flow);
       if (room <= 0) {
@@ -676,15 +678,51 @@ export function createEngine({ dialTcp, dialUdp, emit, fakeIp = null, mtu = TUN_
     return true;
   }
 
+  // RFC 5961 §3.2: a Linux peer in a synchronized state applies RST only when
+  // SEG.SEQ equals RCV.NXT. Anything else inside the window is a challenge ACK,
+  // and a sequence outside the window is dropped. After a lossy stretch the peer's
+  // RCV.NXT is still sndUna (the next byte they have not acknowledged). sndNxt is
+  // past unacknowledged payload and an unacked FIN, so a RST there does not reset
+  // the socket. If their ACK was lost and they already have every byte we sent,
+  // RCV.NXT is sndNxt instead, so that endpoint is sent as well. Both values are
+  // sequence numbers this stack assigned; seqBefore keeps the range correct when
+  // they wrap. Retransmission does not move sndUna. A later ACK whose number lies
+  // in [sndUna, sndNxt] is the peer saying what RCV.NXT is, and one RST is repeated
+  // at that number. The ACK field stays rcvNxt (next byte we expect), including a
+  // FIN we have already taken.
+  function emitReset(flow, seqNo) {
+    emitTcp(flow, seqNo >>> 0, RST | ACK, Buffer.alloc(0));
+  }
+
+  function ackInSent(flow, ack) {
+    const a = ack >>> 0;
+    const una = flow.sndUna >>> 0;
+    const nxt = flow.sndNxt >>> 0;
+    if (a === una || a === nxt) return true;
+    return seqBefore(una, a) && seqBefore(a, nxt);
+  }
+
   function resetFlow(key, flow) {
+    if (flow.aborting) return;
+    flow.aborting = true;
     oooClear(flow);
     stopRto(flow);
     stopReo(flow);
-    emitTcp(flow, flow.sndNxt, RST | ACK, Buffer.alloc(0));
-    flow.socket?.destroy();
     if (flow.timer) clearTimeout(flow.timer);
     flow.timer = null;
-    tcpFlows.delete(key);
+    const una = flow.sndUna >>> 0;
+    const nxt = flow.sndNxt >>> 0;
+    emitReset(flow, una);
+    if (nxt !== una) emitReset(flow, nxt);
+    try {
+      flow.socket?.destroy();
+    } catch {
+      /* already closed */
+    }
+    flow.socket = null;
+    // Long enough for one challenge ACK. No data segment is sent from this state.
+    flow.timer = setTimeout(() => dropFlow(flow), 1000);
+    flow.timer.unref?.();
   }
 
   async function onTcp(ip, tcp) {
@@ -703,15 +741,15 @@ export function createEngine({ dialTcp, dialUdp, emit, fakeIp = null, mtu = TUN_
     }
     if ((tcp.flags & SYN) && !(tcp.flags & ACK)) {
       if (tcpFlows.has(key)) return;
-      const iss = seq();
+      const issSeq = fixedIss === null ? seq() : fixedIss;
       const flow = {
         key,
         src: ip.src,
         dst: ip.dst,
         sport: tcp.sport,
         dport: tcp.dport,
-        sndUna: iss,
-        sndNxt: iss,
+        sndUna: issSeq,
+        sndNxt: issSeq,
         rcvNxt: (tcp.seq + 1) >>> 0,
         peerWnd: tcp.window,
         socket: null,
@@ -725,6 +763,8 @@ export function createEngine({ dialTcp, dialUdp, emit, fakeIp = null, mtu = TUN_
         finPending: false,
         finSent: false,
         finRcvd: false,
+        aborting: false,
+        abortReplied: false,
         timeWait: false,
         timer: null,
         rtoTimer: null,
@@ -756,7 +796,7 @@ export function createEngine({ dialTcp, dialUdp, emit, fakeIp = null, mtu = TUN_
           if (tcpFlows.has(key)) resetFlow(key, flow);
         });
         socket.on("close", () => {
-          if (!tcpFlows.has(key) || flow.finSent) return;
+          if (!tcpFlows.has(key) || flow.finSent || flow.aborting) return;
           flow.finPending = true;
           pump(flow);
         });
@@ -767,7 +807,16 @@ export function createEngine({ dialTcp, dialUdp, emit, fakeIp = null, mtu = TUN_
       return;
     }
     const flow = tcpFlows.get(key);
-    if (!flow?.socket) return;
+    if (!flow) return;
+    if (flow.aborting) {
+      if ((tcp.flags & ACK) && !flow.abortReplied && ackInSent(flow, tcp.ack)) {
+        flow.abortReplied = true;
+        emitReset(flow, tcp.ack >>> 0);
+      }
+      dropFlow(flow);
+      return;
+    }
+    if (!flow.socket) return;
     const sameWnd = tcp.window === flow.peerWnd;
     if (typeof tcp.window === "number") flow.peerWnd = tcp.window;
     if (tcp.flags & ACK) {

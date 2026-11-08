@@ -21,9 +21,21 @@ rej(() => openV2({ keys, counter: 1, window: w + 1, dir: "e2g", prose: wire[0] }
 rej(() => openV2({ keys: deriveV2Keys(nextSessionKey(sk, new Uint8Array(20)), 1), counter: 1, window: w, dir: "e2g", prose: wire[0] }));
 // tamper: replace one word, drop one word, swap two words
 const words = wire[10].split(" ");
-rej(() => openV2({ keys, counter: 11, window: w, dir: "e2g", prose: [...words.slice(0, 5), "hello", ...words.slice(6)].join(" ") }));
+// (bb-v4: replace a body word; the last few tail words are malleable by design -- a
+// different wire for the same ciphertext -- see docs/design/frame-v4-bitsback.md)
+const mid = words.length >> 1;
+rej(() => openV2({ keys, counter: 11, window: w, dir: "e2g", prose: [...words.slice(0, mid), words[mid] === "hello" ? "world" : "hello", ...words.slice(mid + 1)].join(" ") }));
 rej(() => openV2({ keys, counter: 11, window: w, dir: "e2g", prose: [...words.slice(0, 5), ...words.slice(6)].join(" ") }));
 rej(() => openV2({ keys, counter: 11, window: w, dir: "e2g", prose: [words[1], words[0], ...words.slice(2)].join(" ") }));
 // wrong key
 rej(() => openV2({ keys: deriveV2Keys(Uint8Array.from(randomBytes(32))), counter: 1, window: w, dir: "e2g", prose: wire[0] }));
+// rans-v3 fallback still round-trips and keeps the canonical check
+const k3 = deriveV2Keys(sk, 0, null, "rans-v3");
+const p3 = sealV2({ keys: k3, counter: 1, window: w, dir: "e2g", plaintext: msgs[0] });
+assert.deepEqual(openV2({ keys: k3, counter: 1, window: w, dir: "e2g", prose: p3 }), msgs[0]);
+rej(() => openV2({ keys, counter: 1, window: w, dir: "e2g", prose: p3 }));
+// bb-v4 sender is randomized: the same frame twice gives two different wires, both open
+const a4 = sealV2({ keys, counter: 1, window: w, dir: "e2g", plaintext: msgs[0] }), b4 = sealV2({ keys, counter: 1, window: w, dir: "e2g", plaintext: msgs[0] });
+assert.notEqual(a4, b4);
+assert.deepEqual(openV2({ keys, counter: 1, window: w, dir: "e2g", prose: b4 }), msgs[0]);
 console.log("frame2 ok: roundtrip 50, replay/deletion/reorder/reflection/window/gen/tamper(replace,drop,swap)/wrong-key rejected");
