@@ -1,5 +1,5 @@
-/* frame.dteCheck at the agent layer: a gate whose frame.dte differs from the edge's writes exactly
- * what it writes for any valid hello (one server reply), then behaves like every other failed
+/* frame.dteCheck at the agent layer: a gate whose frame.dte differs from the edge's (within the 4.0
+ * values, same hello model) writes exactly what it writes for any valid hello (one server reply), then behaves like every other failed
  * handshake: no further byte, half-open slot released early, connection held silent until the
  * handshake deadline. The edge rejects with the key-confirmation error. */
 import assert from "node:assert/strict";
@@ -48,5 +48,19 @@ const m = Number(r.gr.split("@")[1]);
 assert.ok(/握手超时/.test(r.gr) && m >= W - 20 && m < W + 300, `held to deadline ${r.gr}`);
 assert.equal(halfOpen.earlyReleased, early + 1);
 assert.equal(halfOpen.total, 0); assert.equal(halfOpen.silent, 0);
-setFrameOptions({ dte: "bb-k-v4" });
-console.log(`dte-silent ok: mismatch -> edge "${r.er}", gate 1 write, slot released early, silent until ${m} ms (deadline ${W})`);
+// bb-k-v4s (default) vs bb-k-v4 (explicit fallback): the hello word models differ, so the gate cannot
+// admit the hello and writes NOTHING (same as a bad token), holds the connection silent to the
+// deadline; the edge never gets a server reply and fails its handshake. Both directions.
+const s2: string[] = [];
+for (const [ed, gd] of [["bb-k-v4s", "bb-k-v4"], ["bb-k-v4", "bb-k-v4s"]]) {
+  const early2 = halfOpen.earlyReleased;
+  const r2 = await run(ed, gd);
+  assert.ok(r2.er.startsWith("fail"), `edge must fail ${ed}/${gd}: ${r2.er}`);
+  assert.equal(r2.writes, 0, `gate wrote nothing ${ed}/${gd}`);
+  const m2 = Number(r2.gr.split("@")[1]);
+  assert.ok(/握手超时/.test(r2.gr) && m2 >= W - 20 && m2 < W + 300, `held to deadline ${r2.gr}`);
+  assert.equal(halfOpen.total, 0); assert.equal(halfOpen.silent, 0);
+  s2.push(`${ed}->${gd}: edge "${r2.er}", gate 0 writes, silent until ${m2} ms, early release +${halfOpen.earlyReleased - early2}`);
+}
+setFrameOptions({ dte: "bb-k-v4s" });
+console.log(`dte-silent ok: mismatch -> edge "${r.er}", gate 1 write, slot released early, silent until ${m} ms (deadline ${W}); ${s2.join("; ")}`);

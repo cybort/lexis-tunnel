@@ -8,5 +8,10 @@ This repository includes third-party material:
   (copies shipped with the agent: public/agent/NOTICE-vocab.txt,
    public/agent/LICENSE-vocab-CC-BY-SA-4.0.txt)
 
+- Allowed English word set (src/lib/lexis/v2/vocab-allowed.ts, frame.dte bb-k-v4s, bundled
+  into public/agent/lexis-frame.mjs): adapted from the same FrequencyWords list, CC BY-SA 4.0.
+  Attribution and the list of modifications: src/lib/lexis/v2/vocab-allowed.NOTICE.md
+  (copy shipped with the agent: appended to public/agent/NOTICE-vocab.txt)
+
 - HCTR2 test vectors (src/lib/lexis/v2/vectors/): Apache-2.0,
   see src/lib/lexis/v2/vectors/README.md.

@@ -25,7 +25,12 @@ export const useProfile = create<ProfileState>()(
       name: "lexis-profile-v1",
       storage: createJSONStorage(() => localStorage),
       skipHydration: true,
-      version: 1,
+      version: 2,
+      migrate: (persisted, version) => {
+        const state = persisted as { profile?: { frame?: { dte?: string } } } | undefined;
+        if (version < 2 && state?.profile?.frame?.dte === "bb-k-v4") state.profile.frame.dte = "bb-k-v4s";
+        return persisted;
+      },
       partialize: (state) => ({ profile: persistedProfile(state.profile) }),
       merge: (persisted, current) => {
         const saved = persisted as Partial<ProfileState> | undefined;

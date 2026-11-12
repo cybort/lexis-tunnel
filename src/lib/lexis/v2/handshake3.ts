@@ -25,10 +25,10 @@ import { clampKdf, decodeKdf, deriveSessionKeyAsync, encodeKdf, featureByte, typ
 import { SPEC } from "../spec";
 import type { MeshNode } from "../types";
 import { elligatorKeyPair, sharedFromPub, sharedFromRep, type EphemeralKey } from "./elligator";
-import { constantTimeEqual, deriveV2Keys, getDefaultDte, type V2Keys } from "./frame2";
+import { constantTimeEqual, deriveV2Keys, getDefaultDte, isV4s, type V2Keys } from "./frame2";
 import { x25519 } from "@noble/curves/ed25519.js";
 import { hctr2Decrypt, hctr2Encrypt, hctr2Key } from "./hctr2";
-import { buildModel, bytesToWords, wordsToBytes, type WordModel } from "./model";
+import { buildModel, buildModelS, bytesToWords, wordsToBytes, type WordModel } from "./model";
 
 const enc = new TextEncoder();
 export class HandshakeDrop extends Error {}
@@ -46,13 +46,19 @@ function unb64(s: string): Uint8Array {
 }
 
 const modelCache = new Map<string, WordModel>();
+/** Hello / server-reply word model, keyed by wordsIkm (token || 0 || gate long-term key; parseable
+ * by anyone holding both, does not protect the body). frame.dte = bb-k-v4s builds it over the
+ * allowed set (same HKDF labels); every other dte keeps the public 32768 corpus unchanged, so an
+ * explicit bb-k-v4 / rans-v3 end still talks to 4.0 / 3.0.x. A bb-k-v4s end and an end on any
+ * other dte therefore cannot parse each other's hello: the gate drops it like a bad token. */
 function helloModel(ikm: Uint8Array): WordModel {
-  const id = hex(sha256(ikm));
+  const s = isV4s(getDefaultDte());
+  const id = (s ? "s:" : "") + hex(sha256(ikm));
   let m = modelCache.get(id);
   if (!m) {
     const lex = hkdf(sha256, ikm, enc.encode("lexis-v3-hello"), enc.encode("lex"), 32);
     const pad = hkdf(sha256, ikm, enc.encode("lexis-v3-hello"), enc.encode("pad"), 32);
-    m = buildModel(lex, pad);
+    m = s ? buildModelS(lex, pad) : buildModel(lex, pad);
     if (modelCache.size > 16) modelCache.clear();
     modelCache.set(id, m);
   }

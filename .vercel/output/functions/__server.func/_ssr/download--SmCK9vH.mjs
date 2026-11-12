@@ -1,7 +1,7 @@
 import { i as __toESM } from "../_runtime.mjs";
 import { q as require_react, x as require_jsx_runtime, y as Link } from "../_libs/@tanstack/react-router+[...].mjs";
 import { i as Smartphone, o as Monitor, r as Terminal } from "../_libs/lucide-react.mjs";
-//#region node_modules/.nitro/vite/services/ssr/assets/download-BXJw-h2C.js
+//#region node_modules/.nitro/vite/services/ssr/assets/download--SmCK9vH.js
 var import_react = /* @__PURE__ */ __toESM(require_react());
 var import_jsx_runtime = require_jsx_runtime();
 var CARDS = [
@@ -18,7 +18,7 @@ var CARDS = [
 		title: "Linux",
 		icon: Terminal,
 		resident: "systemd 用户服务，断了自己拉起",
-		listen: "固定端口。redirect / tproxy 读原始目的，虚拟网卡要 root。公网 IPv6 默认不可达",
+		listen: "固定端口。redirect（TCP REDIRECT + UDP TPROXY）/ tproxy 读原始目的，缺 TPROXY 时拒绝系统接管，虚拟网卡要 root。公网 IPv6 默认在 redirect、tproxy、虚拟网卡下都不可达，应用回落 IPv4；IPv6 不经隧道",
 		process: "从 /proc 认出程序名"
 	},
 	{
@@ -85,7 +85,7 @@ function DownloadPage() {
 					children: [
 						/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("p", {
 							className: "font-mono text-xs text-sage",
-							children: ["LEXIS ", manifest?.version ?? "4.0.0"]
+							children: ["LEXIS ", manifest?.version ?? "4.1.0"]
 						}),
 						/* @__PURE__ */ (0, import_jsx_runtime.jsx)("h2", {
 							className: "mt-2 text-2xl font-bold",
@@ -93,7 +93,7 @@ function DownloadPage() {
 						}),
 						/* @__PURE__ */ (0, import_jsx_runtime.jsx)("p", {
 							className: "mt-2 max-w-2xl text-sm text-mist",
-							children: "安装包是 4.0.0，默认 bb-k-v4（方案 K），和这页演示是同一套帧。和 3.0.x 默认不互通。要和仍跑 3.0.x 的一端互通，这一端要显式选 rans-v3 并关闭 frame.dteCheck，只改词编码不够。两端都是 4.0 时仍建议开着检查。TLS 和 WebSocket 只做外层。安装包不带 TLS 私钥。长期密钥是 X25519，旧的 P-256 身份对不上。握手口令两端相同，至少 128 比特，可以用常驻进程的 --gen-token 生成。半开按网段计，默认全局 512、连接上限 1024。虚拟网卡只认 IPv4，公网 IPv6 默认不可达。未确认的段会按超时重发，乱序可以留多段。没有在这台机器上证明虚拟网卡已经接住流量。Windows 的 WinDivert 和 Android 的系统 VPN 只有源码。中继和出口都要逐个节点打开。需要 Node.js 22。"
+							children: "安装包是 4.1.0，默认 bb-k-v4s，和这页演示是同一套帧。和 4.0 的 bb-k-v4 不互通，混用在问候阶段就失败关闭，关掉检查也没用。要和 4.0 互通，两端都显式选 bb-k-v4。要和仍跑 3.0.x 的一端互通，这一端要再选 rans-v3 并关闭 frame.dteCheck，只改词编码不够。两端都是 4.1 时仍建议开着检查。TLS 和 WebSocket 只做外层。安装包不带 TLS 私钥。长期密钥是 X25519，旧的 P-256 身份对不上。握手口令两端相同，至少 128 比特，可以用常驻进程的 --gen-token 生成。半开按网段计，默认全局 512、连接上限 1024。三种系统接管都只送 IPv4，公网 IPv6 默认不可达。Linux 上会尝试把本机 53 端口接到自带的 DNS 服务，装不齐就整段回滚。未确认的段会按超时重发，乱序可以留多段。没有在这台机器上证明虚拟网卡或透明代理已经接住流量。Windows 的 WinDivert 和 Android 的系统 VPN 只有源码。中继和出口都要逐个节点打开。需要 Node.js 22。"
 						})
 					]
 				}),

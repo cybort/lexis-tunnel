@@ -65,6 +65,7 @@ export function ConfigPanel() {
   const [covering, setCovering] = useState(false);
   const [a1Ask, setA1Ask] = useState(false);
   const [tunDraft, setTunDraft] = useState<Partial<Record<"mtu" | "mss" | "oooMaxBytes" | "oooMaxSegs" | "oooTotalBytes", string>>>({});
+  const commonDtes = ["bb-k-v4s", "bb-k-v4", "rans-v3"] as const;
   const experimentalDtes = ["bb-v4", "bb-c8-v4", "bb-ou-v4", "bb-ouc8-v4", "bb-ouc8r-v4", "dfa-v4"] as const;
   const dteExperimental = experimentalDtes.includes(profile.frame.dte as (typeof experimentalDtes)[number]);
   function setFrame(partial: Partial<LexisProfile["frame"]>) {
@@ -227,7 +228,7 @@ export function ConfigPanel() {
           压缩不靠这份配置在对端对齐。明文第一个字节是类型：0 是原文，1 是 zstd 帧。等级决定窗口，窗口写在帧头里，对端解开以后自己读。比原文更大时这一帧会改回类型 0。
         </p>
         <p className="mt-2 text-sm text-mist">
-          蜜文只挡对长期私钥和口令的暴力猜测，不挡已经拿到候选会话密钥的人。默认方案 K 的词模型公开，密钥参与尾部；重封对得上只说明这把密钥能生成这条尾，不能证明帧来自对端。错钥的蜜文视图仍是一句格式合法的词，检查不在那条路径上。旧的 rans-v3 才用词序重编码确认密钥：对的密钥几乎总能对上，错的大约 2%–3%。握手确认用临时密钥的共享秘密来算。两端的蜜文开关要写成一样，它会进入会话密钥。封面系数仍按旧的句式封存，线上帧不用这句式。长期私钥的封存在节点页。这一版和 2.0 及更早的对端对不上。
+          蜜文只挡对长期私钥和口令的暴力猜测，不挡已经拿到候选会话密钥的人。默认 bb-k-v4s 的允许词表全体会话共用，会话密钥只在频次相近的组里改词序，同组频次相同，打乱不改变出现概率。密钥仍参与尾部；重封对得上只说明这把密钥能生成这条尾，不能证明帧来自对端。错钥的蜜文视图仍是一句格式合法的词，检查不在那条路径上。回退到 bb-k-v4 时词模型公开、不随密钥改词序。旧的 rans-v3 才用词序重编码确认密钥：对的密钥几乎总能对上，错的大约 2%–3%。握手确认用临时密钥的共享秘密来算。两端的蜜文开关要写成一样，它会进入会话密钥。封面系数仍按旧的句式封存，线上帧不用这句式。长期私钥的封存在节点页。这一版和 2.0 及更早的对端对不上。
         </p>
         <div className="mt-4 grid gap-3 sm:grid-cols-3">
           <Field label="Argon2 内存 KiB">
@@ -337,7 +338,7 @@ export function ConfigPanel() {
       <section className="rounded-md border border-line bg-panel p-4">
         <h2 className="text-base font-medium">链路</h2>
         <p className="mt-2 text-sm text-mist">
-          控制台和安装包都是 4.0.0，默认 bb-k-v4。和 3.0.x 默认不互通。握手是 X25519，问候用临时密钥和闸门长期公钥的共享秘密加密。默认把词编码绑进密钥确认，两端必须相同。TCP、TLS、WebSocket 只负责协议和头，用来过 CDN。路径默认 /lexis。CDN 若自己终结 TLS，源站可以听 WebSocket。
+          控制台和安装包都是 4.1.0，默认 bb-k-v4s。和 4.0 的 bb-k-v4 不互通，混用在问候阶段就失败关闭，关掉检查也没用。和 3.0.x 默认也不互通。握手是 X25519，问候用临时密钥和闸门长期公钥的共享秘密加密。默认把词编码绑进密钥确认，两端必须相同。TCP、TLS、WebSocket 只负责协议和头，用来过 CDN。路径默认 /lexis。CDN 若自己终结 TLS，源站可以听 WebSocket。
         </p>
         <p className="mt-2 text-sm text-mist">
           一条会话上可以开多路。打开写成 tcp 主机 端口、udp 主机 端口、relay 节点 再接后面的命令，或 expose 服务名。中继和出口都要逐个节点打开。暴露不能经中继绕过去。跳数到 4 就停。慢的那一路只堵住自己。SOCKS 的用户名和密码留空就是不认证，HTTP 代理共用这一对。
@@ -467,6 +468,14 @@ export function ConfigPanel() {
               onChange={(e) => patch({ link: { ...profile.link, udpIdleMs: Math.round(Number(e.target.value) * 1000) } })}
             />
           </Field>
+          <Field label="UDP 关联空闲（秒）">
+            <input
+              className={control}
+              inputMode="numeric"
+              value={Math.round(profile.link.udpAssociateIdleMs / 1000)}
+              onChange={(e) => patch({ link: { ...profile.link, udpAssociateIdleMs: Math.round(Number(e.target.value) * 1000) } })}
+            />
+          </Field>
           <Field label="UDP 路数">
             <input
               className={control}
@@ -477,7 +486,7 @@ export function ConfigPanel() {
           </Field>
         </div>
         <p className="mt-2 text-sm text-mist">
-          握手口令在 Argon2 之前参与问候。估约 {estimateTokenBits(profile.link.token.trim())} bit，需要至少 128。两端写成同一个。手写短口令会被常驻进程拒绝。半开按网段计，IPv4 默认 /24，IPv6 默认 /64，写成 32 和 128 就回到按单个地址。校验失败会马上让出名额，连接仍等到握手超时再关，外面看不出差别。一个字节都没有的连接，到首字节超时也会让出名额，晚到的字节不再处理。静默连接超过上限才会马上关掉，这是外面能看出来的。半开中的连接也占连接上限，所以连接上限要大于半开上限。新配置默认 1024 和 512。旧配置里写死 128 的，要自己改大。校验关掉时，外层 TLS 认不出对端，正式部署请换自己的证书。
+          UDP 关联空闲只作用于 SOCKS UDP ASSOCIATE 的控制连接：合法 UDP 活动续命，无活动按本值回收。它不改变其它连接的空闲超时。握手口令在 Argon2 之前参与问候。估约 {estimateTokenBits(profile.link.token.trim())} bit，需要至少 128。两端写成同一个。手写短口令会被常驻进程拒绝。半开按网段计，IPv4 默认 /24，IPv6 默认 /64，写成 32 和 128 就回到按单个地址。校验失败会马上让出名额，连接仍等到握手超时再关，外面看不出差别。一个字节都没有的连接，到首字节超时也会让出名额，晚到的字节不再处理。静默连接超过上限才会马上关掉，这是外面能看出来的。半开中的连接也占连接上限，所以连接上限要大于半开上限。新配置默认 1024 和 512。旧配置里写死 128 的，要自己改大。校验关掉时，外层 TLS 认不出对端，正式部署请换自己的证书。
         </p>
         <div className="mt-4 rounded-sm bg-panel-2 p-3">
           <p className="text-sm text-mist">本机身份</p>
@@ -648,7 +657,7 @@ export function ConfigPanel() {
             <select
               className={control}
               aria-label="词编码"
-              value={profile.frame.dte === "bb-k-v4" || profile.frame.dte === "rans-v3" ? profile.frame.dte : "experimental"}
+              value={(commonDtes as readonly string[]).includes(profile.frame.dte) ? profile.frame.dte : "experimental"}
               onChange={(e) => {
                 const dte = e.target.value;
                 if (dte === "experimental") return;
@@ -656,7 +665,8 @@ export function ConfigPanel() {
                 setFrame({ dte });
               }}
             >
-              <option value="bb-k-v4">bb-k-v4 · 方案 K（默认）</option>
+              <option value="bb-k-v4s">bb-k-v4s · 允许词表，组内打乱（默认）</option>
+              <option value="bb-k-v4">bb-k-v4 · 4.0 方案 K，显式回退</option>
               <option value="rans-v3">rans-v3 · 3.0 数据帧</option>
               {dteExperimental ? (
                 <option value="experimental">当前是实验编码 {profile.frame.dte}</option>
@@ -676,11 +686,14 @@ export function ConfigPanel() {
           </Field>
         </div>
         <p className="mt-2 text-sm text-mist">
-          默认方案 K：密钥派生尾部并重封校验。两端必须相同，线上不协商。和 3.0.x 互通要同时选 rans-v3 并关闭检查。只改词编码不够。两端都是 4.0 时仍建议开着检查。检查开着时，对不上则内网端确认失败后关连接，闸门只回一次应答，放出半开名额后静默到超时，不会立刻回错。线格式不变。改词编码或检查会使浏览器里的旧会话作废。
+          默认 bb-k-v4s：方案 K 的带钥尾，词表是全体会话共用的允许词表，会话密钥只在频次相近的组内打乱，同组频次相同。和 bb-k-v4 不互通，混用在问候阶段失败关闭，关掉检查也没用。要和 4.0 互通，两端都选 bb-k-v4。和 3.0.x 互通要同时选 rans-v3 并关闭检查，只改词编码不够。两端都是 4.1 时仍建议开着检查。检查开着、且不是 bb-k-v4s 混用时，对不上则内网端确认失败后关连接，闸门只回一次应答，放出半开名额后静默到超时，不会立刻回错。bb-k-v4s 和别的词编码混用时，闸门认不出问候，一个字节都不回。线格式不变。改词编码或检查会使浏览器里的旧会话作废。浏览器里以前存过的方案 K 会在这次打开时换成 bb-k-v4s。
         </p>
         <div className="mt-3 flex flex-wrap gap-2">
+          <Btn kind="ghost" onClick={() => { setA1Ask(false); setFrame({ dte: "bb-k-v4s", dteCheck: true }); }}>
+            回到默认
+          </Btn>
           <Btn kind="ghost" onClick={() => { setA1Ask(false); setFrame({ dte: "bb-k-v4", dteCheck: true }); }}>
-            回到方案 K
+            填成 4.0 回退
           </Btn>
           <Btn kind="ghost" onClick={() => { setA1Ask(false); setFrame({ dte: "rans-v3", dteCheck: false }); }}>
             填成 3.0 兼容
@@ -855,7 +868,7 @@ export function ConfigPanel() {
           {profile.mode === "system-forward" ? "客户端启动时会按当前系统写出并尝试执行。" : "现在走固定端口。这些参数会跟着配置走，切到系统接管才生效。"}
         </p>
         <div className="mt-4 grid gap-3 lg:grid-cols-3">
-          <Platform title="Linux" body="redirect、tproxy 或虚拟网卡。需要 root 才会改规则。虚拟网卡只认 IPv4。公网 IPv6 默认不可达，回环、链路本地、ULA 和组播仍走原来的路由。选「不动」则不把 IPv6 送进隧道，并撤掉本程序自己加过的公网 IPv6 不可达规则。没有在这台机器上证明规则已经接住流量。">
+          <Platform title="Linux" body="redirect、tproxy 或虚拟网卡。需要 root 才会改规则。redirect 是混合方式：TCP 用 REDIRECT，UDP 走 TPROXY，UDP 不再直连。redirect 和 tproxy 都要 TPROXY（nft 或 iptables）和透明 UDP；缺了就拒绝系统接管、不装规则，可改用虚拟网卡，两者都不行则这台机器无法系统接管。三种方法都只把 IPv4 接进隧道，IPv6 不经隧道。DNS：系统接管时，启动先在 127.0.0.1 和 ::1 起本机 DNS 服务（UDP 和 TCP），再把本机所有 TCP/UDP 53（IPv4 和 IPv6，含写死的 1.1.1.1、8.8.8.8 和路由器、内网等私网 DNS）劫持过去，两个选项都一样。「本机 DNS 接管（假地址）」A 记录回假地址；「不回假地址，按规则转发」时本机服务把全部查询按规则转发给上游（默认 1.1.1.1，经隧道），不直连原来的解析器。服务、劫持或任何一条规则没装成就整体拒绝系统接管、撤掉已装的规则，状态页显示拒绝接管。默认「公网 IPv6 不可达」：公网 IPv6 在 redirect、tproxy、虚拟网卡下都设为不可达，应用会回落 IPv4；回环、链路本地、ULA、组播、对端的 IPv6 地址和本程序带旁路标记的连接仍走原来的路由。选「不处理 IPv6」则 IPv6 直接走本机网络，不经隧道，并撤掉本程序自己加过的 IPv6 规则。没有在这台机器上证明规则已经接住流量。">
             <select className={control} value={profile.linux.method} onChange={(e) => patch({ linux: { ...profile.linux, method: e.target.value as LexisProfile["linux"]["method"] } })}>
               <option value="redirect">redirect</option>
               <option value="tproxy">tproxy</option>
@@ -863,9 +876,14 @@ export function ConfigPanel() {
             </select>
             <select className={control} aria-label="公网 IPv6" value={profile.linux.ipv6 === "off" ? "off" : "block"} onChange={(e) => patch({ linux: { ...profile.linux, ipv6: e.target.value === "off" ? "off" : "block" } })}>
               <option value="block">公网 IPv6 不可达</option>
-              <option value="off">不把 IPv6 送进隧道</option>
+              <option value="off">不处理 IPv6（直连，不经隧道）</option>
             </select>
             <input className={control} aria-label="fwmark" inputMode="numeric" value={profile.linux.mark} onChange={(e) => patch({ linux: { ...profile.linux, mark: Number(e.target.value) } })} />
+            <select className={control} aria-label="DNS" value={profile.linux.dnsRedirect ? "on" : "off"} onChange={(e) => patch({ linux: { ...profile.linux, dnsRedirect: e.target.value === "on" } })}>
+              <option value="on">本机 DNS 接管（假地址）</option>
+              <option value="off">不回假地址，本机服务按规则转发</option>
+            </select>
+            <input className={control} aria-label="本机 DNS 端口（0 为自动）" inputMode="numeric" value={profile.linux.dnsPort} onChange={(e) => patch({ linux: { ...profile.linux, dnsPort: Number(e.target.value) } })} />
           </Platform>
           <Platform title="Windows" body="portproxy 只绑回环。WinDivert 只有源码，驱动不在包里，选了也不会改系统流量。">
             <select className={control} value={profile.windows.method} onChange={(e) => patch({ windows: { ...profile.windows, method: e.target.value as LexisProfile["windows"]["method"] } })}>

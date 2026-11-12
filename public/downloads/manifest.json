@@ -1,20 +1,20 @@
 {
-  "version": "4.0.0",
+  "version": "4.1.0",
   "files": {
     "linux": {
       "file": "lexis-linux.zip",
-      "bytes": 420022,
-      "sha256": "7932bf03e654957879984b20e2bbed908167d066e898447a244275c949bf7e7a"
+      "bytes": 648663,
+      "sha256": "a7f547725abaad685f7ca00b66328455e1b43d12715037a36c88a7e14b7f5151"
     },
     "windows": {
       "file": "lexis-windows.zip",
-      "bytes": 410932,
-      "sha256": "7d0d4848186b25132b00dc7e0f79e48cc0c7c16a75fb7aa2fe9523eb1004b735"
+      "bytes": 634808,
+      "sha256": "d1dd5f35ec5bcdb07dee4d13763982327db1e705a5fea95023616be07d21e7a8"
     },
     "android": {
       "file": "lexis-android.zip",
-      "bytes": 410195,
-      "sha256": "b78c886aea62be7f9a9df00ef6f21de288d7a578172f0b32f027c9e5abebef2f"
+      "bytes": 634070,
+      "sha256": "b98a3fe69b3cf27254724453c586ba8dd4b0e665df8b48b6ed819ccefc9f9b54"
     }
   }
 }

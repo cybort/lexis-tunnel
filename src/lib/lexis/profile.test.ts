@@ -89,9 +89,11 @@ assert.equal(profileIssues(normalizeProfile({ role: "edge", statusHost: "0.0.0.0
 assert.equal(defaultProfile().frame.maxExpansion, 5);
 assert.equal(defaultProfile().frame.smallFramePolicy, "expansion");
 assert.equal(defaultProfile().frame.coalesceTarget, 1024);
-assert.equal(defaultProfile().frame.dte, "bb-k-v4");
+assert.equal(defaultProfile().frame.dte, "bb-k-v4s");
 assert.equal(defaultProfile().frame.dteCheck, true);
 assert.equal(defaultProfile().link.udpIdleMs, 60000);
+assert.equal(defaultProfile().link.udpAssociateIdleMs, 120000);
+assert.equal(defaultProfile().link.idleMs, 120000);
 assert.equal(defaultProfile().link.udpMax, 64);
 assert.equal(defaultProfile().link.maxHalfOpen, 512);
 assert.equal(defaultProfile().link.halfOpenPrefixV4, 24);
@@ -103,7 +105,8 @@ const framed = normalizeProfile({ frame: { maxExpansion: 99, smallFramePolicy: "
 assert.equal(framed.frame.maxExpansion, 5);
 assert.equal(framed.frame.smallFramePolicy, "honey");
 assert.equal(framed.frame.coalesceTarget, 1024);
-assert.equal(framed.frame.dte, "bb-k-v4");
+assert.equal(framed.frame.dte, "bb-k-v4s");
+assert.equal(normalizeProfile({ frame: { dte: "bb-k-v4" } }).frame.dte, "bb-k-v4"); // explicit fallback kept
 assert.equal(framed.frame.dteCheck, true);
 const dteRound = normalizeProfile({ frame: { dte: "rans-v3", dteCheck: false } });
 assert.equal(dteRound.frame.dte, "rans-v3");
@@ -116,6 +119,12 @@ try { normalizeProfile({ frame: { dte: "nope-v9" } }); } catch { unknownDte = tr
 assert.equal(unknownDte, true);
 assert.equal(framed.link.udpIdleMs, 60000);
 assert.equal(framed.link.udpMax, 64);
+assert.equal(normalizeProfile({ link: { udpAssociateIdleMs: 5000 } }).link.udpAssociateIdleMs, 5000);
+assert.equal(normalizeProfile({ link: { udpAssociateIdleMs: 5000 } }).link.idleMs, 120000);
+assert.equal(normalizeProfile({ link: { idleMs: 5000 } }).link.udpAssociateIdleMs, 120000);
+assert.equal(normalizeProfile({ link: { idleMs: 5000 } }).link.idleMs, 5000);
+assert.equal(normalizeProfile({ link: { udpAssociateIdleMs: 50 } }).link.udpAssociateIdleMs, 120000);
+assert.equal(normalizeProfile({ link: { udpAssociateIdleMs: 600001 } }).link.udpAssociateIdleMs, 120000);
 assert.ok(estimateTokenBits(mintHandshakeToken()) >= 128);
 const weakJoin = normalizeProfile({
   role: "gate",
@@ -143,6 +152,12 @@ assert.equal(defaultProfile().linux.ipv6, "block");
 assert.equal(normalizeProfile({ linux: { method: "tun" } }).linux.ipv6, "block");
 assert.equal(normalizeProfile({ linux: { method: "tun", ipv6: "off" } }).linux.ipv6, "off");
 assert.equal(normalizeProfile({ linux: { method: "tun", ipv6: "yes" } as never }).linux.ipv6, "block");
+// U2 linux.dnsPort: default 0 (auto), 1..65535 kept, anything else back to 0; dnsRedirect default true
+assert.equal(defaultProfile().linux.dnsPort, 0);
+assert.equal(normalizeProfile({ linux: { method: "tun", dnsPort: 5353 } }).linux.dnsPort, 5353);
+assert.equal(normalizeProfile({ linux: { method: "tun", dnsPort: 70000 } }).linux.dnsPort, 0);
+assert.equal(normalizeProfile({ linux: { method: "tun" } }).linux.dnsRedirect, true);
+assert.equal(normalizeProfile({ linux: { method: "tun", dnsRedirect: false } }).linux.dnsRedirect, false);
 
 // 3.0.4 tun: MSS override only when in range; zero caps are kept
 assert.equal(defaultProfile().tun.mtu, 1500);

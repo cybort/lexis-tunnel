@@ -425,7 +425,10 @@ async function main() {
     };
     const remote = await waitRemote();
     assert.ok(remote);
-    assert.equal(addon.originalDest(remote._handle.fd), null);
+    // SO_ORIGINAL_DST on a connection nothing rewrote: null when conntrack does not track it
+    // (fresh netns), else conntrack's original tuple, i.e. the real local destination.
+    const orig = addon.originalDest(remote._handle.fd);
+    if (orig !== null) assert.deepEqual(orig, { host: "127.0.0.1", port: probe.address().port });
     assert.throws(() => addon.listenTransparent(1), /IP_TRANSPARENT/);
     assert.throws(() => addon.listenTransparentUdp(1), /IP_TRANSPARENT/);
     assert.throws(() => addon.markFd(remote._handle.fd, 255), /SO_MARK/);

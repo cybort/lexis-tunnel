@@ -39,7 +39,7 @@ export function LexiconPanel({ session }: { session: LiveSession | null }) {
       <section className="rounded-md border border-line bg-panel p-4">
         <h2 className="text-base font-medium">本窗词表</h2>
         <p className="mt-2 text-sm text-mist">
-          当前会话列出的是握手用的词序：按会话密钥在相近频次里打乱，问候和应答仍用它。默认方案 K 的数据帧不用这份词序，帧词模型是公开词频表，和密钥无关。选回 rans-v3 时，数据帧才用这份打乱后的词序。静态按钮是更早的握手音节表，线上帧不用。词表来自 FrequencyWords，许可是 CC BY-SA 4.0。
+          当前会话列出的是这一把密钥下的词序。默认 bb-k-v4s 用全体会话共用的允许词表，会话密钥只在频次相近的组内打乱；数据帧和结束握手用会话密钥，问候用另一把派生，两者都含全部允许词。词的出现概率不随打乱改变。选回 bb-k-v4 时，数据帧用公开词频表，不读这份词序。选回 rans-v3 时，数据帧才用这份打乱后的词序。静态按钮是更早的握手音节表，线上帧不用。词表来自 FrequencyWords，许可是 CC BY-SA 4.0。去掉的整词可以和上游对比出来，不是秘密。
         </p>
         <div className="mt-4 flex flex-wrap gap-2">
           <Btn kind={source === "session" ? "solid" : "ghost"} onClick={() => setSource("session")}>

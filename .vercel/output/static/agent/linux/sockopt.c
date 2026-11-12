@@ -1,5 +1,8 @@
 /* Linux helpers: IP_TRANSPARENT, SO_ORIGINAL_DST, SO_MARK, TUN, UDP tproxy.
  * SO_MARK is set here. Connecting and waiting stay in Node so the process is not blocked.
+ * U1b: transparent UDP replies leave from a socket bound (IP_TRANSPARENT / IPV6_TRANSPARENT)
+ * to the original destination ip:port, so connect()ed clients accept them. Senders are cached
+ * per source address (REPLY_SLOTS, LRU) and closed after REPLY_IDLE_MS without use.
  */
 #define NAPI_VERSION 8
 #define NODE_GYP_MODULE_NAME lexis_sockopt
@@ -14,6 +17,7 @@
 #include <string.h>
 #include <sys/ioctl.h>
 #include <sys/socket.h>
+#include <time.h>
 #include <unistd.h>
 #include <linux/if.h>
 #include <linux/if_tun.h>
@@ -31,6 +35,18 @@
 #ifndef IP_PKTINFO
 #define IP_PKTINFO 8
 #endif
+#ifndef IPV6_TRANSPARENT
+#define IPV6_TRANSPARENT 75
+#endif
+#ifndef IPV6_RECVORIGDSTADDR
+#define IPV6_RECVORIGDSTADDR 74
+#endif
+#ifndef IPV6_ORIGDSTADDR
+#define IPV6_ORIGDSTADDR 74
+#endif
+
+#define REPLY_SLOTS 64
+#define REPLY_IDLE_MS 30000
 
 typedef struct {
   uv_poll_t poll;
@@ -70,6 +86,150 @@ static napi_value fd_value(napi_env env, int fd) {
   napi_value out;
   napi_create_int32(env, fd, &out);
   return out;
+}
+
+static int set_transparent(int fd, int family) {
+  int one = 1;
+  if (family == AF_INET6) return setsockopt(fd, SOL_IPV6, IPV6_TRANSPARENT, &one, sizeof(one));
+  return setsockopt(fd, SOL_IP, IP_TRANSPARENT, &one, sizeof(one));
+}
+
+/* Text address + port -> sockaddr. IPv4 first, then IPv6. Returns the family or -1. */
+static int parse_addr(const char *host, int port, struct sockaddr_storage *out, socklen_t *len) {
+  memset(out, 0, sizeof(*out));
+  if (port < 0 || port > 65535) return -1;
+  struct sockaddr_in *v4 = (struct sockaddr_in *)out;
+  if (inet_pton(AF_INET, host, &v4->sin_addr) == 1) {
+    v4->sin_family = AF_INET;
+    v4->sin_port = htons((uint16_t)port);
+    *len = sizeof(*v4);
+    return AF_INET;
+  }
+  struct sockaddr_in6 *v6 = (struct sockaddr_in6 *)out;
+  memset(out, 0, sizeof(*out));
+  if (inet_pton(AF_INET6, host, &v6->sin6_addr) == 1) {
+    v6->sin6_family = AF_INET6;
+    v6->sin6_port = htons((uint16_t)port);
+    *len = sizeof(*v6);
+    return AF_INET6;
+  }
+  return -1;
+}
+
+static void addr_text(const struct sockaddr_storage *ss, char *host, size_t size, int *port) {
+  if (ss->ss_family == AF_INET6) {
+    const struct sockaddr_in6 *v6 = (const struct sockaddr_in6 *)ss;
+    inet_ntop(AF_INET6, &v6->sin6_addr, host, (socklen_t)size);
+    *port = ntohs(v6->sin6_port);
+  } else if (ss->ss_family == AF_INET) {
+    const struct sockaddr_in *v4 = (const struct sockaddr_in *)ss;
+    inet_ntop(AF_INET, &v4->sin_addr, host, (socklen_t)size);
+    *port = ntohs(v4->sin_port);
+  }
+}
+
+/* Reply senders: one unconnected UDP socket per spoofed source ip:port.
+ * Unconnected on purpose: nf_tproxy's established lookup skips unconnected sockets, so new
+ * client packets to that ip:port still reach the transparent listener, never these senders. */
+typedef struct {
+  int fd; /* -1 = free */
+  struct sockaddr_storage addr;
+  socklen_t len;
+  uint64_t used;
+} ReplySlot;
+
+static ReplySlot reply_slots[REPLY_SLOTS];
+static int reply_ready = 0;
+static uint64_t reply_opened = 0;
+static uint64_t reply_evicted = 0;
+static uint64_t reply_expired = 0;
+
+static uint64_t now_ms(void) {
+  struct timespec ts;
+  clock_gettime(CLOCK_MONOTONIC, &ts);
+  return (uint64_t)ts.tv_sec * 1000u + (uint64_t)ts.tv_nsec / 1000000u;
+}
+
+static void reply_init(void) {
+  if (reply_ready) return;
+  for (int i = 0; i < REPLY_SLOTS; i++) reply_slots[i].fd = -1;
+  reply_ready = 1;
+}
+
+static void reply_drop(int i) {
+  if (reply_slots[i].fd >= 0) close(reply_slots[i].fd);
+  reply_slots[i].fd = -1;
+}
+
+static void reply_sweep(uint64_t now) {
+  reply_init();
+  for (int i = 0; i < REPLY_SLOTS; i++) {
+    if (reply_slots[i].fd >= 0 && now - reply_slots[i].used > REPLY_IDLE_MS) {
+      reply_drop(i);
+      reply_expired++;
+    }
+  }
+}
+
+static int same_addr(const struct sockaddr_storage *a, const struct sockaddr_storage *b) {
+  if (a->ss_family != b->ss_family) return 0;
+  if (a->ss_family == AF_INET) {
+    const struct sockaddr_in *x = (const struct sockaddr_in *)a, *y = (const struct sockaddr_in *)b;
+    return x->sin_port == y->sin_port && x->sin_addr.s_addr == y->sin_addr.s_addr;
+  }
+  const struct sockaddr_in6 *x = (const struct sockaddr_in6 *)a, *y = (const struct sockaddr_in6 *)b;
+  return x->sin6_port == y->sin6_port && memcmp(&x->sin6_addr, &y->sin6_addr, sizeof(x->sin6_addr)) == 0;
+}
+
+/* Open a socket that may send from a non-local ip:port. Returns fd or -1 (errno kept). */
+static int open_reply_socket(const struct sockaddr_storage *from, socklen_t len) {
+  int family = from->ss_family;
+  int fd = socket(family, SOCK_DGRAM | SOCK_CLOEXEC | SOCK_NONBLOCK, 0);
+  if (fd < 0) return -1;
+  int one = 1;
+  setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+  if (family == AF_INET6) setsockopt(fd, SOL_IPV6, IPV6_V6ONLY, &one, sizeof(one));
+  if (set_transparent(fd, family) != 0 || bind(fd, (const struct sockaddr *)from, len) != 0) {
+    int saved = errno;
+    close(fd);
+    errno = saved;
+    return -1;
+  }
+  return fd;
+}
+
+/* Cached sender for this source; evicts the least recently used slot when full. */
+static int reply_fd(const struct sockaddr_storage *from, socklen_t len, int *slot) {
+  uint64_t now = now_ms();
+  reply_sweep(now);
+  int free_i = -1, lru = -1;
+  for (int i = 0; i < REPLY_SLOTS; i++) {
+    if (reply_slots[i].fd < 0) {
+      if (free_i < 0) free_i = i;
+      continue;
+    }
+    if (same_addr(&reply_slots[i].addr, from)) {
+      reply_slots[i].used = now;
+      *slot = i;
+      return reply_slots[i].fd;
+    }
+    if (lru < 0 || reply_slots[i].used < reply_slots[lru].used) lru = i;
+  }
+  int fd = open_reply_socket(from, len);
+  if (fd < 0) return -1;
+  int i = free_i;
+  if (i < 0) {
+    i = lru;
+    reply_drop(i);
+    reply_evicted++;
+  }
+  reply_slots[i].fd = fd;
+  reply_slots[i].addr = *from;
+  reply_slots[i].len = len;
+  reply_slots[i].used = now;
+  reply_opened++;
+  *slot = i;
+  return fd;
 }
 
 static napi_value original_dest(napi_env env, napi_callback_info info) {
@@ -142,37 +302,58 @@ static napi_value listen_transparent(napi_env env, napi_callback_info info) {
   return obj;
 }
 
+/* listenTransparentUdp(port[, family]) — family 4 (default, unchanged) or 6 (IPv6-only socket). */
 static napi_value listen_transparent_udp(napi_env env, napi_callback_info info) {
+  size_t argc = 2;
+  napi_value argv[2];
+  napi_get_cb_info(env, info, &argc, argv, NULL, NULL);
   int32_t port = 0;
-  if (take_i32(env, info, &port) != 0) return fail(env, "缺少端口");
-  int fd = socket(AF_INET, SOCK_DGRAM | SOCK_CLOEXEC, 0);
+  if (argc < 1 || napi_get_value_int32(env, argv[0], &port) != napi_ok) return fail(env, "缺少端口");
+  int family = AF_INET;
+  if (argc >= 2 && family_of(env, argv[1], 1, &family) != 0) return fail(env, "地址族无效");
+  int fd = socket(family, SOCK_DGRAM | SOCK_CLOEXEC, 0);
   if (fd < 0) return fail(env, "不能打开套接字");
   int one = 1;
   setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
-  if (setsockopt(fd, SOL_IP, IP_TRANSPARENT, &one, sizeof(one)) != 0) {
+  if (family == AF_INET6) setsockopt(fd, SOL_IPV6, IPV6_V6ONLY, &one, sizeof(one));
+  if (set_transparent(fd, family) != 0) {
     close(fd);
     return fail(env, "IP_TRANSPARENT 失败");
   }
-  setsockopt(fd, SOL_IP, IP_RECVORIGDSTADDR, &one, sizeof(one));
+  if (family == AF_INET6) setsockopt(fd, SOL_IPV6, IPV6_RECVORIGDSTADDR, &one, sizeof(one));
+  else setsockopt(fd, SOL_IP, IP_RECVORIGDSTADDR, &one, sizeof(one));
   int flags = fcntl(fd, F_GETFL, 0);
   if (flags < 0) flags = 0;
   fcntl(fd, F_SETFL, flags | O_NONBLOCK);
-  struct sockaddr_in addr;
+  struct sockaddr_storage addr;
   memset(&addr, 0, sizeof(addr));
-  addr.sin_family = AF_INET;
-  addr.sin_port = htons((uint16_t)port);
-  addr.sin_addr.s_addr = htonl(INADDR_ANY);
-  if (bind(fd, (struct sockaddr *)&addr, sizeof(addr)) != 0) {
+  socklen_t alen;
+  if (family == AF_INET6) {
+    struct sockaddr_in6 *v6 = (struct sockaddr_in6 *)&addr;
+    v6->sin6_family = AF_INET6;
+    v6->sin6_port = htons((uint16_t)port);
+    v6->sin6_addr = in6addr_any;
+    alen = sizeof(*v6);
+  } else {
+    struct sockaddr_in *v4 = (struct sockaddr_in *)&addr;
+    v4->sin_family = AF_INET;
+    v4->sin_port = htons((uint16_t)port);
+    v4->sin_addr.s_addr = htonl(INADDR_ANY);
+    alen = sizeof(*v4);
+  }
+  if (bind(fd, (struct sockaddr *)&addr, alen) != 0) {
     close(fd);
     return fail(env, "透明监听失败");
   }
-  struct sockaddr_in bound;
+  struct sockaddr_storage bound;
   socklen_t blen = sizeof(bound);
+  memset(&bound, 0, sizeof(bound));
   getsockname(fd, (struct sockaddr *)&bound, &blen);
+  int bport = family == AF_INET6 ? ntohs(((struct sockaddr_in6 *)&bound)->sin6_port) : ntohs(((struct sockaddr_in *)&bound)->sin_port);
   napi_value obj, fd_v, port_v;
   napi_create_object(env, &obj);
   napi_create_int32(env, fd, &fd_v);
-  napi_create_int32(env, ntohs(bound.sin_port), &port_v);
+  napi_create_int32(env, bport, &port_v);
   napi_set_named_property(env, obj, "fd", fd_v);
   napi_set_named_property(env, obj, "port", port_v);
   return obj;
@@ -246,13 +427,6 @@ static napi_value connect_marked(napi_env env, napi_callback_info info) {
   return fd_value(env, fd);
 }
 
-static void fill_addr(struct sockaddr_in *addr, const char *host, int port) {
-  memset(addr, 0, sizeof(*addr));
-  addr->sin_family = AF_INET;
-  addr->sin_port = htons((uint16_t)port);
-  inet_pton(AF_INET, host, &addr->sin_addr);
-}
-
 static napi_value packet_object(napi_env env, const char *from_host, int from_port, const char *dest_host, int dest_port, const uint8_t *data, size_t len) {
   napi_value obj, from_v, from_port_v, dest_v, dest_port_v, buf;
   napi_create_object(env, &obj);
@@ -296,25 +470,33 @@ static napi_value recv_udp(napi_env env, napi_callback_info info) {
     }
     return fail(env, "收包失败");
   }
+  reply_sweep(now_ms());
   char from_host[INET6_ADDRSTRLEN] = "0.0.0.0";
   int from_port = 0;
-  if (peer.ss_family == AF_INET) {
-    struct sockaddr_in *v4 = (struct sockaddr_in *)&peer;
-    inet_ntop(AF_INET, &v4->sin_addr, from_host, sizeof(from_host));
-    from_port = ntohs(v4->sin_port);
-  }
+  addr_text(&peer, from_host, sizeof(from_host), &from_port);
   char dest_host[INET6_ADDRSTRLEN] = "0.0.0.0";
   int dest_port = 0;
   for (struct cmsghdr *cmsg = CMSG_FIRSTHDR(&msg); cmsg; cmsg = CMSG_NXTHDR(&msg, cmsg)) {
     if (cmsg->cmsg_level == SOL_IP && (cmsg->cmsg_type == IP_ORIGDSTADDR || cmsg->cmsg_type == IP_RECVORIGDSTADDR)) {
-      struct sockaddr_in *orig = (struct sockaddr_in *)CMSG_DATA(cmsg);
-      inet_ntop(AF_INET, &orig->sin_addr, dest_host, sizeof(dest_host));
-      dest_port = ntohs(orig->sin_port);
+      struct sockaddr_storage orig;
+      memset(&orig, 0, sizeof(orig));
+      memcpy(&orig, CMSG_DATA(cmsg), sizeof(struct sockaddr_in));
+      addr_text(&orig, dest_host, sizeof(dest_host), &dest_port);
+    } else if (cmsg->cmsg_level == SOL_IPV6 && cmsg->cmsg_type == IPV6_ORIGDSTADDR) {
+      struct sockaddr_storage orig;
+      memset(&orig, 0, sizeof(orig));
+      memcpy(&orig, CMSG_DATA(cmsg), sizeof(struct sockaddr_in6));
+      addr_text(&orig, dest_host, sizeof(dest_host), &dest_port);
     }
   }
   return packet_object(env, from_host, from_port, dest_host, dest_port, buf, (size_t)n);
 }
 
+/* sendUdp(fd, data, toHost, toPort, fromHost, fromPort)
+ * U1b: the reply goes out from fromHost:fromPort (the client's original destination), through a
+ * cached IP_TRANSPARENT/IPV6_TRANSPARENT socket bound to it. IPv4 and IPv6 share this path.
+ * Only when fromPort is 0 (no original destination was read) does it fall back to the old
+ * IPv4 IP_PKTINFO send on the listener fd, which spoofs the address but not the port. */
 static napi_value send_udp(napi_env env, napi_callback_info info) {
   size_t argc = 6;
   napi_value argv[6];
@@ -333,8 +515,28 @@ static napi_value send_udp(napi_env env, napi_callback_info info) {
   size_t copied = 0;
   if (napi_get_value_string_utf8(env, argv[2], to_host, sizeof(to_host), &copied) != napi_ok) return fail(env, "回包地址无效");
   if (napi_get_value_string_utf8(env, argv[4], from_host, sizeof(from_host), &copied) != napi_ok) return fail(env, "回包地址无效");
-  struct sockaddr_in to;
-  fill_addr(&to, to_host, to_port);
+  struct sockaddr_storage to, from;
+  socklen_t to_len = 0, from_len = 0;
+  int to_family = parse_addr(to_host, to_port, &to, &to_len);
+  if (to_family < 0) return fail(env, "回包地址无效");
+  if (from_port > 0) {
+    int from_family = parse_addr(from_host, from_port, &from, &from_len);
+    if (from_family < 0 || from_family != to_family) return fail(env, "回包地址无效");
+    for (int attempt = 0; attempt < 2; attempt++) {
+      int slot = -1;
+      int rfd = reply_fd(&from, from_len, &slot);
+      if (rfd < 0) return fail(env, errno == EPERM ? "回包失败：IP_TRANSPARENT 需要 CAP_NET_ADMIN" : "回包失败：不能绑定原目的地址");
+      if (sendto(rfd, data, len, 0, (struct sockaddr *)&to, to_len) >= 0) {
+        napi_value nil;
+        napi_get_undefined(env, &nil);
+        return nil;
+      }
+      if (errno == EAGAIN || errno == EWOULDBLOCK || errno == ENOBUFS) break;
+      reply_drop(slot); /* broken sender: drop it and try one fresh socket */
+    }
+    return fail(env, "回包失败");
+  }
+  if (to_family != AF_INET) return fail(env, "回包地址无效");
   char control[CMSG_SPACE(sizeof(struct in_pktinfo))];
   memset(control, 0, sizeof(control));
   struct iovec iov;
@@ -343,7 +545,7 @@ static napi_value send_udp(napi_env env, napi_callback_info info) {
   struct msghdr msg;
   memset(&msg, 0, sizeof(msg));
   msg.msg_name = &to;
-  msg.msg_namelen = sizeof(to);
+  msg.msg_namelen = to_len;
   msg.msg_iov = &iov;
   msg.msg_iovlen = 1;
   msg.msg_control = control;
@@ -356,6 +558,39 @@ static napi_value send_udp(napi_env env, napi_callback_info info) {
   memset(pkt, 0, sizeof(*pkt));
   inet_pton(AF_INET, from_host, &pkt->ipi_spec_dst);
   if (sendmsg(fd, &msg, 0) < 0) return fail(env, "回包失败");
+  napi_value nil;
+  napi_get_undefined(env, &nil);
+  return nil;
+}
+
+/* udpReplyStats() -> { open, max, idleMs, opened, evicted, expired } */
+static napi_value udp_reply_stats(napi_env env, napi_callback_info info) {
+  (void)info;
+  reply_sweep(now_ms());
+  int open_n = 0;
+  for (int i = 0; i < REPLY_SLOTS; i++) if (reply_slots[i].fd >= 0) open_n++;
+  napi_value obj, v;
+  napi_create_object(env, &obj);
+  napi_create_int32(env, open_n, &v);
+  napi_set_named_property(env, obj, "open", v);
+  napi_create_int32(env, REPLY_SLOTS, &v);
+  napi_set_named_property(env, obj, "max", v);
+  napi_create_int32(env, REPLY_IDLE_MS, &v);
+  napi_set_named_property(env, obj, "idleMs", v);
+  napi_create_double(env, (double)reply_opened, &v);
+  napi_set_named_property(env, obj, "opened", v);
+  napi_create_double(env, (double)reply_evicted, &v);
+  napi_set_named_property(env, obj, "evicted", v);
+  napi_create_double(env, (double)reply_expired, &v);
+  napi_set_named_property(env, obj, "expired", v);
+  return obj;
+}
+
+/* closeUdpReplies(): close every cached reply sender (takeover shutdown / refuse). */
+static napi_value close_udp_replies(napi_env env, napi_callback_info info) {
+  (void)info;
+  reply_init();
+  for (int i = 0; i < REPLY_SLOTS; i++) reply_drop(i);
   napi_value nil;
   napi_get_undefined(env, &nil);
   return nil;
@@ -448,6 +683,10 @@ static napi_value init(napi_env env, napi_value exports) {
   napi_set_named_property(env, exports, "recvUdp", fn);
   napi_create_function(env, "sendUdp", NAPI_AUTO_LENGTH, send_udp, NULL, &fn);
   napi_set_named_property(env, exports, "sendUdp", fn);
+  napi_create_function(env, "udpReplyStats", NAPI_AUTO_LENGTH, udp_reply_stats, NULL, &fn);
+  napi_set_named_property(env, exports, "udpReplyStats", fn);
+  napi_create_function(env, "closeUdpReplies", NAPI_AUTO_LENGTH, close_udp_replies, NULL, &fn);
+  napi_set_named_property(env, exports, "closeUdpReplies", fn);
   napi_create_function(env, "watchUdp", NAPI_AUTO_LENGTH, watch_udp, NULL, &fn);
   napi_set_named_property(env, exports, "watchUdp", fn);
   napi_create_function(env, "openTun", NAPI_AUTO_LENGTH, open_tun, NULL, &fn);

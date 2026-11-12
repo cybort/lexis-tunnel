@@ -16,8 +16,8 @@ import { hkdf } from "@noble/hashes/hkdf.js";
 import { sha256 } from "@noble/hashes/sha2.js";
 import { ctr } from "@noble/ciphers/aes.js";
 import { hctr2Decrypt, hctr2Encrypt, hctr2Key, type Hctr2Key } from "./hctr2";
-import { buildModel, buildModelV4, bytesToWords, wordsToBytes, type WordModel } from "./model";
-import { bbAlign, bbParse, bbSeal, wordsForBytes } from "./bb";
+import { buildModel, buildModelS, buildModelV4, bytesToWords, wordsToBytes, type WordModel } from "./model";
+import { bbAlign, bbAlignS, bbParse, bbParseM, bbSeal, bbSealM, wordsForBytes, wordsForBytesS } from "./bb";
 import { alignX, BBX_DTES, parseX, sealX, specOf, wordsMinX, type BbxDte } from "./bbx";
 /** bb-v4: measured wire bytes per word (avg word length + space). */
 const BB_WIRE_PER_WORD = 4.89;
@@ -25,22 +25,34 @@ function bbWordsMin(n: number): number {
   for (let k = 0; k < 4; k++) { const m = wordsForBytes(n + k); if (m.length) return m[m.length - 1]; }
   return Math.ceil((8 * n) / 9.44);
 }
+/** bb-k-v4s: wire bytes per word over the allowed set (expected word length + space under the
+ * group-flat table, 4.925; checked against the measured paired expansion). */
+const BBS_WIRE_PER_WORD = 4.92;
+function bbsWordsMin(n: number): number {
+  for (let k = 0; k < 4; k++) { const m = wordsForBytesS(n + k); if (m.length) return m[m.length - 1]; }
+  return Math.ceil((8 * n) / 9.44);
+}
 
 /** Wire protocol identity. Deliberately NOT sent on the wire (a version byte is a fingerprint);
  *  both ends must run the same protocol. Incompatible with 1.8.0 (lexis-codebook-ctr-v1). */
-export const PROTOCOL = { name: "lexis-hctr2-bb-k-v4", version: 4, agent: "4.0.0" } as const;
+export const PROTOCOL = { name: "lexis-hctr2-bb-k-v4s", version: 4, agent: "4.1.0" } as const;
 
-/** frame.dte (v4). Default "bb-k-v4" (scheme K): surjective bits-back over ONE public word
+/** frame.dte (v4). Default "bb-k-v4s" (see isV4s below). "bb-k-v4" (scheme K, the 4.0.0 default, now an explicit fallback): surjective bits-back over ONE public word
  * model, tail bits from a key-derived stream, re-seal on open. "bb-v4" is the A0 fallback
  * (CSPRNG tail, malleable words below the ciphertext). "rans-v3" is the keyed rANS model
  * (3.0.x data frames; re-encode confirms a candidate key, ~2–3% false pass). Not negotiated.
  * Handshake interop with 3.0.x also needs frame.dteCheck off. Unknown values throw. */
-export type Dte = "rans-v3" | "bb-v4" | "bb-k-v4" | BbxDte;
-const DTES: readonly string[] = ["rans-v3", "bb-v4", "bb-k-v4", ...BBX_DTES];
+export type Dte = "rans-v3" | "bb-v4" | "bb-k-v4" | "bb-k-v4s" | BbxDte;
+const DTES: readonly string[] = ["rans-v3", "bb-v4", "bb-k-v4", "bb-k-v4s", ...BBX_DTES];
+/** bb-k-v4s (default): scheme K over the shared allowed set (vocab-allowed.ts, pack implied by the
+ * dte value), session-keyed permutation within near-equal-frequency groups. Data frames and the
+ * finish use a model keyed by the session key sk (never wordsIkm); the hello uses wordsIkm over
+ * the same allowed set. Not interoperable with bb-k-v4 (mix fails closed in the handshake). */
+export const isV4s = (d: Dte | string): d is "bb-k-v4s" => d === "bb-k-v4s";
 /** bb-v4 family (same public-model surjective parse, same lengths): bb-v4, bb-k-v4 (scheme K). */
 const isBb = (d: Dte): boolean => d === "bb-v4" || d === "bb-k-v4";
 const isBbx = (d: Dte): d is BbxDte => (BBX_DTES as readonly string[]).includes(d);
-let defaultDte: Dte = "bb-k-v4";
+let defaultDte: Dte = "bb-k-v4s";
 export function setDefaultDte(d: string | undefined): void {
   if (d === undefined || d === null || d === "") return;
   if (!DTES.includes(d)) throw new Error(`frame.dte: unknown value ${d}`);
@@ -57,6 +69,7 @@ export function getDefaultDte(): Dte {
 export type Dir = "e2g" | "g2e";
 
 function parseWords(keys: { dte: Dte; wire: WordModel }, words: string[]): Uint8Array {
+  if (isV4s(keys.dte)) return bbParseM(keys.wire, words);
   if (isBb(keys.dte)) return bbParse(words);
   if (isBbx(keys.dte)) return parseX(specOf(keys.dte), words);
   return wordsToBytes(keys.wire, words);
@@ -91,7 +104,11 @@ export function deriveV2Keys(sk: Uint8Array, gen = 0, mnemonicBase?: Uint8Array 
   const mnemonic = mnemonicBase
     ? hkdf(sha256, mnemonicBase, enc.encode("lexis-v2-mnemonic"), enc.encode(`mnemonic|gen=${gen}`), 16)
     : derive(sk, "mnemonic", gen, 16);
-  const model = buildModel(lexKey, padKey);
+  // bb-k-v4s: word model keyed by the session key sk over the allowed set (design D-pool, §6).
+  const sModel = isV4s(dte)
+    ? buildModelS(hkdf(sha256, sk, new Uint8Array(0), enc.encode("lexis-v4s-lex"), 32), hkdf(sha256, sk, new Uint8Array(0), enc.encode("lexis-v4s-pad"), 32))
+    : null;
+  const model = sModel ?? buildModel(lexKey, padKey);
   return {
     gen,
     perm: hctr2Key(derive(sk, "perm", gen)),
@@ -100,7 +117,7 @@ export function deriveV2Keys(sk: Uint8Array, gen = 0, mnemonicBase?: Uint8Array 
     mnemonic,
     tailKey: derive(sk, "tail", gen, 16),
     dte,
-    wire: dte === "rans-v3" ? model : buildModelV4(),
+    wire: sModel ?? (dte === "rans-v3" ? model : buildModelV4()),
   };
 }
 
@@ -178,7 +195,11 @@ export function padLength(keys: V2Keys, counter: number, dir: Dir, len: number, 
     return ((mix[0] << 8) | mix[1]) % 256;
   }
   let maxPad: number;
-  if (keys.dte !== "rans-v3") {
+  if (isV4s(keys.dte)) {
+    const cap = maxExpansion * Math.max(len, 1);
+    maxPad = 0;
+    for (let p = 255; p > 0; p--) if (bbsWordsMin(len + p + OVERHEAD) * BBS_WIRE_PER_WORD <= cap) { maxPad = p; break; }
+  } else if (keys.dte !== "rans-v3") {
     const wmin = isBb(keys.dte) ? bbWordsMin : (n: number) => wordsMinX(specOf(keys.dte as BbxDte), n);
     // bb-v4 spends more words on short frames (fixed information margin), so the wire budget
     // is checked against the actual word count: largest pad whose frame stays within
@@ -210,7 +231,8 @@ export function sealV2(opts: {
   let pad = padLength(keys, counter, dir, plaintext.length, opts.maxExpansion ?? 2, opts.smallFramePolicy ?? "expansion");
   // bb-v4: the word count fixes the inner length; nudge the pad by +-1 when the natural length
   // falls in a 1-byte gap of the representable set (the length field still carries the pad).
-  if (isBb(keys.dte)) pad = bbAlign(plaintext.length + OVERHEAD, pad);
+  if (isV4s(keys.dte)) pad = bbAlignS(plaintext.length + OVERHEAD, pad);
+  else if (isBb(keys.dte)) pad = bbAlign(plaintext.length + OVERHEAD, pad);
   else if (isBbx(keys.dte)) pad = alignX(specOf(keys.dte), plaintext.length + OVERHEAD, pad);
   const cipherFor = (pad: number): Uint8Array => {
     const inner = new Uint8Array(plaintext.length + pad + OVERHEAD);
@@ -227,6 +249,7 @@ export function sealV2(opts: {
   };
   if (keys.dte === "bb-v4") return bbSeal(cipherFor(pad)).join(" ");
   if (keys.dte === "bb-k-v4") { const C = cipherFor(pad); return bbSeal(C, tailStream(keys, counter, dir, window, C)).join(" "); }
+  if (isV4s(keys.dte)) { const C = cipherFor(pad); return bbSealM(keys.wire, C, tailStream(keys, counter, dir, window, C)).join(" "); }
   if (keys.dte === "rans-v3") return bytesToWords(keys.model, cipherFor(pad), counter & 0xff).join(" ");
   const sp = specOf(keys.dte);
   if (!sp.canon) return (sealX(sp, cipherFor(pad)) as string[]).join(" ");
@@ -260,7 +283,10 @@ function tailStream(keys: V2Keys, counter: number, dir: Dir, window: number, C: 
 }
 function canonK(keys: V2Keys, counter: number, dir: Dir, window: number, cipher: Uint8Array, words: string[]): boolean {
   let again: string[];
-  try { again = bbSeal(cipher, tailStream(keys, counter, dir, window, cipher)); } catch { return false; }
+  try {
+    const tail = tailStream(keys, counter, dir, window, cipher);
+    again = isV4s(keys.dte) ? bbSealM(keys.wire, cipher, tail) : bbSeal(cipher, tail);
+  } catch { return false; }
   let d = again.length ^ words.length;
   for (let i = 0; i < again.length && i < words.length; i++) d |= again[i] === words[i] ? 0 : 1;
   return d === 0;
@@ -316,8 +342,8 @@ export function openV2(opts: { keys: V2Keys; counter: number; window: number; di
     const again = bytesToWords(opts.keys.model, cipher, opts.counter & 0xff);
     if (again.length !== words.length || again.some((w, i) => w !== words[i])) throw new FrameError("帧完整性校验失败");
   }
-  // bb-k-v4: keyed canonical tail -- re-seal with the keyed stream, require the same words.
-  if (opts.keys.dte === "bb-k-v4" && !canonK(opts.keys, opts.counter, opts.dir, opts.window, cipher, words)) throw new FrameError("帧完整性校验失败");
+  // bb-k-v4 / bb-k-v4s: keyed canonical tail -- re-seal with the keyed stream, require the same words.
+  if ((opts.keys.dte === "bb-k-v4" || isV4s(opts.keys.dte)) && !canonK(opts.keys, opts.counter, opts.dir, opts.window, cipher, words)) throw new FrameError("帧完整性校验失败");
   // bb-v4: no canonical check. The last few words (below the ciphertext's 8n bits) are
   // malleable (a different wire, same ciphertext); the SPRP + mnemonic still authenticate
   // every ciphertext byte and the counter forbids replays.

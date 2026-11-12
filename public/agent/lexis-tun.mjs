@@ -35,6 +35,16 @@ export function parseIpv4(packet) {
   return { src: fmtIp(view, 12), dst: fmtIp(view, 16), proto: view[9], payload: view.subarray(ihl) };
 }
 
+/** S0: why push() could not use a packet: { version, proto, reason } (proto = IPv6 next header). */
+export function dropInfo(packet) {
+  const buf = Buffer.from(packet);
+  const version = buf.length ? buf[0] >> 4 : 0;
+  if (version !== 6) return { version, proto: "", reason: version === 4 ? "bad_ipv4" : "not_ip" };
+  if (buf.length < 40) return { version, proto: "", reason: "truncated" };
+  const next = buf[6];
+  return { version, proto: next === 6 ? "tcp" : next === 17 ? "udp" : next === 58 ? "icmpv6" : "other", reason: "no_ipv6_engine" };
+}
+
 export function parseTcp(payload) {
   const buf = Buffer.from(payload);
   if (buf.length < 20) return null;
@@ -274,7 +284,7 @@ export function answerDns(packet, fakeIp, ttl = 60) {
   return Buffer.concat([header, asked, answer]);
 }
 
-export function createEngine({ dialTcp, dialUdp, emit, fakeIp = null, mtu = TUN_MTU, mss = null, oooMaxBytes = RCV_WND, oooMaxSegs = 64, oooTotalBytes = 8 << 20, log = () => undefined, udpIdleMs = 60000, udpMax = 64, timeWaitMs = 2000, finLingerMs = 60000, rtoMs = 1000, rtoMinMs = 200, rtoMaxMs = 60000, maxRetries = 7, giveUpMs = 180000, synRtoMs = 3000, dupAckThresh = 3, loopGuard = [], onLoopDrop = () => undefined, iss = null }) {
+export function createEngine({ dialTcp, dialUdp, emit, fakeIp = null, mtu = TUN_MTU, mss = null, oooMaxBytes = RCV_WND, oooMaxSegs = 64, oooTotalBytes = 8 << 20, log = () => undefined, udpIdleMs = 60000, udpMax = 64, timeWaitMs = 2000, finLingerMs = 60000, rtoMs = 1000, rtoMinMs = 200, rtoMaxMs = 60000, maxRetries = 7, giveUpMs = 180000, synRtoMs = 3000, dupAckThresh = 3, loopGuard = [], onLoopDrop = () => undefined, onDrop6 = () => undefined, iss = null }) {
   // 3.0.3 loop guard: packets addressed to our own peers (gates) must never be tunnelled;
   // they only show up here when the route to the peer fell back to the tun table.
   const guarded = new Set(loopGuard);
@@ -879,7 +889,12 @@ export function createEngine({ dialTcp, dialUdp, emit, fakeIp = null, mtu = TUN_
   return {
     async push(packet) {
       const ip = parseIpv4(packet);
-      if (!ip) return;
+      if (!ip) {
+        // S0 (C8): a packet parseIpv4 cannot read used to vanish uncounted. Report it by IP
+        // version; this engine has no IPv6 path yet, so every IPv6 packet is a drop.
+        onDrop6(dropInfo(packet));
+        return;
+      }
       if (guarded.has(ip.dst)) {
         onLoopDrop(ip);
         return;

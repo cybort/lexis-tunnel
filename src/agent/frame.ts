@@ -35,7 +35,7 @@ const MAX_FRAME_PAYLOAD = 4096;
 /** D1: flush a coalesced frame once this many record bytes are queued. Default 1024. */
 let COALESCE_TARGET = 1024;
 export function setFrameOptions(opts: { maxExpansion?: number; smallFramePolicy?: string; coalesceTarget?: number; dte?: string; dteCheck?: boolean }) {
-  // frame.dte (v4): "bb-k-v4" (default; scheme K, keyed canonical tail, protocol lexis-hctr2-bb-k-v4) | "bb-v4" (A0, fallback) | "bb-c8-v4" (A1) | "bb-ou-v4" (A2) | "bb-ouc8-v4" / "bb-ouc8r-v4" (A3, ring off/on) | "dfa-v4" (A4) | "rans-v3". Must match on both ends (not negotiated; unknown values are refused).
+  // frame.dte (v4): "bb-k-v4s" (default; scheme K over the shared allowed word set with a session-keyed permutation, protocol lexis-hctr2-bb-k-v4s) | "bb-k-v4" (4.0 default, explicit fallback; not interoperable with bb-k-v4s) | "bb-v4" (A0, fallback) | "bb-c8-v4" (A1) | "bb-ou-v4" (A2) | "bb-ouc8-v4" / "bb-ouc8r-v4" (A3, ring off/on) | "dfa-v4" (A4) | "rans-v3". Must match on both ends (not negotiated; unknown values are refused).
   setDefaultDte(opts.dte);
   // frame.dteCheck (default true): dte mismatch fails the handshake key confirmation (silent, like a wrong key).
   setDteCheck(opts.dteCheck !== false);

@@ -9,7 +9,7 @@ import { buildModelV4 } from "./model";
 const R = (n: number) => Uint8Array.from(randomBytes(n));
 const words = buildModelV4().words;
 assert.equal(F.protocolName("bb-k-v4"), "lexis-hctr2-bb-k-v4");
-assert.equal(F.getDefaultDte(), "bb-k-v4"); assert.equal(F.protocolName(), "lexis-hctr2-bb-k-v4"); assert.equal(F.protocolName("bb-v4"), "lexis-hctr2-bb-v4"); F.setDefaultDte("bb-v4"); assert.equal(F.getDefaultDte(), "bb-v4"); F.setDefaultDte("bb-k-v4");
+assert.equal(F.getDefaultDte(), "bb-k-v4s"); assert.equal(F.protocolName(), "lexis-hctr2-bb-k-v4s"); assert.equal(F.protocolName("bb-v4"), "lexis-hctr2-bb-v4"); F.setDefaultDte("bb-v4"); assert.equal(F.getDefaultDte(), "bb-v4"); F.setDefaultDte("bb-k-v4s");
 const sk = R(32), mb = R(32);
 const k = F.deriveV2Keys(sk, 0, mb, "bb-k-v4"), w = F.deriveV2Keys(R(32), 0, R(32), "bb-k-v4"), a0 = F.deriveV2Keys(sk, 0, mb, "bb-v4");
 let tested = 0, rejected = 0;

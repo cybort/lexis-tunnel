@@ -8,7 +8,7 @@ import { packPayload, unpackPayload } from "@/lib/lexis/pack";
 import { useProfile } from "@/lib/lexis/profile-store";
 import { decodeRecord, encodeRecord, heartbeatPayload, RECORD, recordLabel } from "@/lib/lexis/records";
 import { useMesh } from "@/lib/lexis/store";
-import { FrameError, openV2, openV2Honey, packBatch, protocolName, sealV2, SEG_COMPLETE, unpackBatch, deriveV2Keys } from "@/lib/lexis/v2/frame2";
+import { FrameError, openV2, openV2Honey, packBatch, protocolName, sealV2, SEG_COMPLETE, unpackBatch, deriveV2Keys, type Dte } from "@/lib/lexis/v2/frame2";
 import { EntropyMeter } from "./meter";
 import { Btn, control, Field, Paper } from "./ui";
 
@@ -104,7 +104,7 @@ export function Bench({
       const chosen = next.v2?.dte ?? profile.frame.dte;
       push({
         title: "会话密钥已按握手回声派生",
-        meta: `${next.v2 ? protocolName(next.v2.dte) : chosen} · 词编码 ${chosen} · 握手检查${profile.frame.dteCheck ? "开" : "关"} · Argon2id ${next.kdf.memoryKiB} KiB · t${next.kdf.iterations} · p${next.kdf.parallelism} · ${next.kdfMs} ms · ${chosen === "rans-v3" ? "帧词序随密钥" : "帧词模型公开"} · ${next.honey ? "握手带蜜文标志" : "坏帧会拆掉会话"}。两端选项相同，这一页不能演示错配。`,
+        meta: `${next.v2 ? protocolName(next.v2.dte) : chosen} · 词编码 ${chosen} · 握手检查${profile.frame.dteCheck ? "开" : "关"} · Argon2id ${next.kdf.memoryKiB} KiB · t${next.kdf.iterations} · p${next.kdf.parallelism} · ${next.kdfMs} ms · ${chosen === "rans-v3" ? "帧词序随密钥" : chosen === "bb-k-v4s" ? "允许词表共用，组内词序随密钥" : "帧词模型公开"} · ${next.honey ? "握手带蜜文标志" : "坏帧会拆掉会话"}。两端选项相同，这一页不能演示错配。`,
       });
       for (const item of [
         { title: "内网端 → 闸门 · 问候", prose: next.helloWire },
@@ -296,7 +296,7 @@ export function Bench({
           ? view.formatValid
             ? "rans-v3 的词序重编码碰巧通过（错误密钥大约 2%–3%）。正文仍不是原文。单靠这一步就能确认候选会话密钥，蜜文挡不住。"
             : "rans-v3 的词序重编码没过。错误密钥大约 97% 会这样。蜜文挡不住已经拿到候选会话密钥的人。"
-          : dteNow === "bb-k-v4"
+          : dteNow === "bb-k-v4" || dteNow === "bb-k-v4s"
             ? "方案 K 的蜜文路径不做重封检查，错钥仍是一份格式合法的视图。持有候选会话密钥的人可以重封或核对助记码。重封对得上不能证明这一帧来自对端。这一次用的是随机密钥。"
             : `${dteNow} 的蜜文路径不把坏帧收成另一套词。错钥视图格式${view.formatValid ? "合法" : "不合法"}。这不是打不开篡改的证明。`;
       push({
@@ -386,7 +386,7 @@ export function Bench({
               {busy ? "进行中" : "握手"}
             </Btn>
             <p className="text-sm text-mist">
-              当前 {dte} · {protocolName(dte as "bb-k-v4")} · 握手检查{dteCheck ? "开" : "关"}。两端用同一套选项，不能在这一页演示错配。词编码或检查一变，旧会话作废。方案 K 在浏览器里很慢，短帧也要等，不要改成很大的随机载荷。
+              当前 {dte} · {protocolName(dte as Dte)} · 握手检查{dteCheck ? "开" : "关"}。两端用同一套选项，不能在这一页演示错配。词编码或检查一变，旧会话作废。默认 bb-k-v4s 在浏览器里很慢，短帧也要等，不要改成很大的随机载荷。
             </p>
           </div>
           {session ? (

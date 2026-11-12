@@ -14,7 +14,7 @@ K_tail = HKDF(sk, "lexis-v2", "tail|gen=N", 16)，与 HCTR2/pad/mnemonic 密钥�
 
 ## Default and interop (4.0, 2026-11-03)
 
-`frame.dte` values: `bb-k-v4` (**default**, protocol `lexis-hctr2-bb-k-v4`), `bb-c8-v4` (A1 with the
+`frame.dte` values: `bb-k-v4` (4.0.0 default, explicit fallback after v4s; protocol `lexis-hctr2-bb-k-v4`), `bb-k-v4s` (**default** from next 4.x, see frame-v4s-session-vocab.md), `bb-c8-v4` (A1 with the
 fast closure check, optional, **not recommended**: residual tamper acceptance 19/6000 ≈ 0.3% with
 unchanged plaintext, vs 0/6000 for bb-k-v4; kept only for faster open), `bb-v4` (A0, fallback), `rans-v3` (3.0.x data frames only; a 3.0.x handshake also needs `frame.dteCheck=false` — setting rans-v3 alone is not enough), and the experimental
 `bb-ou-v4` / `bb-ouc8-v4` / `bb-ouc8r-v4` / `dfa-v4`. Both ends must use the same value; it is not

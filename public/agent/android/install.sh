@@ -3,7 +3,7 @@ set -eu
 HERE=$(CDPATH= cd -- "$(dirname "$0")" && pwd)
 DEST="${HOME}/.lexis"
 mkdir -p "$DEST"
-cp "$HERE/lexis-agent.mjs" "$HERE/lexis-frame.mjs" "$HERE/lexis-http.mjs" "$HERE/lexis-tun.mjs" "$HERE/zstd.wasm" "$HERE/lexis.config.json" "$DEST/"
+cp "$HERE/lexis-agent.mjs" "$HERE/lexis-frame.mjs" "$HERE/lexis-http.mjs" "$HERE/lexis-tun.mjs" "$HERE/lexis-dns-local.mjs" "$HERE/zstd.wasm" "$HERE/lexis.config.json" "$DEST/"
 if [ -f "$HERE/LexisVpnService.kt" ]; then
   cp "$HERE/LexisVpnService.kt" "$DEST/"
 fi

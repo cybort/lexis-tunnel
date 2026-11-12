@@ -21,8 +21,10 @@ function runScript(linux) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "lexis-fwd-"));
   const logf = path.join(dir, "ip.log");
   fs.writeFileSync(path.join(dir, "id"), "#!/bin/sh\necho 0\n", { mode: 0o755 });
+  // U2 r2: the 53 hijack needs a nat backend; a fake nft that accepts everything (and lists nothing).
+  fs.writeFileSync(path.join(dir, "nft"), '#!/bin/sh\ncase "$1" in list) exit 1;; esac\nexit 0\n', { mode: 0o755 });
   fs.writeFileSync(path.join(dir, "ip"), `#!/bin/sh\necho "$*" >> ${logf}\ncase "$*" in "link show"*) exit 1;; "-6 rule del"*|"rule del"*) exit 1;; esac\nexit 0\n`, { mode: 0o755 });
-  const { body } = forwardScript({ mode: "system-forward", linux: { method: "tun", mark: 4731, table: 165, ...linux }, peers: [{ endpoint: "10.240.2.2:18443" }, { endpoint: "203.0.113.9:7000" }] });
+  const body = forwardScript({ mode: "system-forward", linux: { method: "tun", mark: 4731, table: 165, ...linux }, peers: [{ endpoint: "10.240.2.2:18443" }, { endpoint: "203.0.113.9:7000" }] }, 5399).body.replace("IF6=/proc/net/if_inet6", "IF6=/dev/null"); // U2 r2: DNS service port (always hijacked), no IPv6 53 here
   const sh = path.join(dir, "apply.sh");
   fs.writeFileSync(sh, body, { mode: 0o755 });
   const out = execFileSync("/bin/sh", [sh], { env: { PATH: `${dir}:/usr/bin:/bin` }, encoding: "utf8" });

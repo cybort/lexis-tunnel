@@ -5,7 +5,7 @@
 # The image user is not root, so tproxy and TUN are not available here.
 FROM node:22-bookworm-slim
 WORKDIR /opt/lexis
-COPY lexis-agent.mjs lexis-frame.mjs lexis-http.mjs lexis-tun.mjs zstd.wasm lexis.config.json 使用说明.txt ./
+COPY lexis-agent.mjs lexis-frame.mjs lexis-http.mjs lexis-tun.mjs lexis-dns-local.mjs zstd.wasm lexis.config.json 使用说明.txt ./
 COPY linux/lexis-sockopt.node linux/sockopt.c ./
 RUN groupadd --system lexis && useradd --system --gid lexis --home-dir /opt/lexis --no-create-home lexis \
  && chown -R lexis:lexis /opt/lexis

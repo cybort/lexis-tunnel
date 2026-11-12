@@ -2,7 +2,9 @@
 // on (default): every mismatched pair of bb-k-v4 / bb-c8-v4 / bb-v4 fails at edgeFinish3 (confirmS),
 // and a forged finish under the other dte is a HandshakeDrop at the gate; matching pairs work.
 // off: mismatched handshakes complete (old behaviour) and the data frames are what fail.
-// Wire sizes are identical with the check on or off.
+// bb-k-v4s (default) builds the hello over the allowed set, so any pair of bb-k-v4s with another
+// dte already fails at the gate (hello not admitted -> HandshakeDrop, no server reply), with the
+// check on or off. Wire sizes are identical with the check on or off.
 import assert from "node:assert/strict";
 import { b64 } from "../bytes.ts";
 import { createIdentity } from "../crypto.ts";
@@ -18,46 +20,53 @@ async function makeNode(name: string, role: MeshNode["role"]): Promise<MeshNode>
 }
 resetHandshakeGuards();
 assert.equal(getDteCheck(), true);
-assert.equal(getDefaultDte(), "bb-k-v4");
+assert.equal(getDefaultDte(), "bb-k-v4s");
 const gate = await makeNode("g", "gate"), edge = await makeNode("e", "edge");
 const peers = [{ id: "e1", publicRawB64: edge.publicRawB64 }];
 const T = "dte-test-token-0123456789ab";
-const D = ["bb-k-v4", "bb-c8-v4", "bb-v4"];
+const D = ["bb-k-v4s", "bb-k-v4", "bb-c8-v4", "bb-v4"];
+const S = "bb-k-v4s";
 const msg = new TextEncoder().encode("dte handshake probe payload ".repeat(8));
 
-type R = { edgeOk: boolean; gateOk: boolean; dataOk: boolean; sizes: number[] };
+type R = { helloOk: boolean; edgeOk: boolean; gateOk: boolean; dataOk: boolean; sizes: number[] };
 async function hs(ed: string, gd: string): Promise<R> {
   resetHandshakeGuards();
-  const p = edgeStart3(edge, gate.publicRawB64, Date.now(), FAST, T);
-  setDefaultDte(gd); const g = await gateRespond3(gate, peers, p.helloWire, { token: T, kdf: FAST });
+  setDefaultDte(ed); const p = edgeStart3(edge, gate.publicRawB64, Date.now(), FAST, T);
+  setDefaultDte(gd);
+  let g;
+  try { g = await gateRespond3(gate, peers, p.helloWire, { token: T, kdf: FAST }); } catch (e) {
+    // gate cannot admit the hello (different hello word model): silent drop, no server reply.
+    assert.ok(e instanceof HandshakeDrop); setDefaultDte("bb-k-v4s"); return { helloOk: false, edgeOk: false, gateOk: false, dataOk: false, sizes: [] };
+  }
   setDefaultDte(ed);
   const sizes = [p.helloWire.split(" ").length, g.serverWire.split(" ").length];
   let f;
   try { f = await edgeFinish3(edge, p, gate.publicRawB64, g.serverWire); } catch {
     // edge refuses confirmS and closes; the gate never receives a finish (its timeout path,
     // covered in src/agent/dte-silent.test.ts).
-    setDefaultDte("bb-k-v4"); return { edgeOk: false, gateOk: false, dataOk: false, sizes };
+    setDefaultDte("bb-k-v4s"); return { helloOk: true, edgeOk: false, gateOk: false, dataOk: false, sizes };
   }
   sizes.push(f.finishWire.split(" ").length);
   setDefaultDte(gd);
   let acc;
-  try { acc = gateAccept3(g, f.finishWire); } catch (e) { assert.ok(e instanceof HandshakeDrop); setDefaultDte("bb-k-v4"); return { edgeOk: true, gateOk: false, dataOk: false, sizes }; }
+  try { acc = gateAccept3(g, f.finishWire); } catch (e) { assert.ok(e instanceof HandshakeDrop); setDefaultDte("bb-k-v4s"); return { helloOk: true, edgeOk: true, gateOk: false, dataOk: false, sizes }; }
   let dataOk = true;
   for (let c = 1; c <= 4 && dataOk; c++) {
     setDefaultDte(ed); const e2g = sealV2({ keys: f.keys, counter: c, window: f.window, dir: "e2g", plaintext: msg });
     setDefaultDte(gd); const g2e = sealV2({ keys: acc.keys, counter: c, window: g.window, dir: "g2e", plaintext: msg });
     try { assert.deepEqual(openV2({ keys: acc.keys, counter: c, window: g.window, dir: "e2g", prose: e2g }), msg); assert.deepEqual(openV2({ keys: f.keys, counter: c, window: f.window, dir: "g2e", prose: g2e }), msg); } catch { dataOk = false; }
   }
-  setDefaultDte("bb-k-v4");
-  return { edgeOk: true, gateOk: true, dataOk, sizes };
+  setDefaultDte("bb-k-v4s");
+  return { helloOk: true, edgeOk: true, gateOk: true, dataOk, sizes };
 }
 const out: string[] = [];
 for (const on of [true, false]) {
   setDteCheck(on);
   for (const ed of D) for (const gd of D) {
     const r = await hs(ed, gd);
-    out.push(`check=${on ? "on" : "off"} edge=${ed} gate=${gd}: edgeConfirm=${r.edgeOk} gateAccept=${r.gateOk} data=${r.dataOk}`);
-    if (ed === gd) assert.ok(r.edgeOk && r.gateOk && r.dataOk, `same dte ${ed} check=${on}`);
+    out.push(`check=${on ? "on" : "off"} edge=${ed} gate=${gd}: helloAdmit=${r.helloOk} edgeConfirm=${r.edgeOk} gateAccept=${r.gateOk} data=${r.dataOk}`);
+    if (ed === gd) assert.ok(r.helloOk && r.edgeOk && r.gateOk && r.dataOk, `same dte ${ed} check=${on}`);
+    else if (ed === S || gd === S) assert.ok(!r.helloOk && !r.edgeOk && !r.gateOk, `bb-k-v4s mix must fail at the hello ${ed}/${gd} check=${on}`);
     else if (on) assert.ok(!r.edgeOk && !r.gateOk, `mismatch must fail in handshake ${ed}/${gd}`);
     else { assert.ok(r.edgeOk && r.gateOk, `check off: handshake completes ${ed}/${gd}`); assert.ok(!r.dataOk, `check off: data fails ${ed}/${gd}`); }
   }
@@ -66,10 +75,10 @@ setDteCheck(true);
 // an edge with the check off still refuses confirmS from a check-on gate (different transcript)
 {
   const p = edgeStart3(edge, gate.publicRawB64, Date.now(), FAST, T);
-  const g = await gateRespond3(gate, peers, p.helloWire, { token: T, kdf: FAST }); // gate bb-k-v4, check on
-  setDteCheck(false); setDefaultDte("bb-v4");
+  const g = await gateRespond3(gate, peers, p.helloWire, { token: T, kdf: FAST }); // gate bb-k-v4s, check on
+  setDteCheck(false);
   let f; try { f = await edgeFinish3(edge, p, gate.publicRawB64, g.serverWire); } catch { f = null; }
-  setDteCheck(true); setDefaultDte("bb-k-v4");
+  setDteCheck(true);
   assert.ok(f === null);
 }
 // mismatched check setting with the same dte also fails (both ends must agree on frame.dteCheck)
@@ -79,4 +88,4 @@ setDteCheck(true);
   setDteCheck(false); await assert.rejects(edgeFinish3(edge, p, gate.publicRawB64, g.serverWire)); setDteCheck(true);
 }
 console.log(out.join("\n"));
-console.log("dte-handshake ok: 3 same-dte pairs pass, 6 mismatches fail in handshake (check on), complete+data fails (check off), check setting must match");
+console.log("dte-handshake ok: 4 same-dte pairs pass; 6 bb-k-v4s mixes fail at the hello (check on and off); 6 legacy mixes fail at confirmS (check on), complete+data fails (check off); check setting must match");

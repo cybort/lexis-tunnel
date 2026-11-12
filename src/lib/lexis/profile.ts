@@ -104,7 +104,7 @@ export type LexisProfile = {
   /** Required before /metrics or the status page leaves loopback. /health stays open. */
   statusToken: string;
   heartbeatSec: number;
-  linux: { method: "tproxy" | "redirect" | "tun"; mark: number; table: number; dnsRedirect: boolean; ipv6: "block" | "off" };
+  linux: { method: "tproxy" | "redirect" | "tun"; mark: number; table: number; dnsRedirect: boolean; dnsPort: number; ipv6: "block" | "off" };
   windows: { method: "windivert" | "portproxy"; gateway: string };
   android: { method: "vpn"; mtu: number; address: string; dns: string };
   /** Userspace TCP on the virtual NIC. Omitted mss means announce mtu-40. */
@@ -121,7 +121,7 @@ export type LexisProfile = {
     maxExpansion: number;
     smallFramePolicy: "expansion" | "honey";
     coalesceTarget: number;
-    /** v4 word coding. Default bb-k-v4. Both ends must match; not negotiated. */
+    /** v4 word coding. Default bb-k-v4s (not interoperable with bb-k-v4). Both ends must match; not negotiated. */
     dte: string;
     /** Bind frame.dte into handshake key confirmation (default true). Both ends must match. */
     dteCheck: boolean;
@@ -136,6 +136,8 @@ export type LexisProfile = {
     dialMs: number;
     maxHandshakes: number;
     udpIdleMs: number;
+    /** SOCKS UDP ASSOCIATE control connection only. Legal UDP activity renews it. */
+    udpAssociateIdleMs: number;
     udpMax: number;
     maxHalfOpen: number;
     /** per network prefix since 3.0.1 (IPv4 /halfOpenPrefixV4, IPv6 /halfOpenPrefixV6) */
@@ -238,7 +240,7 @@ export function defaultProfile(): LexisProfile {
     statusPort: 17890,
     statusToken: "",
     heartbeatSec: 15,
-    linux: { method: "redirect", mark: 255, table: 100, dnsRedirect: true, ipv6: "block" },
+    linux: { method: "redirect", mark: 255, table: 100, dnsRedirect: true, dnsPort: 0, ipv6: "block" },
     windows: { method: "portproxy", gateway: "10.7.0.1" },
     android: { method: "vpn", mtu: 1500, address: "10.7.0.2/32", dns: "1.1.1.1" },
     tun: { mtu: 1500, mss: null, oooMaxBytes: 65535, oooMaxSegs: 64, oooTotalBytes: 8 << 20 },
@@ -247,7 +249,7 @@ export function defaultProfile(): LexisProfile {
     honeyProgram: null,
     seal: null,
     zstd: { enabled: false, level: 3 },
-    frame: { maxExpansion: 5, smallFramePolicy: "expansion", coalesceTarget: 1024, dte: "bb-k-v4", dteCheck: true },
+    frame: { maxExpansion: 5, smallFramePolicy: "expansion", coalesceTarget: 1024, dte: "bb-k-v4s", dteCheck: true },
     link: {
       token: "",
       idleMs: 120000,
@@ -258,6 +260,7 @@ export function defaultProfile(): LexisProfile {
       dialMs: 10000,
       maxHandshakes: 2,
       udpIdleMs: 60000,
+      udpAssociateIdleMs: 120000,
       udpMax: 64,
       maxHalfOpen: 512,
       maxHalfOpenPerIp: 8,
@@ -302,6 +305,8 @@ function linuxOf(base: LexisProfile["linux"], raw?: Partial<LexisProfile["linux"
     mark: clampNum(raw?.mark, 1, 255, base.mark),
     table: clampNum(raw?.table, 1, 65535, base.table),
     dnsRedirect: raw?.dnsRedirect !== false,
+    // U2: local DNS service port on 127.0.0.1; 0 = pick a free port at start.
+    dnsPort: clampNum(raw?.dnsPort, 0, 65535, 0),
     // tun mode: "block" (default) makes public IPv6 unreachable so it cannot bypass the tunnel; "off" leaves IPv6 routing alone.
     ipv6: raw?.ipv6 === "off" ? "off" : "block",
   };
@@ -366,6 +371,7 @@ export function normalizeProfile(input: unknown): LexisProfile {
       dialMs: clampNum(raw.link?.dialMs, 1000, 60000, base.link.dialMs),
       maxHandshakes: clampNum(raw.link?.maxHandshakes, 1, 8, base.link.maxHandshakes),
       udpIdleMs: clampNum(raw.link?.udpIdleMs, 1000, 600000, base.link.udpIdleMs),
+      udpAssociateIdleMs: clampNum(raw.link?.udpAssociateIdleMs, 1000, 600000, base.link.udpAssociateIdleMs),
       udpMax: clampNum(raw.link?.udpMax, 4, 4096, base.link.udpMax),
       maxHalfOpen: clampNum(raw.link?.maxHalfOpen, 1, 10000, base.link.maxHalfOpen),
       maxHalfOpenPerIp: clampNum(raw.link?.maxHalfOpenPerIp, 1, 1024, base.link.maxHalfOpenPerIp),
@@ -709,6 +715,7 @@ const FRAME_DTES = [
   "rans-v3",
   "bb-v4",
   "bb-k-v4",
+  "bb-k-v4s",
   "bb-c8-v4",
   "bb-ou-v4",
   "bb-ouc8-v4",

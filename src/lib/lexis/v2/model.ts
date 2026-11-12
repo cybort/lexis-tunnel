@@ -20,6 +20,7 @@
 import { aesCtrKeystream } from "../native";
 import { STATE_WEIGHTS } from "./state-table";
 import { VOCAB_COUNTS, VOCAB_WORDS } from "./vocab-en";
+import { ALLOWED_COUNTS, ALLOWED_MU, ALLOWED_PACK, ALLOWED_SIG, ALLOWED_WORDS } from "./vocab-allowed";
 
 export const SCALE_BITS = 24;
 const M = 2 ** SCALE_BITS;
@@ -66,25 +67,26 @@ export class KeyStream {
 }
 
 /** Rank groups: consecutive ranks whose counts are within 1.5x, at most 256 wide. */
-const GROUPS: Array<[number, number]> = (() => {
+function groupsOf(counts: number[]): Array<[number, number]> {
   const out: Array<[number, number]> = [];
   let start = 0;
-  for (let i = 1; i <= WORDS.length; i++) {
-    if (i === WORDS.length || COUNTS[i] * 1.5 < COUNTS[start] || i - start >= 256) {
+  for (let i = 1; i <= counts.length; i++) {
+    if (i === counts.length || counts[i] * 1.5 < counts[start] || i - start >= 256) {
       out.push([start, i]);
       start = i;
     }
   }
   return out;
-})();
+}
+const GROUPS: Array<[number, number]> = groupsOf(COUNTS);
 
 /** Quantized frequencies by rank, summing exactly to 2^24, each >= 1. */
-const FREQ_BY_RANK: Uint32Array = (() => {
-  const total = COUNTS.reduce((a, b) => a + b, 0);
-  const f = new Uint32Array(WORDS.length);
+function quantize(counts: number[]): Uint32Array {
+  const total = counts.reduce((a, b) => a + b, 0);
+  const f = new Uint32Array(counts.length);
   let sum = 0;
   for (let i = 0; i < f.length; i++) {
-    f[i] = Math.max(1, Math.floor((COUNTS[i] / total) * M));
+    f[i] = Math.max(1, Math.floor((counts[i] / total) * M));
     sum += f[i];
   }
   // Put the rounding remainder on the most common ranks so sum === M.
@@ -102,7 +104,50 @@ const FREQ_BY_RANK: Uint32Array = (() => {
     i++;
   }
   return f;
-})();
+}
+const FREQ_BY_RANK: Uint32Array = quantize(COUNTS);
+
+/** bb-k-v4s: GROUP-FLAT quantized frequencies (sum exactly 2^24, each >= 1). Every rank of a group
+ * gets the same frequency (group share / group size, rounded), so the in-group key permutation
+ * never changes any word's probability: the word distribution, and with it any candidate-key
+ * likelihood statistic, is the same for every key. The rounding remainder is fixed exactly on the
+ * first two groups of coprime sizes. Must match scripts/build-vocab-allowed.mjs (v4s.test.ts). */
+export function quantizeFlat(counts: number[], gs: Array<[number, number]>): Uint32Array {
+  const total = counts.reduce((x, y) => x + y, 0);
+  const fg = gs.map(([a, b]) => {
+    let g = 0;
+    for (let i = a; i < b; i++) g += counts[i];
+    return Math.max(1, Math.round(((g / total) * M) / (b - a)));
+  });
+  let R = M;
+  gs.forEach(([a, b], j) => {
+    R -= fg[j] * (b - a);
+  });
+  const gcd = (x: number, y: number): number => (y ? gcd(y, x % y) : x);
+  let ja = -1;
+  let jb = -1;
+  outer: for (let x = 0; x < gs.length; x++)
+    for (let y = x + 1; y < gs.length; y++)
+      if (gcd(gs[x][1] - gs[x][0], gs[y][1] - gs[y][0]) === 1) {
+        ja = x;
+        jb = y;
+        break outer;
+      }
+  if (ja < 0) throw new Error("no coprime group sizes");
+  const sa = gs[ja][1] - gs[ja][0];
+  const sb = gs[jb][1] - gs[jb][0];
+  const sg = Math.sign(R);
+  const r = Math.abs(R);
+  let y = 0;
+  while ((r - y * sb) % sa !== 0) y++;
+  if (r - y * sb < 0) throw new Error("remainder not representable");
+  fg[ja] += sg * ((r - y * sb) / sa);
+  fg[jb] += sg * y;
+  if (fg[ja] < 1 || fg[jb] < 1) throw new Error("flat quantize underflow");
+  const out = new Uint32Array(counts.length);
+  gs.forEach(([a, b], j) => out.fill(fg[j], a, b));
+  return out;
+}
 
 export type WordModel = {
   words: string[]; // symbol -> word (symbol == rank)
@@ -184,23 +229,38 @@ function canonicalCode(w: Uint32Array): PrefixCode {
 /* Frequencies, cumulative table and the header Huffman code depend only on the corpus
  * (FREQ_BY_RANK), never on the session key, so they are built once per process and shared
  * read-only by every model (they used to be rebuilt on every handshake, ~2.3 MB each). */
-let corpusCode: { cum: Uint32Array; pc: PrefixCode } | null = null;
-function corpusTables() {
-  if (corpusCode) return corpusCode;
-  const freq = FREQ_BY_RANK;
+/** One word corpus (words by rank, counts, rank groups, quantized frequencies) and its lazily
+ * built key-independent tables. The legacy corpus (vocab-en.ts, public 32768 words) serves every dte
+ * except bb-k-v4s; the allowed corpus (vocab-allowed.ts) serves bb-k-v4s only. */
+type Corpus = {
+  words: string[];
+  counts: number[];
+  groups: Array<[number, number]>;
+  freq: Uint32Array;
+  tables: { cum: Uint32Array; pc: PrefixCode } | null;
+  cache: Map<string, WordModel>;
+};
+const LEGACY: Corpus = { words: WORDS, counts: COUNTS, groups: GROUPS, freq: FREQ_BY_RANK, tables: null, cache: modelCache };
+function corpusTablesOf(c: Corpus) {
+  if (c.tables) return c.tables;
+  const freq = c.freq;
   const cum = new Uint32Array(freq.length + 1);
   for (let i = 0; i < freq.length; i++) cum[i + 1] = cum[i] + freq[i];
-  corpusCode = { cum, pc: canonicalCode(freq) };
-  return corpusCode;
+  c.tables = { cum, pc: canonicalCode(freq) };
+  return c.tables;
+}
+export function buildModel(lexKey: Uint8Array, padKey: Uint8Array): WordModel {
+  return buildModelOn(LEGACY, lexKey, padKey);
 }
 
-export function buildModel(lexKey: Uint8Array, padKey: Uint8Array): WordModel {
+function buildModelOn(corpus: Corpus, lexKey: Uint8Array, padKey: Uint8Array): WordModel {
   const id = hexOf(lexKey) + hexOf(padKey);
+  const modelCache = corpus.cache;
   const hit = modelCache.get(id);
   if (hit) return hit;
   const ks = new KeyStream(lexKey, 1);
-  const words = WORDS.slice();
-  for (const [a, b] of GROUPS) {
+  const words = corpus.words.slice();
+  for (const [a, b] of corpus.groups) {
     for (let i = b - 1; i > a; i--) {
       const j = a + ks.below(i - a + 1);
       const t = words[i];
@@ -210,8 +270,8 @@ export function buildModel(lexKey: Uint8Array, padKey: Uint8Array): WordModel {
   }
   const index = new Map<string, number>();
   words.forEach((w, i) => index.set(w, i));
-  const { cum, pc } = corpusTables();
-  const model: WordModel = { words, index, freq: FREQ_BY_RANK, cum, codeLen: pc.len, code: pc.code, decodeTree: pc.tree, maxLen: pc.maxLen, padKey };
+  const { cum, pc } = corpusTablesOf(corpus);
+  const model: WordModel = { words, index, freq: corpus.freq, cum, codeLen: pc.len, code: pc.code, decodeTree: pc.tree, maxLen: pc.maxLen, padKey };
   modelCache.set(id, model);
   if (modelCache.size > 16) modelCache.delete(modelCache.keys().next().value as string);
   return model;
@@ -232,6 +292,34 @@ export function buildModelV4(): WordModel {
   const base = buildModel(new Uint8Array(32), new Uint8Array(32));
   v4Model = { ...base, words, index, padKey: new Uint8Array(32) };
   return v4Model;
+}
+
+/* ---------- bb-k-v4s: shared allowed set (D-pool) ----------
+ * One allowed word set for every session (vocab-allowed.ts: the cleaned FrequencyWords list
+ * with a small set of specified whole words removed at build time). Frequencies, cumulative
+ * table and header code depend only on this set and are built once per process. A session key
+ * only permutes words among ranks of the same near-equal-frequency group (counts within 1.5x,
+ * at most 256 wide), exactly like buildModel: EVERY keyed model contains EVERY allowed word, so
+ * a candidate key never yields a "word not in this model" test. There is no secret subset.
+ * Frequencies are group-flat (quantizeFlat), so the permutation also never changes a word's
+ * probability (no candidate-key likelihood test). */
+let allowed: Corpus | null = null;
+function allowedCorpus(): Corpus {
+  if (allowed) return allowed;
+  const words = ALLOWED_WORDS.split(" ");
+  const counts = ALLOWED_COUNTS.split(",").map(Number);
+  const groups = groupsOf(counts);
+  allowed = { words, counts, groups, freq: quantizeFlat(counts, groups), tables: null, cache: new Map() };
+  return allowed;
+}
+/** Keyed model over the allowed set (bb-k-v4s hello: wordsIkm; data/finish: session key sk). */
+export function buildModelS(lexKey: Uint8Array, padKey: Uint8Array): WordModel {
+  return buildModelOn(allowedCorpus(), lexKey, padKey);
+}
+/** Allowed-set corpus (measurement and tests). */
+export function corpusS() {
+  const c = allowedCorpus();
+  return { pack: ALLOWED_PACK, words: c.words, counts: c.counts, freqByRank: c.freq, groups: c.groups, mu: ALLOWED_MU, sig: ALLOWED_SIG };
 }
 
 /** CSPRNG byte source for the v4 sender (buffered). */

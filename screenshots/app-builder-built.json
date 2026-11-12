@@ -35,7 +35,7 @@
   "verdictFile": "/workspace/screenshots/app-builder-built.json",
   "divergesFromBaseline": true,
   "baselineReasons": [
-    "desktop: body text collapsed (2180 -> 62 chars)",
-    "mobile: body text collapsed (2180 -> 62 chars)"
+    "desktop: body text collapsed (2489 -> 62 chars)",
+    "mobile: body text collapsed (2489 -> 62 chars)"
   ]
 }
